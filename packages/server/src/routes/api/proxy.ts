@@ -23,6 +23,12 @@ import { requireAdmin } from '../../middlewares/auth.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
 import { StaticFiles } from '../../app.js';
 import { Transform } from 'stream';
+import {
+  buildUnsatisfiableRangeHeaders,
+  isUnsatisfiableByteRange,
+  parseContentLengthHeader,
+  parseSingleByteRangeHeader,
+} from './proxy-range.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
@@ -340,6 +346,101 @@ function assertProxyAccess(auth: ProxyAuth, requestId: string) {
   }
 }
 
+async function getUpstreamContentLength(
+  currentUrl: string,
+  headers: Record<string, string | string[] | undefined>,
+  dispatcher: Dispatcher | undefined,
+  requestId: string
+): Promise<number | undefined> {
+  const headHeaders = { ...headers };
+  delete headHeaders['range'];
+  delete headHeaders['content-length'];
+  delete headHeaders['content-type'];
+
+  let headUrl = currentUrl;
+  for (let redirectCount = 0; redirectCount < 5; redirectCount++) {
+    const headResponse = await request(headUrl, {
+      method: 'HEAD',
+      headers: headHeaders,
+      dispatcher,
+      bodyTimeout: 0,
+      headersTimeout: 0,
+    });
+
+    try {
+      if ([301, 302, 303, 307, 308].includes(headResponse.statusCode)) {
+        const location = headResponse.headers['location'];
+        if (!location || typeof location !== 'string') {
+          return undefined;
+        }
+        headUrl = new URL(location, headUrl).href;
+        continue;
+      }
+
+      if (headResponse.statusCode < 200 || headResponse.statusCode >= 400) {
+        logger.debug(`[${requestId}] Range fallback HEAD failed`, {
+          statusCode: headResponse.statusCode,
+        });
+        return undefined;
+      }
+
+      return parseContentLengthHeader(headResponse.headers['content-length']);
+    } finally {
+      if (!headResponse.body.destroyed) {
+        headResponse.body.destroy();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+async function maybeRespondUnsatisfiableRange(
+  upstreamResponse: Dispatcher.ResponseData,
+  currentUrl: string,
+  headers: Record<string, string | string[] | undefined>,
+  dispatcher: Dispatcher | undefined,
+  res: Response,
+  requestId: string
+): Promise<boolean> {
+  if (
+    !headers['range'] ||
+    (upstreamResponse.statusCode !== 416 && upstreamResponse.statusCode < 500)
+  ) {
+    return false;
+  }
+
+  const range = parseSingleByteRangeHeader(headers['range']);
+  if (!range) {
+    return false;
+  }
+
+  const contentLength = await getUpstreamContentLength(
+    currentUrl,
+    headers,
+    dispatcher,
+    requestId
+  );
+  if (
+    contentLength === undefined ||
+    !isUnsatisfiableByteRange(range, contentLength)
+  ) {
+    return false;
+  }
+
+  if (!upstreamResponse.body.destroyed) {
+    upstreamResponse.body.destroy();
+  }
+
+  res.set(buildUnsatisfiableRangeHeaders(contentLength));
+  res.status(416).end();
+  logger.debug(`[${requestId}] Normalized unsatisfiable range response`, {
+    statusCode: upstreamResponse.statusCode,
+    contentLength,
+  });
+  return true;
+}
+
 async function serveProxyRequest(
   req: Request<any>,
   res: Response,
@@ -356,8 +457,7 @@ async function serveProxyRequest(
   try {
     assertProxyAccess(auth, requestId);
 
-    clientIp =
-      req.requestIp || req.ip || req.socket.remoteAddress || 'unknown';
+    clientIp = req.requestIp || req.ip || req.socket.remoteAddress || 'unknown';
     const timestamp = Date.now();
 
     const connectionLimit =
@@ -444,8 +544,7 @@ async function serveProxyRequest(
       try {
         const upstreamUrlObj = new URL(currentUrl);
         if (
-          upstreamUrlObj.origin ===
-          new URL(appConfig.bootstrap.baseUrl).origin
+          upstreamUrlObj.origin === new URL(appConfig.bootstrap.baseUrl).origin
         ) {
           let forwarded = false;
           for (const param of INTERNAL_FORWARDED_PARAMS) {
@@ -465,6 +564,9 @@ async function serveProxyRequest(
     const maxRedirects = 10;
     let redirectCount = 0;
     let method = req.method as Dispatcher.HttpMethod;
+    let upstreamRequestHeaders: Record<string, string | string[] | undefined> =
+      {};
+    let upstreamDispatcher: Dispatcher | undefined;
 
     while (redirectCount < maxRedirects) {
       const urlObj = new URL(currentUrl);
@@ -495,11 +597,12 @@ async function serveProxyRequest(
       const proxyAgent = useProxy
         ? getProxyAgent(appConfig.http.addonProxy[proxyIndex])
         : undefined;
-      const headers = Object.fromEntries(
-        Object.entries({ ...clientHeaders, ...data.requestHeaders }).map(
-          ([key, value]) => [key.toLowerCase(), value]
-        )
-      );
+      const headers: Record<string, string | string[] | undefined> =
+        Object.fromEntries(
+          Object.entries({ ...clientHeaders, ...data.requestHeaders }).map(
+            ([key, value]) => [key.toLowerCase(), value]
+          )
+        );
       const domainUserAgent = domainHasUserAgent(urlObj);
       if (domainUserAgent) {
         headers['user-agent'] = domainUserAgent;
@@ -515,6 +618,8 @@ async function serveProxyRequest(
         urlObj.password = '';
       }
       currentUrl = urlObj.toString();
+      upstreamRequestHeaders = headers;
+      upstreamDispatcher = proxyAgent;
       logger.debug(`[${requestId}] Making upstream request`, {
         username: auth.username,
         method: method,
@@ -567,6 +672,19 @@ async function serveProxyRequest(
       return;
     }
     const upstreamDuration = getTimeTakenSincePoint(upstreamStartTime);
+
+    if (
+      await maybeRespondUnsatisfiableRange(
+        upstreamResponse,
+        currentUrl,
+        upstreamRequestHeaders,
+        upstreamDispatcher,
+        res,
+        requestId
+      )
+    ) {
+      return;
+    }
 
     if (auth.username === constants.PUBLIC_NZB_PROXY_USERNAME) {
       if (appConfig.nzbProxy.maxSize > 0) {
@@ -750,11 +868,7 @@ router.delete(
 
 router.all(
   '/s/:id{/:filename}',
-  async (
-    req: Request<ProxyAliasParams>,
-    res: Response,
-    next: NextFunction
-  ) => {
+  async (req: Request<ProxyAliasParams>, res: Response, next: NextFunction) => {
     const requestId = Math.random().toString(36).substring(7);
     try {
       const payload = await ProxyAliasRepository.getPayload(req.params.id);
