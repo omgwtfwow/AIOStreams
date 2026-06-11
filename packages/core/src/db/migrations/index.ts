@@ -4,6 +4,7 @@ import { analytics } from './0003_analytics.js';
 import { userIndexes } from './0004_user_indexes.js';
 import { analyticsV2 } from './0005_analytics_v2.js';
 import { analyticsIp } from './0006_analytics_ip.js';
+import { proxyAliases } from './0007_proxy_aliases.js';
 import type { Migration } from './types.js';
 
 export const MIGRATIONS: readonly Migration[] = [
@@ -13,6 +14,7 @@ export const MIGRATIONS: readonly Migration[] = [
   userIndexes,
   analyticsV2,
   analyticsIp,
+  proxyAliases,
 ];
 
 export type { Migration } from './types.js';

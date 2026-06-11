@@ -9,6 +9,10 @@ export {
   SettingsRepository,
   type SettingRow,
 } from './repositories/settings.js';
+export {
+  ProxyAliasRepository,
+  type ProxyAliasPayload,
+} from './repositories/proxy-aliases.js';
 export * from './schemas.js';
 
 export { sql, raw, join, SqlFragment } from './sql.js';
