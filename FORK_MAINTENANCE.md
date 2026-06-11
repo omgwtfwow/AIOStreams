@@ -10,8 +10,8 @@ Use the `Fork Image` GitHub Actions workflow in this repository.
 
 1. Open **Actions** -> **Fork Image** -> **Run workflow**.
 2. Use a pinned tag such as `proxy-aliases-YYYYMMDD-<short-sha>`.
-3. Keep `platforms=linux/amd64` for the Hetzner deployment unless another
-   platform is intentionally needed.
+3. Use `platforms=linux/amd64,linux/arm64` for a portable release tag. Hetzner
+   currently needs `linux/arm64`.
 4. Leave `create_release=true`.
 5. Deploy the resulting pinned image:
 
@@ -34,7 +34,7 @@ pnpm -F core build
 pnpm -F server build
 pnpm run build
 docker buildx build \
-  --platform linux/amd64 \
+  --platform linux/arm64 \
   --build-arg OCI_SOURCE=https://github.com/omgwtfwow/AIOStreams \
   -t ghcr.io/omgwtfwow/aiostreams:local-check \
   --load .
