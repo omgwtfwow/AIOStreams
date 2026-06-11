@@ -346,6 +346,24 @@ function assertProxyAccess(auth: ProxyAuth, requestId: string) {
   }
 }
 
+function destroyResponseBodyQuietly(
+  body: Dispatcher.ResponseData['body'],
+  requestId: string,
+  context: string
+) {
+  if (body.destroyed) {
+    return;
+  }
+
+  body.once('error', (err) => {
+    logger.debug(`[${requestId}] Ignored expected response body error`, {
+      context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+  body.destroy();
+}
+
 async function getUpstreamContentLength(
   currentUrl: string,
   headers: Record<string, string | string[] | undefined>,
@@ -386,9 +404,7 @@ async function getUpstreamContentLength(
 
       return parseContentLengthHeader(headResponse.headers['content-length']);
     } finally {
-      if (!headResponse.body.destroyed) {
-        headResponse.body.destroy();
-      }
+      destroyResponseBodyQuietly(headResponse.body, requestId, 'range HEAD');
     }
   }
 
@@ -428,9 +444,11 @@ async function maybeRespondUnsatisfiableRange(
     return false;
   }
 
-  if (!upstreamResponse.body.destroyed) {
-    upstreamResponse.body.destroy();
-  }
+  destroyResponseBodyQuietly(
+    upstreamResponse.body,
+    requestId,
+    'unsatisfiable range upstream'
+  );
 
   res.set(buildUnsatisfiableRangeHeaders(contentLength));
   res.status(416).end();
@@ -753,13 +771,12 @@ async function serveProxyRequest(
   } catch (error) {
     const totalDuration = Date.now() - startTime;
 
-    if (upstreamResponse && !upstreamResponse.body.destroyed) {
-      upstreamResponse.body.on('error', (err) => {
-        logger.warn(`[${requestId}] Failed to destroy upstream response body`, {
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-      upstreamResponse.body.destroy();
+    if (upstreamResponse) {
+      destroyResponseBodyQuietly(
+        upstreamResponse.body,
+        requestId,
+        'proxy error cleanup'
+      );
     }
 
     const errorCode = (error as NodeJS.ErrnoException)?.code;
