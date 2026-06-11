@@ -3,5 +3,6 @@
 **/out
 **/.next
 **/data
+**/*.tsbuildinfo
 .env
 .git
