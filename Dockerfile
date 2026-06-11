@@ -76,8 +76,10 @@ COPY --from=builder /build/packages/server/node_modules ./packages/server/node_m
 
 FROM gcr.io/distroless/nodejs24-debian12 AS production
 
+ARG OCI_SOURCE="https://github.com/Viren070/AIOStreams"
+
 LABEL org.opencontainers.image.title="AIOStreams"
-LABEL org.opencontainers.image.source="https://github.com/Viren070/AIOStreams"
+LABEL org.opencontainers.image.source="${OCI_SOURCE}"
 LABEL org.opencontainers.image.description="AIOStreams consolidates multiple Stremio addons and debrid services - including its own suite of built-in addons - into a single, highly customisable super-addon."
 LABEL org.opencontainers.image.licenses="GPL-3.0"
 
