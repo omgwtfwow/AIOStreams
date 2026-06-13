@@ -25,7 +25,7 @@ on:
       platforms:
         description: 'Docker platforms to publish.'
         required: true
-        default: 'linux/amd64'
+        default: 'linux/amd64,linux/arm64'
         type: string
       create_release:
         description: 'Create or update a private fork GitHub release for this image.'
@@ -104,7 +104,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
           push: ${{ github.event_name == 'workflow_dispatch' }}
           tags: ${{ steps.meta.outputs.image }}
           build-args: |
