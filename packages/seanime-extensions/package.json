@@ -8,7 +8,7 @@
     "typecheck": "pnpm run typecheck:torrent && pnpm run typecheck:plugin && pnpm run typecheck:custom-source",
     "typecheck:torrent": "tsc -p ./src/extensions/aiostreams-torrent-provider/tsconfig.json",
     "typecheck:plugin": "tsc -p ./src/extensions/aiostreams-plugin/tsconfig.json",
-    "typecheck:custom-source": "tsc -p ./src/extensions/aiostreams-custom-source/tsconfig.json"
+    "typecheck:custom-source": "tsc -p ./src/extensions/stremio-custom-source/tsconfig.json"
   },
   "devDependencies": {
     "esbuild": "^0.25.12",
