@@ -10,8 +10,9 @@ Use the `Fork Image` GitHub Actions workflow in this repository.
 
 1. Open **Actions** -> **Fork Image** -> **Run workflow**.
 2. Use a pinned tag such as `proxy-aliases-YYYYMMDD-<short-sha>`.
-3. Use `platforms=linux/amd64,linux/arm64` for a portable release tag. Hetzner
-   currently needs `linux/arm64`.
+3. Keep the default `platforms=linux/amd64,linux/arm64` for a portable release
+   tag. Hetzner currently needs `linux/arm64`, so do not publish an amd64-only
+   release for production.
 4. Leave `create_release=true`.
 5. Deploy the resulting pinned image:
 
