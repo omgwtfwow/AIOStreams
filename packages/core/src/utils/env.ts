@@ -196,7 +196,7 @@ export const Env = cleanEnv(process.env, {
     desc: 'Port to run the addon on',
   }),
   SECRET_KEY: secretKey({
-    desc: 'Session/encryption secret used to derive keys for stored configurations. Must be a 64-character hex string. Generate with `openssl rand -hex 32`. Cannot be changed after first run. (Legacy alias `SESSION_SECRET` is still accepted for one minor release.)',
+    desc: 'Session/encryption secret used to derive keys for stored configurations. Must be a 64-character hex string. Generate with `openssl rand -hex 32`. Cannot be changed after first run.',
     example: 'Generate using: openssl rand -hex 32',
   }),
   DATABASE_URI: str({
