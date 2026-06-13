@@ -5,6 +5,7 @@ import {
   createLogger,
 } from '@aiostreams/core';
 import { Router, Request, Response } from 'express';
+import { buildAliasRedirectLogContext } from './alias-log-redaction.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
@@ -29,7 +30,10 @@ router.get(
     }
 
     const redirectPath = `/stremio/${configuration.uuid}/${configuration.password}${wildcardPath ? `/${wildcardPath}` : ''}`;
-    logger.debug(`Redirecting alias ${alias} to ${redirectPath}`);
+    logger.debug(
+      'Redirecting configured alias',
+      buildAliasRedirectLogContext(alias, wildcardPath)
+    );
 
     res.redirect(redirectPath);
   }
