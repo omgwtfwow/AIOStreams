@@ -10,7 +10,6 @@ import {
   fromUrlSafeBase64,
   getProxyAgent,
   getTimeTakenSincePoint,
-  maskSensitiveInfo,
   ProxyAliasRepository,
   shouldProxy,
   canUseProxy,
@@ -29,6 +28,10 @@ import {
   parseContentLengthHeader,
   parseSingleByteRangeHeader,
 } from './proxy-range.js';
+import {
+  sanitiseHeadersForLog,
+  sanitiseUrlForLog,
+} from './proxy-log-redaction.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
@@ -232,29 +235,6 @@ interface ProxyAliasParams {
 const CreateAliasSchema = ProxyDataSchema.extend({
   stableKey: z.string().min(1).max(2048),
 });
-
-function sanitiseUrlForLog(value: string): string {
-  try {
-    const url = new URL(value);
-    url.username = '';
-    url.password = '';
-    for (const key of [
-      'apikey',
-      'api_key',
-      'auth',
-      'downloadKey',
-      'key',
-      'token',
-    ]) {
-      if (url.searchParams.has(key)) {
-        url.searchParams.set(key, '[redacted]');
-      }
-    }
-    return `${url.protocol}//${maskSensitiveInfo(url.host)}${url.pathname}${url.search}`;
-  } catch {
-    return '[invalid-url]';
-  }
-}
 
 function buildAliasUrl(id: string, filename?: string): string {
   const suffix = filename ? `/${encodeURIComponent(filename)}` : '';
@@ -648,7 +628,7 @@ async function serveProxyRequest(
         url: sanitiseUrlForLog(currentUrl),
       });
       logger.silly(`[${requestId}] Headers for upstream request`, {
-        headers: JSON.stringify(headers),
+        headers: sanitiseHeadersForLog(headers),
       });
       upstreamResponse = await request(currentUrl, {
         method: method,
