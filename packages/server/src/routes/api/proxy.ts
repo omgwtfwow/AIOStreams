@@ -3,10 +3,8 @@ import {
   APIError,
   constants,
   createLogger,
-  decryptString,
   resolveOverrideHeaders,
   appConfig,
-  fromUrlSafeBase64,
   getTimeTakenSincePoint,
   makeUrlLogSafe,
   rewriteRequestUrl,
@@ -169,53 +167,6 @@ function assertProxyAccess(auth: ProxyAuth, requestId: string): void {
       'Proxy access not permitted for this user'
     );
   }
-}
-
-function decodeAndAuthorizeRequest(
-  encryptedAuthAndData: string,
-  requestId: string
-): { auth: ProxyAuth; data: ProxyData } {
-  const parts = encryptedAuthAndData.split('.');
-  let encodedAuth: string;
-  let encodedData: string;
-  let encodeMode: 'e' | 'u';
-  if (parts.length === 2) {
-    encodeMode = 'e';
-    [encodedAuth, encodedData] = parts;
-  } else if (parts.length === 3) {
-    encodeMode = parts[0] as 'e' | 'u';
-    [, encodedAuth, encodedData] = parts;
-  } else {
-    throw new APIError(
-      constants.ErrorCode.BAD_REQUEST,
-      undefined,
-      'Invalid encrypted auth and data'
-    );
-  }
-
-  let rawAuth: string | undefined;
-  let rawData: string | undefined;
-  if (encodeMode === 'e') {
-    rawAuth = decryptString(encodedAuth).data ?? undefined;
-    rawData = decryptString(encodedData).data ?? undefined;
-  } else {
-    rawAuth = fromUrlSafeBase64(encodedAuth);
-    rawData = fromUrlSafeBase64(encodedData);
-  }
-
-  if (!rawData || !rawAuth) {
-    logger.error(`[${requestId}] Decryption failed`);
-    throw new APIError(
-      constants.ErrorCode.ENCRYPTION_ERROR,
-      undefined,
-      'Could not decrypt data or auth'
-    );
-  }
-
-  const data = ProxyDataSchema.parse(JSON.parse(rawData));
-  const auth = ProxyAuthSchema.parse(JSON.parse(rawAuth));
-  assertProxyAccess(auth, requestId);
-  return { auth, data };
 }
 
 /**
@@ -479,11 +430,6 @@ router.post(
     }
   }
 );
-
-interface ProxyParams {
-  encryptedAuthAndData: string;
-  filename?: string; // optional
-}
 
 async function serveProxyRequest(
   req: Request<any>,
@@ -867,21 +813,25 @@ router.all(
 );
 
 router.all(
-  '/:encryptedAuthAndData{/:filename}',
-  async (req: Request<ProxyParams>, res: Response, next: NextFunction) => {
+  '/o/:id{/:filename}',
+  async (req: Request<ProxyAliasParams>, res: Response, next: NextFunction) => {
     const requestId = Math.random().toString(36).substring(7);
     try {
-      const { auth, data } = decodeAndAuthorizeRequest(
-        req.params.encryptedAuthAndData,
-        requestId
-      );
+      const payload = await ProxyAliasRepository.getPayload(req.params.id);
+      if (!payload) {
+        res.status(404).json({ error: 'Proxy alias not found' });
+        return;
+      }
+      const auth = ProxyAuthSchema.parse(payload.auth);
+      const data = ProxyDataSchema.parse(payload.data);
+      assertProxyAccess(auth, requestId);
       await serveProxyRequest(
         req,
         res,
         next,
         auth,
         data,
-        req.params.filename,
+        req.params.filename ?? data.filename,
         requestId
       );
     } catch (error) {

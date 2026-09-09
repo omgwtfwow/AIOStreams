@@ -7,7 +7,6 @@ export function filterForDiff(d: UserData | null): UserData | null {
   const filtered: any = { ...d };
   delete filtered.ip;
   delete filtered.uuid;
-  delete filtered.accessToken;
   delete filtered.trusted;
   delete filtered.encryptedPassword;
   delete filtered.showChanges;

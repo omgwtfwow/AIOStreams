@@ -8,7 +8,6 @@ import { Permission, ALL_PERMISSIONS, isPermission } from './permissions.js';
 const logger = createLogger('auth');
 
 const CONFIG_ACCESS_KEY_SETTING = 'api.configAccessKey';
-const AUTH_REQUIRED_SETTING = 'api.authRequired';
 
 /**
  * Where a session's permissions come from: `password` re-resolves them from the
@@ -374,27 +373,6 @@ export async function ensureConfigAccessKey(): Promise<void> {
   if (appConfig.api.configAccessKey) return;
   if (process.env.CONFIG_ACCESS_KEY !== undefined) return; // env-managed
 
-  const legacy = process.env.ADDON_PASSWORD;
-  const passwords = legacy
-    ?.split(',')
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-
-  if (legacy && legacy.length > 0 && passwords && passwords.length > 0) {
-    await settingsStore.set(
-      CONFIG_ACCESS_KEY_SETTING,
-      passwords[0],
-      'system:auth'
-    );
-    if (!appConfig.api.authRequired) {
-      await settingsStore.set(AUTH_REQUIRED_SETTING, true, 'system:auth');
-    }
-    logger.warn(
-      'Migrated legacy ADDON_PASSWORD env into the config access key setting. ADDON_PASSWORD is deprecated; use CONFIG_ACCESS_KEY or manage the key from the dashboard.'
-    );
-    return;
-  }
-
   if (!appConfig.api.authRequired) return;
   regenerateAccessKey();
   logger.info(
@@ -405,7 +383,7 @@ export async function ensureConfigAccessKey(): Promise<void> {
 /**
  * Enforce the config-write gate. When the gate is active, the config must
  * carry the current access key in its `accessKey` field. Throws
- * ADDON_PASSWORD_INVALID otherwise. No-op when the gate is disabled.
+ * CONFIG_ACCESS_KEY_INVALID otherwise. No-op when the gate is disabled.
  */
 export function assertConfigAccessKey(config: { accessKey?: string }): void {
   let key = getConfigAccessKey();
@@ -420,6 +398,6 @@ export function assertConfigAccessKey(config: { accessKey?: string }): void {
     }
   }
   if (!config.accessKey || !constantTimeEquals(config.accessKey, key)) {
-    throw new APIError(ErrorCode.ADDON_PASSWORD_INVALID);
+    throw new APIError(ErrorCode.CONFIG_ACCESS_KEY_INVALID);
   }
 }

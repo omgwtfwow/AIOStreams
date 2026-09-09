@@ -2,23 +2,27 @@
 import {
   appConfig,
   createLogger,
-  maskSensitiveInfo,
-  Env,
   makeRequest,
-  encryptString,
   Cache,
   getSimpleTextHash,
-  toUrlSafeBase64,
-  constants,
   checkAuthToken,
   Permission,
   isAdminUser,
 } from '../utils/index.js';
+import {
+  ProxyAliasRepository,
+  type ProxyAliasPayload,
+} from '../db/repositories/proxy-aliases.js';
+import {
+  buildOnDemandAliasUrl,
+  buildOnDemandStableKey,
+} from './builtin-on-demand.js';
 import z from 'zod';
 
 const logger = createLogger('builtin');
 
 const cache = Cache.getInstance<string, string>('publicIp');
+type OnDemandProxyData = ProxyAliasPayload['data'];
 
 export class BuiltinProxy extends BaseProxy {
   public static validateAuth(auth: string): {
@@ -100,43 +104,37 @@ export class BuiltinProxy extends BaseProxy {
 
   protected override async generateStreamUrls(
     streams: ProxyStream[],
-    encrypt: boolean = true
+    _encrypt: boolean = true
   ): Promise<string[] | null> {
     const auth = BuiltinProxy.validateAuth(this.config.credentials);
 
-    return streams.map((stream) => {
-      let authData = JSON.stringify({
-        username: auth.username,
-        password: auth.password,
-      });
-      let streamData = JSON.stringify({
-        url: stream.url,
-        filename: stream.filename,
-        requestHeaders: stream.headers?.request,
-        responseHeaders: stream.headers?.response,
-        type: stream.type ?? 'stream',
-      });
+    return Promise.all(
+      streams.map(async (stream) => {
+        const data = {
+          url: stream.url,
+          filename: stream.filename,
+          requestHeaders: stream.headers?.request,
+          responseHeaders: stream.headers?.response,
+          type: stream.type ?? 'stream',
+        } satisfies OnDemandProxyData;
 
-      if (encrypt) {
-        const { success, data, error } = encryptString(authData);
-        if (!success) {
-          throw new Error(`Failed to encrypt auth data: ${error}`);
-        }
-        authData = data;
-      } else {
-        authData = toUrlSafeBase64(authData);
-      }
-      if (encrypt) {
-        const { success, data, error } = encryptString(streamData);
-        if (!success) {
-          throw new Error(`Failed to encrypt stream data: ${error}`);
-        }
-        streamData = data;
-      } else {
-        streamData = toUrlSafeBase64(streamData);
-      }
+        const { id } = await ProxyAliasRepository.createOrUpdate(
+          buildOnDemandStableKey(auth.username, data),
+          {
+            auth: {
+              username: auth.username,
+              password: auth.password,
+            },
+            data,
+          }
+        );
 
-      return `${appConfig.bootstrap.baseUrl}${constants.BUILTIN_PROXY_PATH_PREFIX}${encrypt ? 'e' : 'u'}.${authData}.${streamData}/${encodeURIComponent(stream.filename ?? '')}`;
-    });
+        return buildOnDemandAliasUrl(
+          appConfig.bootstrap.baseUrl,
+          id,
+          stream.filename
+        );
+      })
+    );
   }
 }

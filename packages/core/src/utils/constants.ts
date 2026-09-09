@@ -7,7 +7,7 @@ export enum ErrorCode {
   USER_INVALID_CONFIG = 'USER_INVALID_CONFIG',
   USER_NEW_PASSWORD_TOO_SHORT = 'USER_NEW_PASSWORD_TOO_SHORT',
   USER_NEW_PASSWORD_TOO_SIMPLE = 'USER_NEW_PASSWORD_TOO_SIMPLE',
-  ADDON_PASSWORD_INVALID = 'ADDON_PASSWORD_INVALID',
+  CONFIG_ACCESS_KEY_INVALID = 'CONFIG_ACCESS_KEY_INVALID',
   PARENT_CONFIG_SELF_REFERENCE = 'PARENT_CONFIG_SELF_REFERENCE',
   PARENT_CONFIG_UNAVAILABLE = 'PARENT_CONFIG_UNAVAILABLE',
   // Database
@@ -78,9 +78,9 @@ export const ErrorMap: Record<ErrorCode, ErrorDetails> = {
     statusCode: 400,
     message: 'New password is too simple',
   },
-  [ErrorCode.ADDON_PASSWORD_INVALID]: {
+  [ErrorCode.CONFIG_ACCESS_KEY_INVALID]: {
     statusCode: 401,
-    message: 'Invalid addon password',
+    message: 'Invalid config access key',
   },
   [ErrorCode.PARENT_CONFIG_SELF_REFERENCE]: {
     statusCode: 400,

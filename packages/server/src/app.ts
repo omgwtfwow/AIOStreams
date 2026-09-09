@@ -81,7 +81,6 @@ import {
   Env,
   VARIANT_PATH_ROUTE,
 } from '@aiostreams/core';
-import { StremioTransformer } from '@aiostreams/core';
 import { createResponse } from './utils/responses.js';
 import path from 'path';
 import fs from 'fs';
@@ -277,37 +276,6 @@ app.get(
 );
 
 app.use('/static', corsMiddleware, express.static(staticRoot));
-
-// legacy route handlers
-app.get(
-  '{/:config}/stream/:type/:id.json',
-  stremioStreamRateLimiter,
-  (req, res) => {
-    const baseUrl =
-      appConfig.bootstrap.baseUrl ||
-      `${req.protocol}://${req.hostname}${
-        req.hostname === 'localhost' ? `:${appConfig.bootstrap.port}` : ''
-      }`;
-    res.json({
-      streams: [
-        StremioTransformer.createErrorStream({
-          errorDescription:
-            'AIOStreams v2 requires you to reconfigure. Please click this stream to reconfigure.',
-          errorUrl: `${baseUrl}/stremio/configure`,
-        }),
-      ],
-    });
-  }
-);
-
-// redirect for legacy paths
-app.get('{/:config}/configure', (req, res) => {
-  res.redirect('/stremio/configure');
-});
-
-app.get('/configure', (req, res) => {
-  res.redirect('/stremio/configure');
-});
 
 // SPA route validation: returns true for paths that exist in the client-side router.
 const SPA_STATIC_ROUTES = [

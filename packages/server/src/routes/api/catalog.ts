@@ -61,13 +61,13 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
     } catch (error) {
       if (
         error instanceof APIError &&
-        error.code === constants.ErrorCode.ADDON_PASSWORD_INVALID
+        error.code === constants.ErrorCode.CONFIG_ACCESS_KEY_INVALID
       ) {
         next(
           new APIError(
-            constants.ErrorCode.ADDON_PASSWORD_INVALID,
+            constants.ErrorCode.CONFIG_ACCESS_KEY_INVALID,
             undefined,
-            'Please make sure the addon password is provided and correct by attempting to create/save a user first'
+            'Please make sure the config access key is present and correct by creating or saving the user while logged in'
           )
         );
         return;
