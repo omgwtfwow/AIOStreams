@@ -87,9 +87,9 @@ configuration page. Everyone is an admin by default; `AIOSTREAMS_AUTH_ADMINS` na
 dashboard access to named users, and `AIOSTREAMS_AUTH_PROXY` does the same for the
 built-in proxy.
 
-What used to be `ADDON_PASSWORD` lives on as a **config access key**, managed
-automatically, so existing configurations keep working. See
-[Upgrading](#upgrading) below for the one thing you must do.
+The replacement is a **config access key**. This fork does not import the
+retired `ADDON_PASSWORD` value; set `CONFIG_ACCESS_KEY` explicitly when an
+existing configuration needs to keep the same key.
 
 ## For everyone
 
@@ -155,10 +155,9 @@ was possible.
 ## Upgrading
 
 <Callout type="warn">
-  **Keep `ADDON_PASSWORD` in your environment for at least one startup after
-  upgrading.** The migration reads it to set your config access key to the same value,
-  which is what keeps existing configurations working. Once the instance has started
-  once, you can remove it.
+  **Do not carry `ADDON_PASSWORD` forward.** This fork deliberately does not
+  translate the retired variable. Set `CONFIG_ACCESS_KEY` explicitly before
+  upgrading when existing configurations need to keep the same key.
 </Callout>
 
 Everything here only affects self-hosters, and only those using variables that were
