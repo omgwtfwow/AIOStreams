@@ -5,15 +5,12 @@ import {
   constants,
   ChillLinkTransformer,
 } from '@aiostreams/core';
-import { stremioStreamRateLimiter } from '../../middlewares/ratelimit.js';
 import { createResponse } from '../../utils/responses.js';
 import z from 'zod';
 
 const router: Router = Router();
 
 const logger = createLogger('server');
-
-router.use(stremioStreamRateLimiter);
 
 const ChillLinkQuerySchema = z.object({
   type: z.string(),

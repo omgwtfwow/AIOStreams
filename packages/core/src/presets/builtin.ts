@@ -1,7 +1,11 @@
 import { ParsedStream, Stream, UserData } from '../db/index.js';
-import { StreamParser } from '../parser/index.js';
+import { StreamParser, getRegexForTextAfterEmojis } from '../parser/index.js';
 import FileParser from '../parser/file.js';
-import { arrayMerge, mergeParsedFiles } from '../parser/merge.js';
+import {
+  arrayMerge,
+  mergeParsedFiles,
+  applySeasonPackHeuristics,
+} from '../parser/merge.js';
 import { ServiceId } from '../utils/constants.js';
 import {
   constants,
@@ -10,9 +14,20 @@ import {
   toUrlSafeBase64,
 } from '../utils/index.js';
 import { Preset } from './preset.js';
+import { releaseKeyKind } from '../release-blocklist/keys.js';
 import { stremthruSpecialCases } from './stremthru.js';
 
 export class BuiltinStreamParser extends StreamParser {
+  protected override getReleaseKey(stream: Stream): string | undefined {
+    return releaseKeyKind(stream.releaseKey) === 'usenet'
+      ? stream.releaseKey
+      : undefined;
+  }
+
+  protected override getIdMatched(stream: Stream): boolean | undefined {
+    return stream.idMatched === true ? true : undefined;
+  }
+
   protected override getLanguages(
     stream: Stream,
     currentParsedStream: ParsedStream
@@ -41,7 +56,7 @@ export class BuiltinStreamParser extends StreamParser {
     const provided = stream.parsedMediaInfo as ParsedMediaInfo | undefined;
     if (provided) {
       if (typeof provided.duration === 'number')
-        parsedStream.duration = provided.duration;
+        parsedStream.duration = provided.duration * 1000;
       if (typeof provided.bitrate === 'number')
         parsedStream.bitrate = provided.bitrate;
     }
@@ -89,21 +104,10 @@ export class BuiltinStreamParser extends StreamParser {
 
     if (!merged) return undefined;
 
-    if (
-      !merged.seasonPack &&
-      merged.episodes &&
-      merged.episodes.length > 0 &&
-      parsedStream.folderSize &&
-      parsedStream.size &&
-      parsedStream.folderSize > parsedStream.size * 2
-    ) {
-      merged.seasonPack = true;
-    }
-    if (!merged.seasonPack && merged.episodes && merged.episodes.length > 5) {
-      merged.seasonPack = true;
-    }
-
-    return merged;
+    return applySeasonPackHeuristics(merged, {
+      size: parsedStream.size,
+      folderSize: parsedStream.folderSize,
+    });
   }
 
   protected getFolder(
@@ -199,9 +203,7 @@ export class BuiltinStreamParser extends StreamParser {
     stream: Stream,
     currentParsedStream: ParsedStream
   ): string | undefined {
-    return stream.description?.match(
-      this.getRegexForTextAfterEmojis(['🏷️'])
-    )?.[1];
+    return stream.description?.match(getRegexForTextAfterEmojis(['🏷️']))?.[1];
   }
 }
 
@@ -244,6 +246,12 @@ export class BuiltinAddonPreset extends Preset {
             url: credentials.url,
             authToken: credentials.authToken,
             publicUrl: credentials.publicUrl,
+          })
+        ),
+      [constants.AIOSTREAMS_SERVICE]: (credentials: any) =>
+        toUrlSafeBase64(
+          JSON.stringify({
+            aiostreamsAuth: credentials.aiostreamsAuth,
           })
         ),
     };

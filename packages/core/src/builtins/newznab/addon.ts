@@ -9,6 +9,7 @@ import {
 } from '../../debrid/index.js';
 import { SearchMetadata } from '../base/debrid.js';
 import { hashNzbUrl } from '../../debrid/utils.js';
+import { toUnixSeconds, usenetKey } from '../../release-blocklist/index.js';
 import { BaseNabApi, SearchResultItem } from '../base/nab/api.js';
 import {
   BaseNabAddon,
@@ -72,6 +73,7 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
             constants.ALTMOUNT_SERVICE,
             constants.STREMIO_NNTP_SERVICE,
             constants.STREMTHRU_NEWZ_SERVICE,
+            constants.AIOSTREAMS_SERVICE,
           ].includes(s.id)
       )
     ) {
@@ -93,14 +95,20 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
       return undefined;
     }
 
-    const endpoint = appConfig.nzbProxy.zyclopsHealthProxyEndpoint;
+    const endpoint = appConfig.builtins.nab.zyclopsHealthProxyEndpoint;
     const path = '/api';
     const extraParams: Record<string, string | number | boolean> = {};
 
     const upstreamBase = this.userData.url.trim().replace(/\/+$/, '');
-    const upstreamApiPath = this.userData.apiPath?.startsWith('/')
-      ? this.userData.apiPath
-      : `/${this.userData.apiPath || 'api'}`;
+    // an absent apiPath means the legacy '/api' default; an empty one means the
+    // url is already a complete endpoint
+    const rawApiPath = this.userData.apiPath;
+    const upstreamApiPath =
+      rawApiPath === undefined
+        ? '/api'
+        : rawApiPath && !rawApiPath.startsWith('/')
+          ? `/${rawApiPath}`
+          : rawApiPath;
     const target = upstreamBase
       ? `${upstreamBase}${upstreamApiPath}`
       : this.userData.url;
@@ -171,7 +179,7 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
       seenNzbs.add(nzbUrl);
 
       const zyclopsHealth = result.newznab?.zyclopsHealth?.toString();
-      const md5 = result.newznab?.infohash?.toString() || hashNzbUrl(nzbUrl);
+      const md5 = hashNzbUrl(nzbUrl);
 
       let date = result.pubDate?.toString();
       if (typeof result.newznab?.usenetdate === 'string') {
@@ -192,7 +200,9 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
         age: age,
         title: result.title,
         indexer:
+          result.newznab?.sourceIndexerName?.toString() ??
           result.newznab?.hydraIndexerName?.toString() ??
+          result.prowlarrindexer?.name ??
           meta.capabilities.server.title,
         size:
           result.size ??
@@ -203,6 +213,23 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
         parsedMediaInfo,
       };
 
+      const keySize =
+        typeof enclosure?.length === 'number' && enclosure.length > 0
+          ? enclosure.length
+          : result.newznab?.size
+            ? Number(result.newznab.size)
+            : 0;
+      const releaseKey = usenetKey(
+        keySize,
+        typeof result.newznab?.poster === 'string'
+          ? result.newznab.poster
+          : null,
+        toUnixSeconds(date)
+      );
+      if (releaseKey) {
+        nzb.releaseKey = releaseKey;
+      }
+
       if (zyclopsHealth) {
         nzb.zyclopsHealth = zyclopsHealth;
       }
@@ -210,17 +237,9 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
       nzbs.push(nzb);
     }
 
-    if (this.userData.proxyAuth || appConfig.nzbProxy.publicEnabled) {
-      const auth = this.userData.proxyAuth
-        ? this.userData.proxyAuth
-        : `${constants.PUBLIC_NZB_PROXY_USERNAME}:${appConfig.bootstrap.auth?.get(
-            constants.PUBLIC_NZB_PROXY_USERNAME
-          )}`;
-      try {
-        BuiltinProxy.validateAuth(auth);
-      } catch (error) {
-        throw new Error('Invalid AIOStreams Proxy Auth Credentials');
-      }
+    if (this.userData.proxyAuth) {
+      const auth = this.userData.proxyAuth;
+      BuiltinProxy.validateAuth(auth);
       const proxy = createProxy({
         id: constants.BUILTIN_SERVICE,
         url: appConfig.bootstrap.baseUrl,
@@ -277,6 +296,8 @@ export class NewznabAddon extends BaseNabAddon<NewznabAddonConfig, NewznabApi> {
   }
 
   private getEnclosure(result: any) {
-    return result.enclosure.find((e: any) => e.type === 'application/x-nzb');
+    return result.enclosure?.find((e: any) =>
+      e.type?.toLowerCase().includes('nzb')
+    );
   }
 }

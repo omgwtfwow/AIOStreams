@@ -8,12 +8,14 @@ import {
   Cache,
   DistributedLock,
   getTimeTakenSincePoint,
+  makeUrlLogSafe,
 } from '../utils/index.js';
 import {
   selectFileInTorrentOrNZB,
   Torrent,
   hashNzbUrl,
   buildResolveKey,
+  removeDownloadOnAbort,
 } from './utils.js';
 import {
   DebridServiceConfig,
@@ -24,7 +26,8 @@ import {
   UsenetDebridService,
   DebridFailureCache,
 } from './base.js';
-import { parseTorrentTitle, ParsedResult } from '@viren070/parse-torrent-title';
+import { ParsedResult } from '@viren070/parse-torrent-title';
+import { parseTorrentTitleCached } from '../parser/title.js';
 import assert from 'assert';
 
 const logger = createLogger('debrid:stremthru');
@@ -84,7 +87,9 @@ export class StremThruService
   };
 
   // Shared caches across all StremThruService instances.
-  // Cache keys include serviceName + token so different services never collide.
+  // Cache keys include serviceName + a hash of the token so different
+  // services/accounts never collide; hashed because these keys reach log
+  // lines (distributed locks) and file lock paths.
   private static playbackLinkCache = Cache.getInstance<string, string | null>(
     'st:link'
   );
@@ -155,7 +160,7 @@ export class StremThruService
   //  Shared library helpers (pagination, stale-while-revalidate)
 
   private getLibraryCacheKey(type: 'torrent' | 'usenet'): string {
-    return `${type}:${this.serviceName}:${this.config.stremthru.token}`;
+    return `${type}:${this.serviceName}:${getSimpleTextHash(this.config.stremthru.token)}`;
   }
 
   private getLibraryLimit(): number {
@@ -799,7 +804,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    signal?: AbortSignal
   ): Promise<string | undefined> {
     if (playbackInfo.type === 'usenet') {
       const effectiveCacheAndPlay =
@@ -826,7 +832,8 @@ export class StremThruService
             playbackInfo,
             filename,
             effectiveCacheAndPlay,
-            effectiveAutoRemove
+            effectiveAutoRemove,
+            signal
           ),
         {
           timeout: effectiveCacheAndPlay
@@ -859,7 +866,8 @@ export class StremThruService
           playbackInfo,
           filename,
           cacheAndPlay,
-          autoRemoveDownloads
+          autoRemoveDownloads,
+          signal
         ),
       {
         timeout: cacheAndPlay
@@ -880,7 +888,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo & { type: 'torrent' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    signal?: AbortSignal
   ): Promise<string | undefined> {
     const { hash, metadata } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -924,13 +933,16 @@ export class StremThruService
       (await this.checkCacheGet(hash))?.status !== 'cached'
     ) {
       logger.debug(
-        `Adding torrent to ${this.serviceName} for ${playbackInfo.downloadUrl}`
+        `Adding torrent to ${this.serviceName} for ${makeUrlLogSafe(playbackInfo.downloadUrl)}`
       );
       magnetDownload = await this.addTorrent(playbackInfo.downloadUrl);
-      logger.debug(`Torrent added for ${playbackInfo.downloadUrl}`, {
-        status: magnetDownload.status,
-        id: magnetDownload.id,
-      });
+      logger.debug(
+        `Torrent added for ${makeUrlLogSafe(playbackInfo.downloadUrl)}`,
+        {
+          status: magnetDownload.status,
+          id: magnetDownload.id,
+        }
+      );
     } else {
       let magnet = `magnet:?xt=urn:btih:${hash}`;
       if (playbackInfo.filename) {
@@ -940,12 +952,29 @@ export class StremThruService
         magnet += `&tr=${playbackInfo.sources.join('&tr=')}`;
       }
 
-      logger.debug(`Adding magnet to ${this.serviceName} for ${magnet}`);
+      logger.debug(
+        `Adding magnet to ${this.serviceName} for ${makeUrlLogSafe(magnet)}`
+      );
       magnetDownload = await this.addMagnet(magnet);
-      logger.debug(`Magnet download added for ${magnet}`, {
+      logger.debug(`Magnet download added for ${makeUrlLogSafe(magnet)}`, {
         status: magnetDownload.status,
         id: magnetDownload.id,
       });
+    }
+
+    // If this attempt loses a parallel failover race, drop the magnet we just
+    // added. Skipped for items resolved from an existing library entry
+    // (serviceItemId) and for private torrents (seeding obligations).
+    if (!playbackInfo.serviceItemId) {
+      removeDownloadOnAbort(
+        signal,
+        {
+          id: magnetDownload.id,
+          private: magnetDownload.private ?? playbackInfo.private,
+        },
+        (id) => this.removeMagnet(id),
+        (m) => logger.warn(m)
+      );
     }
 
     if (magnetDownload.status !== 'downloaded') {
@@ -958,6 +987,15 @@ export class StremThruService
         this.cacheAndPlayOptions.maxWaitTime / pollingInterval
       );
       for (let i = 0; i < maxPolls; i++) {
+        if (signal?.aborted) {
+          throw new DebridError('resolve aborted (failover lost)', {
+            statusCode: 499,
+            statusText: 'Client Closed Request',
+            code: 'UNKNOWN',
+            headers: {},
+            body: null,
+          });
+        }
         await new Promise((resolve) => setTimeout(resolve, pollingInterval));
         const list = await this.listMagnets();
         const magnetDownloadInList = list.find(
@@ -999,7 +1037,7 @@ export class StremThruService
         throw new DebridError(`Timed out waiting for magnet to download`, {
           statusCode: 408,
           statusText: `Timed out waiting for magnet to download`,
-          code: 'UNKNOWN',
+          code: 'TIMEOUT',
           headers: {},
           body: magnetDownload,
         });
@@ -1057,7 +1095,7 @@ export class StremThruService
       allStrings.push(magnetDownload.name ?? '');
       allStrings.push(...magnetDownload.files.map((file) => file.name ?? ''));
       const parseResults: ParsedResult[] = allStrings.map((string) =>
-        parseTorrentTitle(string)
+        parseTorrentTitleCached(string)
       );
       const parsedFiles = new Map<string, ParsedResult>();
       for (const [index, result] of parseResults.entries()) {
@@ -1121,7 +1159,8 @@ export class StremThruService
     playbackInfo: PlaybackInfo & { type: 'usenet' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    signal?: AbortSignal
   ): Promise<string | undefined> {
     const { nzb, metadata, hash } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -1135,7 +1174,7 @@ export class StremThruService
     const cachedLink = await StremThruService.playbackLinkCache.get(cacheKey);
 
     if (cachedLink !== undefined) {
-      logger.debug(`Using cached link for ${nzb || hash}`);
+      logger.debug(`Using cached link for ${nzb ? makeUrlLogSafe(nzb) : hash}`);
       if (cachedLink === null) {
         if (!cacheAndPlay) {
           return undefined;
@@ -1189,14 +1228,25 @@ export class StremThruService
         name: usenetDownload.name,
       });
     } else {
-      logger.debug(`Adding usenet download for ${nzb}`, { hash });
+      logger.debug(`Adding usenet download for ${makeUrlLogSafe(nzb)}`, {
+        hash,
+      });
 
       usenetDownload = await this.addNzb(nzb, filename);
 
-      logger.debug(`Usenet download added for ${nzb}`, {
+      logger.debug(`Usenet download added for ${makeUrlLogSafe(nzb)}`, {
         status: usenetDownload.status,
         id: usenetDownload.id,
       });
+
+      // If this attempt loses a parallel failover race, drop the usenet
+      // download we just added (library lookups above are left intact).
+      removeDownloadOnAbort(
+        signal,
+        { id: usenetDownload.id },
+        (id) => this.removeNzb(id),
+        (m) => logger.warn(m)
+      );
     }
 
     if (usenetDownload.status !== 'downloaded') {
@@ -1209,11 +1259,20 @@ export class StremThruService
           this.cacheAndPlayOptions.pollingInterval
       );
       for (let i = 0; i < maxPolls; i++) {
+        if (signal?.aborted) {
+          throw new DebridError('resolve aborted (failover lost)', {
+            statusCode: 499,
+            statusText: 'Client Closed Request',
+            code: 'UNKNOWN',
+            headers: {},
+            body: null,
+          });
+        }
         await new Promise((resolve) =>
           setTimeout(resolve, this.cacheAndPlayOptions.pollingInterval)
         );
         const polledDownload = await this.getNzb(usenetDownload.id.toString());
-        logger.debug(`Polled status for ${nzb || hash}`, {
+        logger.debug(`Polled status for ${nzb ? makeUrlLogSafe(nzb) : hash}`, {
           attempt: i + 1,
           status: polledDownload.status,
         });
@@ -1227,7 +1286,7 @@ export class StremThruService
             {
               statusCode: 400,
               statusText: `Usenet download ${polledDownload.status}`,
-              code: 'UNKNOWN',
+              code: 'DOWNLOAD_FAILED',
               headers: {},
               body: polledDownload,
             }
@@ -1248,7 +1307,7 @@ export class StremThruService
           {
             statusCode: 408,
             statusText: `Timed out waiting for usenet download to complete`,
-            code: 'UNKNOWN',
+            code: 'TIMEOUT',
             headers: {},
             body: usenetDownload,
           }
@@ -1309,7 +1368,7 @@ export class StremThruService
       allStrings.push(...usenetDownload.files.map((f) => f.name ?? ''));
 
       const parseResults: ParsedResult[] = allStrings.map((string) =>
-        parseTorrentTitle(string)
+        parseTorrentTitleCached(string)
       );
       const parsedFiles = new Map<string, ParsedResult>();
       for (const [index, result] of parseResults.entries()) {

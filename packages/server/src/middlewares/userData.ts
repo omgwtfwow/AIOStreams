@@ -1,6 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
 import {
-  config as appConfig,
   createLogger,
   APIError,
   constants,
@@ -10,8 +9,17 @@ import {
   StremioTransformer,
   UserRepository,
   Env,
+  isConfigUuid,
+  resolveConfigAlias,
+  activateVariants,
+  recordClientAgent,
+  resolveVariantSelector,
+  logVariantNotes,
+  VARIANT_QUERY_PARAM,
+  VARIANT_PATH_PARAM,
 } from '@aiostreams/core';
 import { syncUserDataUrls } from '../utils/syncUserData.js';
+import { buildVariantRequestContext } from '../utils/variant-context.js';
 
 const logger = createLogger('server');
 
@@ -23,6 +31,8 @@ const VALID_RESOURCES = [
   'manifest',
   'streams',
 ];
+
+const RESOURCE_REGEX = new RegExp(`/(${VALID_RESOURCES.join('|')})`);
 
 interface UserDataParams {
   uuid?: string;
@@ -44,9 +54,7 @@ export const userDataMiddleware = async (
     return;
   }
   // First check - validate path has two components followed by valid resource
-  const resourceRegex = new RegExp(`/(${VALID_RESOURCES.join('|')})`);
-
-  const resourceMatch = req.path.match(resourceRegex);
+  const resourceMatch = req.path.match(RESOURCE_REGEX);
   if (!resourceMatch) {
     next();
     return;
@@ -54,10 +62,8 @@ export const userDataMiddleware = async (
 
   // Second check - validate UUID format (simpler regex that just checks UUID format)
   let uuid: string | undefined;
-  const uuidRegex =
-    /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
-  if (!uuidRegex.test(uuidOrAlias)) {
-    const alias = appConfig.api.aliasedConfigurations[uuidOrAlias];
+  if (!isConfigUuid(uuidOrAlias)) {
+    const alias = await resolveConfigAlias(uuidOrAlias);
     if (alias) {
       uuid = alias.uuid;
     } else {
@@ -125,6 +131,55 @@ export const userDataMiddleware = async (
     userData.ip = req.userIp;
 
     if (resource !== 'configure') {
+      // Before syncUserDataUrls, since a variant may add a synced URL, and
+      // before validateConfig, which is what makes the patch safe.
+      try {
+        const { ids: selected, location } = resolveVariantSelector(
+          req.params[VARIANT_PATH_PARAM],
+          req.query[VARIANT_QUERY_PARAM]
+        );
+        const context = buildVariantRequestContext(req, resource);
+        void recordClientAgent(uuid, context.userAgent, resource);
+        const result = await activateVariants(userData, selected, context);
+        userData = result.userData;
+        if (selected.length) {
+          userData.variantSelectorLocation = location;
+        }
+        if (result.applied.length) {
+          // Per request, so it is visible whether a client carries the
+          // selector beyond the manifest.
+          logger.info(
+            {
+              uuid,
+              resource,
+              variants: userData.activeVariants,
+              auto: result.auto,
+              location: selected.length ? location : undefined,
+            },
+            'serving request with config variants'
+          );
+          logVariantNotes(uuid, result);
+        }
+      } catch (error: any) {
+        if (constants.RESOURCES.includes(resource as Resource)) {
+          res.status(200).json(
+            StremioTransformer.createDynamicError(resource as Resource, {
+              errorDescription: error.message,
+            })
+          );
+          return;
+        }
+        logger.warn(`Invalid variant selection for ${uuid}: ${error.message}`);
+        next(
+          new APIError(
+            constants.ErrorCode.USER_INVALID_CONFIG,
+            undefined,
+            error.message
+          )
+        );
+        return;
+      }
+
       userData = await syncUserDataUrls(userData);
 
       try {

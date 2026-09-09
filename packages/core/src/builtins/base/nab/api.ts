@@ -3,13 +3,14 @@ import {
   Cache,
   DistributedLock,
   formatZodError,
+  getSimpleTextHash,
   getTimeTakenSincePoint,
   createLogger,
   makeRequest,
   makeUrlLogSafe,
+  parseXmlCompat,
 } from '../../../utils/index.js';
 import { config as appConfig } from '../../../config/index.js';
-import { Parser } from 'xml2js';
 import type { Logger } from '../../../logging/logger.js';
 import { searchWithBackgroundRefresh } from '../../utils/general.js';
 
@@ -81,6 +82,35 @@ const AttributeSchema = z
   .object({ $: z.object({ name: z.string(), value: convertString }) })
   .transform((attr) => ({ [attr.$.name]: attr.$.value }));
 
+type NabAttributes = Record<string, string | number | boolean | undefined>;
+
+/**
+ * Collapse `<ns:attr>` elements into a single object.
+ */
+const collapseAttributes = (
+  attrs: NabAttributes[] | undefined
+): NabAttributes =>
+  attrs?.reduce<NabAttributes>((acc, attr) => {
+    for (const key in attr) {
+      const value = attr[key];
+      if (value === '') continue;
+      const previous = acc[key];
+      acc[key] =
+        typeof previous === 'string' && previous && typeof value === 'string'
+          ? `${previous},${value}`
+          : value;
+    }
+    return acc;
+  }, {}) ?? {};
+
+const GuidSchema = z
+  .array(z.union([z.string(), z.object({ _: z.string().optional() })]))
+  .optional()
+  .transform((arr) => {
+    const first = arr?.[0];
+    return (typeof first === 'string' ? first : first?._) || undefined;
+  });
+
 // Create specific schemas for each namespace
 const createTorznabItemSchema = () =>
   z
@@ -90,10 +120,19 @@ const createTorznabItemSchema = () =>
         .array(z.string())
         .optional()
         .transform((arr) => arr?.[0]),
-      guid: z
-        .array(z.union([z.string(), z.object({ _: z.string() })]))
-        .transform((arr) => (typeof arr[0] === 'string' ? arr[0] : arr[0]._)),
+      guid: GuidSchema,
       pubDate: z.array(z.string()).transform((arr) => arr[0]),
+      prowlarrindexer: z
+        .array(
+          z.object({
+            _: z.string(),
+            $: z.object({ id: z.string() }),
+          })
+        )
+        .optional()
+        .transform((arr) =>
+          arr?.[0] ? { name: arr[0]._, id: arr[0].$.id } : undefined
+        ),
       jackettindexer: z
         .array(
           z.object({
@@ -127,26 +166,14 @@ const createTorznabItemSchema = () =>
       'torznab:attr': z
         .array(AttributeSchema)
         .optional()
-        .transform(
-          (arr) =>
-            arr?.reduce((acc, attr) => {
-              for (const key in attr) {
-                acc[key] =
-                  acc[key] &&
-                  typeof acc[key] === 'string' &&
-                  typeof attr[key] === 'string'
-                    ? acc[key] + ',' + attr[key]
-                    : attr[key];
-              }
-              return acc;
-            }, {}) ?? {}
-        ),
+        .transform(collapseAttributes),
     })
     .transform((item) => ({
       title: item.title,
       link: item.link,
       guid: item.guid,
       pubDate: item.pubDate,
+      prowlarrindexer: item.prowlarrindexer,
       jackettindexer: item.jackettindexer,
       type: item.type,
       size: item.size,
@@ -162,14 +189,23 @@ const createNewznabItemSchema = () =>
         .array(z.string())
         .optional()
         .transform((arr) => arr?.[0]),
-      guid: z
-        .array(z.union([z.string(), z.object({ _: z.string() })]))
-        .transform((arr) => (typeof arr[0] === 'string' ? arr[0] : arr[0]._)),
+      guid: GuidSchema,
       pubDate: z.array(z.string()).transform((arr) => arr[0]),
       size: z
         .array(z.string())
         .optional()
         .transform((arr) => (arr?.[0] ? Number(arr[0]) : undefined)),
+      prowlarrindexer: z
+        .array(
+          z.object({
+            _: z.string(),
+            $: z.object({ id: z.string() }),
+          })
+        )
+        .optional()
+        .transform((arr) =>
+          arr?.[0] ? { name: arr[0]._, id: arr[0].$.id } : undefined
+        ),
       enclosure: z.array(
         z
           .object({
@@ -184,9 +220,7 @@ const createNewznabItemSchema = () =>
       'newznab:attr': z
         .array(AttributeSchema)
         .optional()
-        .transform(
-          (arr) => arr?.reduce((acc, attr) => ({ ...acc, ...attr }), {}) ?? {}
-        ),
+        .transform(collapseAttributes),
     })
     .transform((item) => ({
       title: item.title,
@@ -196,6 +230,7 @@ const createNewznabItemSchema = () =>
       size: item.size,
       enclosure: item.enclosure,
       newznab: item['newznab:attr'],
+      prowlarrindexer: item.prowlarrindexer,
     }));
 
 // schema for response attributes (offset, total only)
@@ -235,9 +270,75 @@ type RawSearchResponse = {
   results: (TorznabSearchResultItem | NewznabSearchResultItem)[];
 };
 
+// --- Connection test ---
+const NAB_TEST_TIMEOUT = 15000;
+
+/** Newznab reserves 100-104 for credential/account rejections. */
+const NAB_AUTH_ERROR_CODES = new Set([100, 101, 102, 103, 104]);
+
+export type NabTestStage = 'caps' | 'auth' | 'search';
+
+/** The id params the addon looks for before falling back to a title search. */
+const NAB_ID_SEARCH_PARAMS = ['imdbid', 'tvdbid', 'tmdbid'];
+
+export type NabTestResult = {
+  ok: boolean;
+  stage?: NabTestStage;
+  server?: Capabilities['server'];
+  limits?: Capabilities['limits'];
+  searchModes?: string[];
+  /** ID params actually usable per media type - movie-search/tv-search each advertise their own supportedParams, and one may support IDs while the other doesn't. */
+  idSearchParams?: { movie: string[]; series: string[] };
+  resultCount?: number;
+  error?: { code?: number; message: string };
+};
+
+/**
+ * Mirrors BaseNabAddon.getSearchFunction's matching: a keyword-matching
+ * function (e.g. "movie"/"tv") if available, else the generic `search`.
+ */
+const findIdSearchParams = (
+  searching: Capabilities['searching'],
+  keyword: string
+): string[] => {
+  const key = Object.keys(searching).find((s) =>
+    s.toLowerCase().includes(keyword)
+  );
+  const fn =
+    (key && searching[key]?.available && searching[key]) ||
+    (searching.search?.available && searching.search) ||
+    undefined;
+  return (fn?.supportedParams ?? []).filter((param) =>
+    NAB_ID_SEARCH_PARAMS.includes(param)
+  );
+};
+
+const resolveTestStage = (
+  error: unknown,
+  fallback: NabTestStage
+): NabTestStage =>
+  error instanceof NabApiError && NAB_AUTH_ERROR_CODES.has(error.code)
+    ? 'auth'
+    : fallback;
+
+const describeTestError = (
+  error: unknown
+): { code?: number; message: string } => {
+  if (error instanceof NabApiError) {
+    return { code: error.code, message: error.description };
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  if (
+    message.startsWith('Failed to parse XML response') ||
+    message.startsWith('Response validation failed')
+  ) {
+    return { message: 'The response was not a Newznab/Torznab API response' };
+  }
+  return { message };
+};
+
 // --- API Client Class ---
 export class BaseNabApi<N extends 'torznab' | 'newznab'> {
-  private readonly xmlParser: Parser;
   private readonly capabilitiesCache: Cache<string, Capabilities>;
   private readonly searchCache: Cache<string, SearchResponse<N>>;
   private readonly SearchResultSchema: z.ZodType<RawSearchResponse>;
@@ -268,9 +369,9 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
           this.params[key] = value;
         }
       });
+      this.baseUrl = apiPathUrl.origin;
       this.apiPath = apiPathUrl.pathname;
     }
-    this.xmlParser = new Parser();
     this.capabilitiesCache = Cache.getInstance(`${namespace}:api:caps`);
     this.searchCache = Cache.getInstance(`${namespace}:api:search:v2`);
     this.userAgent =
@@ -371,7 +472,7 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
     searchFunction: string = 'search',
     params: Record<string, string | number | boolean> = {}
   ): Promise<SearchResponse<N>> {
-    const cacheKey = `${this.baseUrl}${this.apiPath}?t=${searchFunction}&${JSON.stringify(params)}&apikey=${this.apiKey}&${JSON.stringify(this.params)}`;
+    const cacheKey = `${this.baseUrl}${this.apiPath}?t=${searchFunction}&${JSON.stringify(params)}&apikey=${this.apiKey ? getSimpleTextHash(this.apiKey) : ''}&${JSON.stringify(this.params)}`;
 
     return searchWithBackgroundRefresh({
       searchCache: this.searchCache as Cache<string, SearchResponse<N>>,
@@ -389,12 +490,69 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
     });
   }
 
+  /**
+   * Probe the endpoint.
+   *
+   * `caps` proves the url and api path; the bare `search` proves the api key,
+   * since plenty of indexers serve caps without authenticating.
+   */
+  public async testConnection(): Promise<NabTestResult> {
+    let capabilities: Capabilities;
+    try {
+      capabilities = await this._request(
+        'caps',
+        CapabilitiesSchema,
+        undefined,
+        NAB_TEST_TIMEOUT
+      );
+    } catch (error) {
+      return {
+        ok: false,
+        stage: resolveTestStage(error, 'caps'),
+        error: describeTestError(error),
+      };
+    }
+
+    const available = Object.entries(capabilities.searching).filter(
+      ([, fn]) => fn?.available === true
+    );
+    const details = {
+      server: capabilities.server,
+      limits: capabilities.limits,
+      searchModes: available.map(([name]) => name),
+      idSearchParams: {
+        movie: findIdSearchParams(capabilities.searching, 'movie'),
+        series: findIdSearchParams(capabilities.searching, 'tv'),
+      },
+    };
+
+    try {
+      const response = await this._request(
+        'search',
+        this.SearchResultSchema,
+        { limit: 1 },
+        NAB_TEST_TIMEOUT
+      );
+      return {
+        ok: true,
+        ...details,
+        resultCount: response.total ?? response.results.length,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        stage: resolveTestStage(error, 'search'),
+        ...details,
+        error: describeTestError(error),
+      };
+    }
+  }
+
   private removeTrailingSlash = (path: string) =>
     path.endsWith('/') ? path.slice(0, -1) : path;
 
   private getHeaders = (): Record<string, string> => {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/xml',
       Accept: 'application/rss+xml, text/rss+xml, application/xml, text/xml',
       'User-Agent': this.userAgent,
     };
@@ -407,7 +565,7 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
     params: Record<string, string | number | boolean> = {},
     timeout?: number
   ): Promise<T> {
-    const lockKey = `${this.baseUrl}${this.apiPath}?t=${func}&${JSON.stringify(params)}&apikey=${this.apiKey}&${JSON.stringify(this.params)}`;
+    const lockKey = `${this.baseUrl}${this.apiPath}?t=${func}&${JSON.stringify(params)}&apikey=${this.apiKey ? getSimpleTextHash(this.apiKey) : ''}&${JSON.stringify(this.params)}`;
     const { result } = await DistributedLock.getInstance().withLock(
       lockKey,
       () => this._request(func, schema, params, timeout),
@@ -452,6 +610,9 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
         headers: this.getHeaders(),
         timeout: timeout ?? appConfig.builtins.nab.searchTimeout,
         forceProxy: this.httpProxy,
+        // `[newznab]`/`[torznab]` overrides apply on top of getHeaders()
+        // (legacy nab.userAgent) inside makeRequest.
+        context: this.namespace,
       });
 
       const data = await response.text();
@@ -459,11 +620,10 @@ export class BaseNabApi<N extends 'torznab' | 'newznab'> {
       let result: any | null = null;
       let parseError: Error | null = null;
       try {
-        result = await this.xmlParser.parseStringPromise(data);
+        result = parseXmlCompat(data);
       } catch (error) {
         parseError = error as Error;
       }
-      this.xmlParser.reset();
 
       if (result && result.error) {
         const code = parseInt(result.error.$.code, 10);

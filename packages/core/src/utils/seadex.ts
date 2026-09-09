@@ -37,14 +37,12 @@ export async function getSeaDexInfoHashes(
     for (const torrent of torrents) {
       const infoHash = torrent.infoHash;
 
-      if (!infoHash || infoHash.includes('<redacted>') || infoHash === '') {
-        continue;
-      }
+      if (infoHash && !infoHash.includes('<redacted>')) {
+        allHashes.add(infoHash);
 
-      allHashes.add(infoHash);
-
-      if (torrent.isBest) {
-        bestHashes.add(infoHash);
+        if (torrent.isBest) {
+          bestHashes.add(infoHash);
+        }
       }
 
       const releaseGroup = torrent.releaseGroup?.toLowerCase();

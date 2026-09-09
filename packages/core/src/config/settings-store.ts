@@ -2,9 +2,13 @@
 import { SettingsRepository } from '../db/repositories/settings.js';
 import { createLogger } from '../logging/logger.js';
 import { formatZodError } from '../utils/format-zod-error.js';
+import { encryptString, decryptString } from '../utils/crypto.js';
 import {
+  deprecationMessage,
   isRuntimeConfigField,
   resolveDescription,
+  resolveEnvOverride,
+  primaryEnvName,
   type ConfigValue,
   type RuntimeConfigField,
   type RuntimeConfigMetadata,
@@ -160,11 +164,16 @@ export type SettingsChangeListener<TSections extends SectionSchemas> = (
 export class SettingsStore<TSections extends SectionSchemas> {
   private snapshot: Snapshot<TSections>;
   private version = 0;
+  private initialisedFlag = false;
   private storedKeys: Set<string> = new Set();
   private fieldsByKey: Map<string, FieldEntry>;
   private listeners: Set<SettingsChangeListener<TSections>> = new Set();
+  private warnedLegacyEnv: Set<string> = new Set();
 
-  constructor(private readonly schemas: TSections) {
+  constructor(
+    private readonly schemas: TSections,
+    private readonly aliases: Record<string, string> = {}
+  ) {
     this.fieldsByKey = new Map();
     for (const sectionName of Object.keys(schemas)) {
       const section = schemas[sectionName] as Record<string, RuntimeConfigNode>;
@@ -188,6 +197,14 @@ export class SettingsStore<TSections extends SectionSchemas> {
     return this.snapshot;
   }
 
+  /**
+   * False until the first successful reload replaces the throwing seed
+   * snapshot.
+   */
+  get initialised(): boolean {
+    return this.initialisedFlag;
+  }
+
   /** Monotonic settings version (bumped by every DB write across all replicas). */
   get currentVersion(): number {
     return this.version;
@@ -201,17 +218,17 @@ export class SettingsStore<TSections extends SectionSchemas> {
         key,
         label: field.label,
         description: resolveDescription(field.description, 'ui'),
-        env: field.env,
+        env: primaryEnvName(field.env),
         requiresRestart: field.requiresRestart,
         secret: field.secret,
         valueType: valueType(field.schema),
         default: field.default,
-        source:
-          field.env && process.env[field.env] !== undefined
-            ? 'environment'
-            : storedKeysCache.has(key)
-              ? 'database'
-              : 'default',
+        source: resolveEnvOverride(field.env)
+          ? 'environment'
+          : storedKeysCache.has(key)
+            ? 'database'
+            : 'default',
+        deprecated: deprecationMessage(field.deprecated),
       });
     }
     return result;
@@ -225,16 +242,49 @@ export class SettingsStore<TSections extends SectionSchemas> {
     const emit = options.emit !== false;
     const previous = this.snapshot;
     const rows = await SettingsRepository.getAll();
-    const stored = new Map<string, unknown>();
+
+    // Parse raw row values, then fold renamed (aliased) keys onto their current
+    // schema key so values saved under an old key survive the rename.
+    const rawByKey = new Map<string, unknown>();
     for (const row of rows) {
       try {
-        stored.set(row.key, JSON.parse(row.value));
+        rawByKey.set(row.key, JSON.parse(row.value));
       } catch (error) {
         logger.warn({ key: row.key, error }, 'Ignoring invalid stored setting');
       }
     }
+    // A real row under the canonical key always wins; among multiple stale
+    // aliases that resolve to the same key, the one closest to it (the most
+    // recent rename) wins.
+    const directlyStored = new Set(rawByKey.keys());
+    const candidates = new Map<string, { value: unknown; hops: number }>();
+    for (const oldKey of Object.keys(this.aliases)) {
+      if (!rawByKey.has(oldKey)) continue;
+      const { key: canonical, hops } = this.resolveAlias(oldKey);
+      if (canonical !== oldKey) {
+        const existing = candidates.get(canonical);
+        if (!existing || hops < existing.hops) {
+          candidates.set(canonical, { value: rawByKey.get(oldKey), hops });
+        }
+      }
+      rawByKey.delete(oldKey);
+    }
+    for (const [canonical, { value }] of candidates) {
+      if (!directlyStored.has(canonical)) rawByKey.set(canonical, value);
+    }
+
+    const stored = new Map<string, unknown>();
+    for (const [key, raw] of rawByKey) {
+      try {
+        const decoded = this.decodeFromStorage(key, raw);
+        if (decoded !== undefined) stored.set(key, decoded);
+      } catch (error) {
+        logger.warn({ key, error }, 'Ignoring invalid stored setting');
+      }
+    }
     this.storedKeys = new Set(stored.keys());
     this.snapshot = this.buildSnapshot(stored);
+    this.initialisedFlag = true;
     this.version = await SettingsRepository.getVersion();
     if (!emit) return new Set();
     const changed = this.diffKeys(previous, this.snapshot);
@@ -304,17 +354,23 @@ export class SettingsStore<TSections extends SectionSchemas> {
   async set(key: string, value: unknown, updatedBy?: string): Promise<void> {
     const entry = this.requireField(key);
     const parsed = entry.field.schema.parse(value);
-    if (entry.field.env && process.env[entry.field.env] !== undefined) {
-      throw new Error(`Setting ${key} is overridden by ${entry.field.env}`);
+    const override = resolveEnvOverride(entry.field.env);
+    if (override) {
+      throw new Error(`Setting ${key} is overridden by ${override.name}`);
     }
-    await SettingsRepository.set(key, parsed, updatedBy);
+    await SettingsRepository.set(
+      key,
+      this.encodeForStorage(key, parsed as ConfigValue),
+      updatedBy
+    );
     await this.reload();
   }
 
   async delete(key: string): Promise<void> {
     const entry = this.requireField(key);
-    if (entry.field.env && process.env[entry.field.env] !== undefined) {
-      throw new Error(`Setting ${key} is overridden by ${entry.field.env}`);
+    const override = resolveEnvOverride(entry.field.env);
+    if (override) {
+      throw new Error(`Setting ${key} is overridden by ${override.name}`);
     }
     await SettingsRepository.delete(key);
     await this.reload();
@@ -376,7 +432,22 @@ export class SettingsStore<TSections extends SectionSchemas> {
     };
 
     for (const { field, path, key } of this.fieldsByKey.values()) {
-      const rawEnv = field.env ? process.env[field.env] : undefined;
+      const override = resolveEnvOverride(field.env);
+      const rawEnv = override?.value;
+      // Names after the first are aliases kept working across a rename, so only
+      // an operator still setting one hears about it.
+      const primary = primaryEnvName(field.env);
+      if (
+        override &&
+        override.name !== primary &&
+        !this.warnedLegacyEnv.has(override.name)
+      ) {
+        this.warnedLegacyEnv.add(override.name);
+        logger.warn(
+          { key, deprecated: override.name, replacement: primary },
+          'environment variable is deprecated'
+        );
+      }
 
       let value: ConfigValue | undefined;
       if (rawEnv !== undefined) {
@@ -385,7 +456,7 @@ export class SettingsStore<TSections extends SectionSchemas> {
         } catch (err) {
           fatalErrors.push({
             source: 'env',
-            label: field.env!,
+            label: override!.name,
             key,
             value: field.secret ? '(secret)' : rawEnv,
             message: formatZodError(err as ZodError, {
@@ -453,9 +524,78 @@ export class SettingsStore<TSections extends SectionSchemas> {
     return snapshot as Snapshot<TSections>;
   }
 
+  /**
+   * Follow the alias chain for a stored key to its current schema key. Renames
+   * are recorded as single hops (`A → B`, `B → C`); this chases them so a value
+   * still stored under `A` resolves to `C`. Returns the endpoint key and the
+   * number of hops taken (used to prefer the most-recent rename when several
+   * stale keys resolve to the same canonical key). A `visited` set guards
+   * against a cyclic alias map looping forever.
+   */
+  private resolveAlias(key: string): { key: string; hops: number } {
+    const visited = new Set<string>([key]);
+    let current = key;
+    let hops = 0;
+    while (this.aliases[current] !== undefined) {
+      const next = this.aliases[current];
+      if (visited.has(next)) break;
+      visited.add(next);
+      current = next;
+      hops++;
+    }
+    return { key: current, hops };
+  }
+
   private requireField(key: string): FieldEntry {
     const entry = this.fieldsByKey.get(key);
     if (!entry) throw new Error(`Unknown setting: ${key}`);
     return entry;
+  }
+
+  /**
+   * Encrypt the persisted form of a `secret: true` field at rest. Non-secret
+   * fields are stored verbatim. The encrypted form is a `{ __enc }` envelope so
+   * {@link decodeFromStorage} can transparently distinguish it from any
+   * previously-plaintext secret value (back-compat).
+   */
+  private encodeForStorage(key: string, value: ConfigValue): unknown {
+    const entry = this.fieldsByKey.get(key);
+    if (!entry?.field.secret) return value;
+    const enc = encryptString(JSON.stringify(value));
+    if (!enc.success) {
+      throw new Error(`Failed to encrypt secret setting ${key}`);
+    }
+    return { __enc: enc.data };
+  }
+
+  /**
+   * Inverse of {@link encodeForStorage}. Returns the decrypted value for secret
+   * fields stored as a `{ __enc }` envelope, the raw value for plaintext
+   * (legacy) secrets, and `undefined` when decryption fails (so the caller
+   * falls back to the default rather than surfacing ciphertext).
+   */
+  private decodeFromStorage(key: string, parsed: unknown): unknown {
+    const entry = this.fieldsByKey.get(key);
+    if (!entry?.field.secret) return parsed;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof (parsed as { __enc?: unknown }).__enc === 'string'
+    ) {
+      const dec = decryptString((parsed as { __enc: string }).__enc);
+      if (!dec.success || dec.data == null) {
+        logger.warn(
+          { key },
+          'failed to decrypt secret setting; falling back to default'
+        );
+        return undefined;
+      }
+      try {
+        return JSON.parse(dec.data);
+      } catch {
+        return dec.data;
+      }
+    }
+    return parsed;
   }
 }

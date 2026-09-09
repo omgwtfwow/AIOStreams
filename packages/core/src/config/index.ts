@@ -1,5 +1,6 @@
 import { bootstrap, BootstrapConfig } from './bootstrap.js';
 import { TaskManager } from '../tasks/index.js';
+import { setLogLevel, setLogFormat } from '../logging/logger.js';
 import {
   SettingsStore,
   type SettingsChangeEvent,
@@ -16,7 +17,6 @@ import {
   httpSchema,
   resourcesSchema,
   proxySchema,
-  nzbProxySchema,
   servicesSchema,
   metadataSchema,
   posterSchema,
@@ -24,6 +24,14 @@ import {
   presetsSchema,
   builtinsSchema,
   analyticsSchema,
+  usenetSchema,
+  streamsSchema,
+  releaseBlocklistSchema,
+  oidcSchema,
+  linkedAccountsSchema,
+  communitySchema,
+  sharesSchema,
+  arrSchema,
 } from './schema/index.js';
 
 export const runtimeSchemas = {
@@ -36,7 +44,6 @@ export const runtimeSchemas = {
   userLimits: userLimitsSchema,
   services: servicesSchema,
   proxy: proxySchema,
-  nzbProxy: nzbProxySchema,
   poster: posterSchema,
   rateLimits: rateLimitsSchema,
   recursion: recursionSchema,
@@ -45,9 +52,27 @@ export const runtimeSchemas = {
   presets: presetsSchema,
   builtins: builtinsSchema,
   analytics: analyticsSchema,
+  usenet: usenetSchema,
+  streams: streamsSchema,
+  releaseBlocklist: releaseBlocklistSchema,
+  oidc: oidcSchema,
+  linkedAccounts: linkedAccountsSchema,
+  community: communitySchema,
+  shares: sharesSchema,
+  arr: arrSchema,
 } as const;
 
-export const settingsStore = new SettingsStore(runtimeSchemas);
+export const runtimeKeyAliases: Record<string, string> = {
+  'nzbProxy.zyclopsHealthProxyEndpoint':
+    'builtins.nab.zyclopsHealthProxyEndpoint',
+  'userLimits.maxNzbFailoverCount': 'userLimits.maxFailoverAttempts',
+  'usenet.maxDownloadConnections': 'usenet.maxConcurrentDownloads',
+};
+
+export const settingsStore = new SettingsStore(
+  runtimeSchemas,
+  runtimeKeyAliases
+);
 
 export const config = new Proxy(
   { bootstrap, ...settingsStore.current },
@@ -64,8 +89,28 @@ export const config = new Proxy(
   }
 ) as { bootstrap: BootstrapConfig } & typeof settingsStore.current;
 
+/**
+ * Push the resolved logging config into the logger. The logger is constructed at
+ * module load with only `process.env` to go on (it is imported by the settings
+ * store itself), so this is where a DB-backed level or format actually takes
+ * effect. Wired from here rather than inside the logger because the reverse
+ * import would cycle: `config/index` → `settings-store` → `logging/logger`.
+ */
+function applyLoggingConfig(): void {
+  setLogLevel(settingsStore.current.logging.logLevel);
+  setLogFormat(settingsStore.current.logging.logFormat);
+}
+
 export async function initialiseConfig(): Promise<void> {
   await settingsStore.initialise();
+  applyLoggingConfig();
+  // Also covers another replica's edit: `settings-sync` below reloads the store,
+  // which emits here.
+  settingsStore.subscribe(({ changed }) => {
+    if (changed.has('logging.logLevel') || changed.has('logging.logFormat')) {
+      applyLoggingConfig();
+    }
+  });
 
   const intervalSeconds = bootstrap.settingsRefreshInterval;
   TaskManager.register({

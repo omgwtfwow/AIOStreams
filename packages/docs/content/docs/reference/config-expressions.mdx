@@ -1,0 +1,410 @@
+---
+title: Config Expression Language
+description: Complete reference for config variants and the CEL instruction set used to adjust a configuration on the fly.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Steps, Step } from 'fumadocs-ui/components/steps';
+
+A **variant** is a named script that adjusts your configuration at request time. Variants live inside one config and are selected by the install URL, so a single UUID can serve several differently-behaving addons.
+
+The scripts are written in the **Config Expression Language (CEL)**. Where the [Stream Expression Language](/reference/stream-expressions) is evaluated against a list of streams, CEL is declarative: a list of edits applied to your configuration, top to bottom.
+
+---
+
+## Variants or a parent config?
+
+|                    | Parent/child config                     | Variant                      |
+| ------------------ | --------------------------------------- | ---------------------------- |
+| Configs to set up  | Two, each with its own UUID             | One                          |
+| Written as         | Merge strategies chosen in the UI       | A few lines of CEL           |
+| Seeing the result  | After saving, by looking at the streams | A diff, before you save      |
+| Whose config it is | Theirs, with their own credentials      | Yours, viewed through a lens |
+
+Prefer a variant where you can. Most differences are a line or two, the preview shows the
+diff before you save, and there is no second configuration to create and keep track of.
+
+Sharing does not settle it either way. Giving your config to someone whose TV cannot handle
+Dolby Vision is a variant: `add excludedVisualTags "DV Only"` and hand them `/v/no-dv`.
+They get your config exactly, minus the one thing their hardware cannot do, and it stays
+one config when you change it.
+
+Use a parent/child config when the second configuration has to belong to somebody else — a
+child config is editable by whoever holds it and carries their own credentials, which you
+never see, where a variant only ever shows your config through a lens you wrote. The other
+reason is preference: a parent config is configured by clicking, at the cost of not being
+able to preview what a merge produces.
+
+---
+
+## Quick start
+
+<Steps>
+
+<Step>
+In **Miscellaneous → Variants** (Advanced mode), add a variant with the id `phone`.
+</Step>
+
+<Step>
+Write the script:
+
+```
+set addonName = "AIOStreams (Phone)"
+set excludedResolutions = ["2160p", "1440p"]
+set size.global.movies = [0, 8000000000]
+set resultLimits.global = 10
+```
+
+</Step>
+
+<Step>
+Hit preview to see exactly which fields change, then save.
+</Step>
+
+<Step>
+On **Save/Install**, pick the variant. Every install link gains `/v/phone`:
+
+```
+https://your-instance/stremio/<uuid>/<password>/v/phone/manifest.json
+```
+
+</Step>
+
+</Steps>
+
+---
+
+## Where the selector goes
+
+**Selector location** on the install page switches between two forms:
+
+```
+https://your-instance/stremio/<uuid>/<password>/v/phone/manifest.json
+https://your-instance/stremio/<uuid>/<password>/manifest.json?v=phone
+```
+
+They do the same thing and both work everywhere, so the path form is the default: it is the one that survives a client rebuilding its request URLs from a base you gave it rather than following the manifest URL. A client keeping the query string is what the other form needs, and not all of them do.
+
+The Search and Newznab/Torznab APIs take the query form only, as `&v=`, since they are single endpoints rather than a base a client extends.
+
+---
+
+## Selecting variants
+
+Comma-separate to combine. They apply left to right, so later instructions win:
+
+```
+.../v/phone,rd2/manifest.json
+```
+
+An unknown or disabled id is an error, surfaced as an error stream, rather than a silent fall back to the base config.
+
+The selector also works on ChillLink and the Seanime extension URLs.
+
+<Callout type="warn">
+The configure page always edits the **base** config, even when a variant is selected.
+</Callout>
+
+---
+
+## Conditional activation
+
+A variant can also decide for itself. Give it an **activation condition** and it applies whenever that condition matches the incoming request, with nothing added to the URL. One install serves a phone a different config from a TV.
+
+The condition is a [stream expression](/reference/stream-expressions) that evaluates to true or false, using a [limited set of functions](/reference/stream-expressions#variant-condition-functions):
+
+```
+includes(userAgent, 'android')
+```
+
+Selecting a variant in the URL still applies it, condition or not. Where both happen, matched variants apply first and the URL's selection wins on anything they both write to.
+
+### What a condition can read
+
+| Name                     | Is                                                                        |
+| ------------------------ | ------------------------------------------------------------------------- |
+| `userAgent`              | The client's `User-Agent` header, or an empty string                      |
+| `resource`               | `stream`, `manifest.json`, `catalog`, `meta`, `subtitles`, `search`, ...  |
+| `type`                   | `movie`, `series`, ... where the request has one                          |
+| `id`                     | The requested id, e.g. `tt0111161:1:2`                                    |
+| `query('name')`          | A query parameter, or an empty string                                     |
+| `header('name')`         | A request header, or an empty string                                      |
+| `health('id')`           | Whether a health check is currently passing                               |
+| `includes(a, b)`         | Whether `a` contains `b`, ignoring case                                   |
+| `matches(value, 'expr')` | Whether a regular expression matches. Follows this instance's regex rules |
+
+Finding the right `userAgent` is guesswork, so the Variants tab lists the last five that actually reached your configuration. Only stream, catalogue, meta and subtitle requests are counted.
+
+### Health checks
+
+A health check is a URL this instance calls to decide whether something is up. Define them in **Miscellaneous → Health Checks**, then read one as `health('id')`:
+
+```
+not health('rd-up')
+```
+
+| Field              | Default | Meaning                                                          |
+| ------------------ | ------- | ---------------------------------------------------------------- |
+| URL                |         | Called with `GET`, or `HEAD` if you prefer                       |
+| Expected status    | `2xx`   | A code (`200`), a class (`2xx`) or a range (`200-299`)           |
+| JSON path          |         | A dotted path into a JSON body, e.g. `debrid.rd`                 |
+| Expected value     |         | Compared to the value at that path. Empty means any truthy value |
+| Body contains      |         | Text the response body must contain, ignoring case               |
+| Interval           | 300s    | How long a result is reused before it is checked again           |
+| Timeout            | 3000ms  | How long to wait for a response                                  |
+| If the check fails | down    | What a timeout or unreachable URL counts as                      |
+
+`health()` is not limited to variant conditions. It works in group conditions, the dynamic addon fetching exit condition, stream expression filters and rankings, and the precache and preload selectors, so you can also skip a group or drop a service's results while it is down.
+
+Every check a configuration defines is resolved once per request, so one request sees one answer everywhere. Results are cached for the interval you set and shared with everyone whose check names the same URL, which means a service that is down is not re-probed on every request. Once a result is older than the interval, the request that notices is served the old answer and the refresh happens behind it, so a slow endpoint never holds up a stream request twice.
+
+### Things worth knowing
+
+- **A condition that fails counts as no match.** A broken expression, an unreachable check, a typo: the variant does not apply and the request is served as it otherwise would be. Only a variant named in the URL is an error when it cannot be applied.
+- **Automatic variants do not change your addon id.** They share the install URL, which is the point. They are still part of the cache key, so two clients on one URL never see each other's results.
+- **The manifest could be cached by your client**, and Stremio syncs installs between devices, so a condition works best on things the manifest does not describe: filters, sorting, formatting, proxying and which service a stream is played through. Writing to `presets`, `services`, `catalogModifications` or `mergedCatalogs` changes which catalogues and resources the addon offers, and `addonName`, `addonLogo`, `addonBackground` and `addonDescription` change how it presents itself. Those are still served correctly on every request, but a client that cached the manifest at install time may keep showing what it saw then.
+
+---
+
+## Syntax
+
+One instruction per line. `#` starts a comment, except inside a string. Object and array literals may span lines.
+
+```
+# Two comments and a multi-line literal
+set resultLimits.global = 10
+
+merge deduplicator = {
+  "enabled": true,
+  "keys": ["filename", "infoHash"]
+}
+```
+
+### Instructions
+
+| Instruction                        | Effect                                                                              |
+| ---------------------------------- | ----------------------------------------------------------------------------------- |
+| `set <path> = <value>`             | Assign a value. Missing intermediate objects are created.                           |
+| `merge <path> = { ... }`           | Deep merge. Objects recurse, arrays are replaced, a `null` member deletes that key. |
+| `unset <path>`                     | Delete a key, or remove a list element when the path ends in an index or selector.  |
+| `clear <path>`                     | Empty a list or object.                                                             |
+| `add <path> <value>, ...`          | Append to a list, skipping values already present. Creates the list if absent.      |
+| `prepend <path> <value>, ...`      | The same, inserted at the front.                                                    |
+| `remove <path> <value>, ...`       | Remove matching values from a list.                                                 |
+| `remove <path>`                    | With no values, the path itself selects the elements to remove.                     |
+| `enable <path>` / `disable <path>` | Shorthand for `set <path>.enabled = true` / `false`.                                |
+| `use formatter <name>`             | Load one of your saved formatters.                                                  |
+| `use variant <id>`                 | Apply another variant's instructions at this point.                                 |
+
+### Values
+
+Strings (single or double quoted), numbers, `true`, `false`, `null`, arrays and objects. Strings support `\n`, `\t`, `\r`, `\b`, `\f`, `\\`, `\"`, `\'`, `\/` and `\uXXXX`.
+
+```
+set addonName = "Living room"
+set resultLimits.global = 10
+set excludeUncached = true
+set sortCriteria.global = [
+  { "key": "cached", "direction": "desc" },
+  { "key": "resolution", "direction": "desc" },
+  { "key": "size", "direction": "desc" }
+]
+```
+
+### Paths
+
+A path starts with a configuration field and drills in.
+
+| Segment         | Meaning                                        | Example                               |
+| --------------- | ---------------------------------------------- | ------------------------------------- |
+| `.name`         | An object property                             | `deduplicator.enabled`                |
+| `[0]`           | A list element by position                     | `sortCriteria.global[0]`              |
+| `[-1]`          | Counting back from the end                     | `sortCriteria.global[-1]`             |
+| `[*]`           | Every element                                  | `presets[*].options.timeout`          |
+| `[key=value]`   | Elements whose property equals a value         | `services[id=realdebrid]`             |
+| `[key!=value]`  | Elements whose property does not equal it      | `presets[type!=torrentio]`            |
+| `[key*=value]`  | Elements whose property contains the text      | `rankedRegexPatterns[name*="german"]` |
+| `[key!*=value]` | Elements whose property does not contain it    | `presets[type!*=torrent]`             |
+| `[=value]`      | Plain list entries, comparing the entry itself | `excludedKeywords[="cam"]`            |
+
+A selector may match several elements, in which case the instruction applies to all of them: `disable presets[type=torrentio]` disables every Torrentio instance.
+
+`=` and `!=` are exact and case-sensitive. `*=` and `!*=` are substring matches that ignore case.
+
+### Lists of plain values
+
+Drop the key to compare the entry itself. This is how you reach a list of strings such as `excludedKeywords` or `syncedExcludedRegexUrls`, where there is no property to name. All four operators work this way:
+
+```
+remove excludedKeywords[="CAM"]           # exactly "CAM", nothing else
+remove excludedKeywords "CAM"             # the same thing, shorter
+remove excludedKeywords[*="cam"]          # "CAM", "hdcam" and "camrip"
+remove syncedExcludedRegexUrls[*="example.com"]   # every URL from one host
+```
+
+---
+
+## Targeting one entry in a list
+
+Different lists identify their entries differently.
+
+**Services** are keyed by `id`:
+
+```
+set services[id=realdebrid].credentials.apiKey = "SECOND_ACCOUNT_KEY"
+```
+
+**Addons** have an `instanceId`, but it is a short random hex string such as `8ae`, so prefer the addon's type or the name you gave it. A selector key may be dotted, which is how you reach the name inside `options`:
+
+```
+disable presets[type=torrentio]                  # every Torrentio instance
+disable presets[options.name*="4K"]              # by the name shown in the UI
+disable presets[instanceId=8ae]                  # one exact instance
+```
+
+The editor autocompletes real instance ids after `presets[instanceId=`, annotated with each addon's name.
+
+**Ranked regex patterns and regex overrides** carry a `name`:
+
+```
+set rankedRegexPatterns[name="HDR boost"].score = 500
+remove rankedRegexPatterns[name*="cam"]
+```
+
+**Stream expressions** have no name field. Their display name lives inside the expression as a `/* Name */` comment, so match the expression text with `*=`:
+
+```
+disable excludedStreamExpressions[expression*="Low seeders"]
+disable rankedStreamExpressions[expression*="4K bonus"]
+```
+
+Position works too, but breaks when you reorder the list:
+
+```
+disable excludedStreamExpressions[0]
+```
+
+<Callout type="info">
+`enable` and `disable` set an `enabled` property. `regexOverrides` and `selOverrides` use an inverted `disabled` flag instead, so for those write `set regexOverrides[name*="hdr"].disabled = true`.
+</Callout>
+
+---
+
+## Recipes
+
+**Phone on mobile data.** Cap the file size, skip 4K, return fewer results.
+
+```
+set addonName = "AIOStreams (Phone)"
+set excludedResolutions = ["2160p", "1440p"]
+set size.global.movies = [0, 8000000000]
+set size.global.series = [0, 3000000000]
+set resultLimits.global = 10
+```
+
+**A second debrid account.**
+
+```
+set services[id=realdebrid].credentials.apiKey = "SECOND_ACCOUNT_KEY"
+```
+
+**Instant playback only.** Cached results, no failover attempts.
+
+```
+set excludeUncached = true
+set failover.enabled = false
+```
+
+**A different formatter.** `use formatter` copies one of your saved formatters into the custom slot and switches to it, so a whole template never has to go in the script.
+
+```
+use formatter "Minimal"
+```
+
+Or pick a built-in one:
+
+```
+set formatter.id = "minimalisticgdrive"
+```
+
+**Debugging.** Show the statistics streams and stop hiding addon errors.
+
+```
+set hideErrors = false
+set statistics = { "enabled": true, "position": "top", "statsToShow": ["addon", "filter", "timing"] }
+```
+
+**Only a couple of addons.**
+
+```
+disable presets[*]
+enable presets[type=comet]
+enable presets[type=easynews]
+```
+
+**A different language.** Language values are the ones the filter menu offers, plus `Original`, `Dual Audio`, `Multi`, `Dubbed` and `Unknown`.
+
+```
+set requiredLanguages = ["German", "Multi", "Dual Audio"]
+prepend preferredLanguages "German"
+```
+
+**A different language, with confirmed media info only.**
+
+```
+set requiredLanguages = ["German"]
+add excludedStreamExpressions { "expression": "mediaInfoQuality(streams, 'unknown')", "enabled": true }
+```
+
+**Reordering the sort.** Put resolution above cache status for a machine that does not mind waiting.
+
+```
+set sortCriteria.global = [
+  { "key": "resolution", "direction": "desc" },
+  { "key": "cached", "direction": "desc" },
+  { "key": "streamExpressionScore", "direction": "desc" },
+  { "key": "size", "direction": "desc" }
+]
+```
+
+**Layering.** Either reference one variant from another:
+
+```
+use variant phone
+add excludedVisualTags "3D"
+```
+
+or keep them independent and combine at install time with `/v/phone,no3d`.
+
+---
+
+## Limits
+
+Operators can tune these; defaults shown.
+
+| Limit                           | Default  | Environment variable                             |
+| ------------------------------- | -------- | ------------------------------------------------ |
+| Availability                    | everyone | `VARIANT_ACCESS` (`all`, `trusted`, `none`)      |
+| Variants per config             | 10       | `MAX_VARIANTS`                                   |
+| Characters per script           | 4000     | `MAX_VARIANT_SCRIPT_LENGTH`                      |
+| Characters across all scripts   | 20000    | `MAX_VARIANT_TOTAL_SCRIPT_CHARACTERS`            |
+| Instructions per script         | 100      | `MAX_VARIANT_INSTRUCTIONS`                       |
+| Variants per request            | 4        | `MAX_ACTIVE_VARIANTS`                            |
+| `use variant` nesting depth     | 5        | `MAX_VARIANT_DEPTH`                              |
+| Elements one instruction writes | 200      | `MAX_VARIANT_PATH_MATCHES`                       |
+| Health checks: availability     | everyone | `HEALTH_CHECK_ACCESS` (`all`, `trusted`, `none`) |
+| Health checks per config        | 5        | `MAX_HEALTH_CHECKS`                              |
+| Shortest health check interval  | 60s      | `HEALTH_CHECK_MIN_TTL`                           |
+| Longest health check timeout    | 10000ms  | `HEALTH_CHECK_MAX_TIMEOUT`                       |
+| Health check response read      | 64KB     | `HEALTH_CHECK_MAX_BYTES`                         |
+| Private health check URLs       | refused  | `HEALTH_CHECK_ALLOW_PRIVATE_URLS`                |
+
+---
+
+## Behaviour notes
+
+- **An instruction that matches nothing is skipped** and only logged. Remove Real-Debrid later and a variant that swapped its credentials keeps working instead of breaking every install URL you handed out. The editor preview shows these as warnings while you write.
+- **Syntax errors and forbidden fields are rejected on save**, so they never reach a live request.
+- **A variant's name is a label** for the configuration UI and the install page. Use `set addonName` to change what your client shows.
+- **Variants are not inherited** from a parent config: they reference this config's own addon ids and saved formatter names. Neither are health checks.
+- **Health check URLs must be public** unless the instance owner has allowed private ones, and can never point back at the instance itself.

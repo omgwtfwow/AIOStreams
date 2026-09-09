@@ -2,6 +2,10 @@ export * from './base.js';
 export * from './predefined.js';
 export * from './custom.js';
 export * from './utils.js';
+export {
+  validateTemplate,
+  type Diagnostic as TemplateDiagnostic,
+} from './engine/parser.js';
 
 import { BaseFormatter, FormatterContext } from './base.js';
 import {
@@ -19,10 +23,14 @@ export function createFormatter(ctx: FormatterContext): BaseFormatter {
   const { formatter } = ctx.userData;
 
   if (formatter.id === 'custom') {
-    if (!formatter?.definitions?.custom) {
+    const definition =
+      (formatter.selectedSaved &&
+        formatter.definitions?.saved?.[formatter.selectedSaved]) ||
+      formatter.definitions?.custom;
+    if (!definition) {
       throw new Error('Definition is required for custom formatter');
     }
-    return CustomFormatter.fromConfig(formatter.definitions.custom, ctx);
+    return CustomFormatter.fromConfig(definition, ctx);
   }
 
   // A per-formatter override replaces the built-in template while keeping the id.

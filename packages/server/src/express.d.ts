@@ -1,5 +1,6 @@
 import 'express';
-import { UserData } from '../db';
+import { UserData, SessionUser } from '@aiostreams/core';
+import type { RateLimitInfo } from 'express-rate-limit';
 
 declare global {
   namespace Express {
@@ -8,7 +9,8 @@ declare global {
       userIp?: string;
       requestIp?: string;
       uuid?: string;
-      user?: { username: string; isAdmin: boolean };
+      user?: SessionUser;
+      rateLimit?: RateLimitInfo;
     }
   }
 }

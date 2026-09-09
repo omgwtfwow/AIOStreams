@@ -1,6 +1,6 @@
 import { cva } from 'class-variance-authority';
 import * as React from 'react';
-import { Accept, FileError, useDropzone } from 'react-dropzone';
+import { Accept, FileError, FileRejection, useDropzone } from 'react-dropzone';
 import {
   BasicField,
   BasicFieldOptions,
@@ -9,6 +9,7 @@ import {
 import { CloseButton, IconButton } from '../button';
 import { cn, ComponentAnatomy, defineStyleAnatomy } from '../core/styling';
 import { hiddenInputStyles } from '../input';
+import { formatBytes } from '@/lib/format';
 
 /* -------------------------------------------------------------------------------------------------
  * Anatomy
@@ -19,7 +20,7 @@ export const SimpleDropzoneAnatomy = defineStyleAnatomy({
     'UI-SimpleDropzone__root',
     'appearance-none w-full mb-2 cursor-pointer hover:text-[--foreground] flex items-center justify-center p-4 border rounded-[--radius] border-dashed',
     'gap-3 text-sm sm:text-base',
-    'outline-none ring-[--ring] focus-visible:ring-2',
+    'outline-none focus-visible:outline-none focus-visible:ring-1 ring-offset-1 ring-offset-[--background] focus-visible:ring-white/40',
     'text-[--muted] transition ease-in-out hover:border-[--foreground]',
     'data-[drag-active=true]:border-brand-500',
     'data-[drag-reject=true]:border-[--red]',
@@ -127,6 +128,11 @@ export type SimpleDropzoneProps = Omit<
      */
     onError?: (err: Error) => void;
     /**
+     * Callback fired when one or more files are rejected (wrong type, too
+     * large, too many, etc.). Each rejection carries the file and its errors.
+     */
+    onDropRejected?: (fileRejections: FileRejection[]) => void;
+    /**
      * Custom file validator function
      */
     validator?: <T extends File>(file: T) => FileError | FileError[] | null;
@@ -168,6 +174,7 @@ export const SimpleDropzone = React.forwardRef<
       noClick,
       noDrag,
       onError,
+      onDropRejected,
       validator,
       multiple,
       value, // ignored
@@ -217,6 +224,7 @@ export const SimpleDropzone = React.forwardRef<
       validator,
       accept,
       onError,
+      onDropRejected,
     });
 
   return (
@@ -266,7 +274,7 @@ export const SimpleDropzone = React.forwardRef<
         <div
           className={cn(SimpleDropzoneAnatomy.maxSizeText(), maxSizeTextClass)}
         >
-          {`≤`} {humanFileSize(maxSize, 0)}
+          {`≤`} {formatBytes(maxSize)}
         </div>
       )}
 
@@ -453,7 +461,7 @@ export const SimpleDropzone = React.forwardRef<
                       listItemSizeClass
                     )}
                   >
-                    {humanFileSize(file.size)}
+                    {formatBytes(file.size)}
                   </p>
                 </div>
                 <IconButton
@@ -548,7 +556,7 @@ export const SimpleDropzone = React.forwardRef<
                       listItemSizeClass
                     )}
                   >
-                    {humanFileSize(file.size)}
+                    {formatBytes(file.size)}
                   </p>
                 </div>
               </div>
@@ -561,11 +569,3 @@ export const SimpleDropzone = React.forwardRef<
 });
 
 SimpleDropzone.displayName = 'SimpleDropzone';
-
-function humanFileSize(size: number, precision = 2): string {
-  const i = Math.floor(Math.log(size) / Math.log(1024));
-  return (
-    (size / Math.pow(1024, i)).toFixed(precision).toString() +
-    ['bytes', 'Kb', 'Mb', 'Gb', 'Tb'][i]
-  );
-}

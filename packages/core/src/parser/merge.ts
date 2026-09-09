@@ -21,6 +21,8 @@ function richerParsedFile(
   const importantFields: (keyof ParsedFile)[] = [
     'title',
     'year',
+    'country',
+    'episodeTitle',
     'seasons',
     'episodes',
     'resolution',
@@ -30,6 +32,7 @@ function richerParsedFile(
     'editions',
     'regraded',
     'repack',
+    'proper',
     'uncensored',
     'unrated',
     'upscaled',
@@ -53,6 +56,26 @@ function richerParsedFile(
   );
 
   return fileParsedRichness >= folderParsedRichness ? fileParsed : folderParsed;
+}
+
+/**
+ * Marks a release as a season pack when the filename alone did not say so:
+ * a file much smaller than its folder is one episode of many, and no single
+ * episode carries six episode numbers.
+ */
+export function applySeasonPackHeuristics(
+  parsedFile: ParsedFile,
+  sizes: { size?: number; folderSize?: number }
+): ParsedFile {
+  if (parsedFile.seasonPack || !parsedFile.episodes?.length) return parsedFile;
+
+  if (sizes.folderSize && sizes.size && sizes.folderSize > sizes.size * 2) {
+    parsedFile.seasonPack = true;
+  } else if (parsedFile.episodes.length > 5) {
+    parsedFile.seasonPack = true;
+  }
+
+  return parsedFile;
 }
 
 /**
@@ -87,6 +110,8 @@ export function mergeParsedFiles(
   return {
     title: richest?.title || folderParsed?.title || fileParsed?.title,
     year: fileParsed?.year || folderParsed?.year,
+    country: fileParsed?.country || folderParsed?.country,
+    episodeTitle: fileParsed?.episodeTitle || folderParsed?.episodeTitle,
     folderSeasons:
       seasons !== folderParsed?.seasons ? folderParsed?.seasons : undefined,
     folderEpisodes:
@@ -101,6 +126,7 @@ export function mergeParsedFiles(
     editions: arrayMerge(folderParsed?.editions, fileParsed?.editions),
     regraded: fileParsed?.regraded || folderParsed?.regraded,
     repack: fileParsed?.repack || folderParsed?.repack,
+    proper: fileParsed?.proper || folderParsed?.proper,
     uncensored: fileParsed?.uncensored || folderParsed?.uncensored,
     unrated: fileParsed?.unrated || folderParsed?.unrated,
     upscaled: fileParsed?.upscaled || folderParsed?.upscaled,

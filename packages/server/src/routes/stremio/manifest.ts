@@ -5,22 +5,20 @@ import {
   config as appConfig,
   constants,
   UserData,
+  userScopeIdSuffix,
 } from '@aiostreams/core';
 import { Manifest } from '@aiostreams/core';
 import { createLogger } from '@aiostreams/core';
-import { stremioManifestRateLimiter } from '../../middlewares/ratelimit.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
 
 export default router;
 
-router.use(stremioManifestRateLimiter);
-
 const manifest = async (config?: UserData): Promise<Manifest> => {
   let addonId = appConfig.branding.addonId;
   if (config) {
-    addonId = addonId += `.${config.uuid?.substring(0, 12)}`;
+    addonId = addonId += `.${userScopeIdSuffix(config)}`;
   }
   let catalogs: Manifest['catalogs'] = [];
   let resources: Manifest['resources'] = [];

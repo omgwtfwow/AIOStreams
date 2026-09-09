@@ -4,6 +4,7 @@ import {
   formatZodError,
   makeRequest,
   DistributedLock,
+  HEADER_PRESETS,
 } from '../../utils/index.js';
 import { createLogger } from '../../utils/index.js';
 import { searchWithBackgroundRefresh } from '../utils/general.js';
@@ -15,6 +16,7 @@ const logger = createLogger('torrent-galaxy');
 enum TorrentGalaxyCategory {
   Movies = 'Movies',
   TV = 'TV',
+  TVShows = 'TV shows',
   Anime = 'Anime',
 }
 
@@ -71,6 +73,7 @@ type TorrentGalaxySearchResponse = z.infer<typeof TorrentGalaxySearchResponse>;
 const TorrentGalaxySearchOptions = z.object({
   query: z.string(),
   page: z.number().default(1),
+  categories: z.array(z.string()).default([]),
 });
 
 type TorrentGalaxySearchOptions = z.infer<typeof TorrentGalaxySearchOptions>;
@@ -88,8 +91,7 @@ class TorrentGalaxyAPI {
   constructor() {
     this.headers = {
       'Content-Type': 'application/json',
-      'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': HEADER_PRESETS.chrome['User-Agent'],
       Accept: 'application/json',
     };
   }
@@ -109,7 +111,7 @@ class TorrentGalaxyAPI {
       cacheTTL: appConfig.builtins.torrentGalaxy.searchCacheTtl,
       fetchFn: () =>
         this.request<TorrentGalaxySearchResponse>(
-          `/get-posts/keywords:${encodeURIComponent(options.query)}:format:json`,
+          `/get-posts/keywords:${encodeURIComponent(options.query)}${options.categories.map((c) => `:category:${c}`).join('')}:format:json`,
           {
             schema: TorrentGalaxySearchResponse,
             timeout: appConfig.builtins.torrentGalaxy.searchTimeout,

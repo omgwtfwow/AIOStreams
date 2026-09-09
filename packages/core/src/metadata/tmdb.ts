@@ -8,6 +8,7 @@ import {
 } from '../utils/index.js';
 import { deduplicateTitles, Metadata, MetadataTitle } from './utils.js';
 import { iso31661ToIso6391 } from '../utils/languages.js';
+import { normaliseCountryCode } from '../utils/countries.js';
 import { z } from 'zod';
 
 export type TMDBIdType = 'imdb_id' | 'tmdb_id' | 'tvdb_id';
@@ -29,6 +30,8 @@ const ALTERNATIVE_TITLES_PATH = '/alternative_titles';
 const ID_CACHE_TTL = 30 * 24 * 60 * 60; // 30 days
 const TITLE_CACHE_TTL = 7 * 24 * 60 * 60; // 7 days
 const AUTHORISATION_CACHE_TTL = 2 * 24 * 60 * 60; // 2 days
+const EPISODE_CACHE_TTL = 6 * 60 * 60; // 6 hours
+const SEARCH_CACHE_TTL = 7 * 24 * 60 * 60; // 7 days
 
 // Zod schemas for API responses
 const GenreSchema = z.object({
@@ -43,6 +46,7 @@ const MovieDetailsSchema = z.object({
   status: z.string(),
   original_title: z.string().optional(),
   original_language: z.string().optional(),
+  origin_country: z.array(z.string()).optional(),
   runtime: z.number().nullable().optional(),
   genres: z.array(GenreSchema).optional(),
 });
@@ -53,8 +57,9 @@ const TVDetailsSchema = z.object({
   first_air_date: z.string().nullable().optional(),
   last_air_date: z.string().nullable().optional(),
   status: z.string(),
-  original_title: z.string().optional(),
+  original_name: z.string().optional(),
   original_language: z.string().optional(),
+  origin_country: z.array(z.string()).optional(),
   episode_run_time: z.array(z.number()).optional(),
   seasons: z.array(
     z.object({
@@ -138,7 +143,46 @@ const TVEpisodeDetailsSchema = z.object({
   season_number: z.number(),
   still_path: z.string().nullable().optional(),
   runtime: z.number().nullable().optional(),
+  translations: z
+    .object({
+      translations: z.array(
+        z.looseObject({
+          iso_639_1: z.string().optional(),
+          data: z.looseObject({ name: z.string().optional() }).optional(),
+        })
+      ),
+    })
+    .optional(),
 });
+
+export interface EpisodeDetails {
+  airDate?: string;
+  runtime?: number;
+  /** The episode's name in every language TMDB has, English first. */
+  titles?: MetadataTitle[];
+}
+
+const TVSearchResultsSchema = z.object({
+  results: z.array(
+    z.looseObject({
+      id: z.number(),
+      name: z.string().optional(),
+      original_name: z.string().optional(),
+      first_air_date: z.string().nullable().optional(),
+      origin_country: z.array(z.string()).optional(),
+      popularity: z.number().optional(),
+    })
+  ),
+});
+
+export interface TMDBSeriesSearchResult {
+  tmdbId: number;
+  name?: string;
+  originalName?: string;
+  year?: number;
+  country?: string;
+  popularity?: number;
+}
 
 const IdTypeMap: Partial<Record<IdType, TMDBIdType>> = {
   imdbId: 'imdb_id',
@@ -160,6 +204,10 @@ export class TMDBMetadata {
   private readonly apiKey: string | undefined;
   private static readonly validationCache: Cache<string, boolean> =
     Cache.getInstance<string, boolean>('tmdb_validation');
+  private static readonly episodeCache: Cache<string, EpisodeDetails> =
+    Cache.getInstance<string, EpisodeDetails>('tmdb_episode_v2');
+  private static readonly searchCache: Cache<string, TMDBSeriesSearchResult[]> =
+    Cache.getInstance<string, TMDBSeriesSearchResult[]>('tmdb_search');
   public constructor(auth?: { accessToken?: string; apiKey?: string }) {
     if (
       !auth?.accessToken &&
@@ -352,8 +400,11 @@ export class TMDBMetadata {
       | undefined;
     let allTitles: MetadataTitle[] = [];
     let originalLanguage: string | undefined;
+    let country: string | undefined;
     let runtime: number | undefined;
     let genres: string[] = [];
+    let firstAiredDate: string | undefined;
+    let lastAiredDate: string | undefined;
 
     if (parsedId.mediaType === 'movie') {
       const movieData = MovieDetailsSchema.parse(detailsJson);
@@ -368,20 +419,17 @@ export class TMDBMetadata {
           language: 'en',
         });
       }
-      primaryTitle =
-        movieData.original_language !== 'en'
-          ? (movieData.original_title ?? movieData.title)
-          : movieData.title;
-
+      primaryTitle = movieData.title;
       originalLanguage = movieData.original_language;
+      country = normaliseCountryCode(movieData.origin_country?.[0]);
       releaseDate = movieData.release_date;
       runtime = movieData.runtime || undefined;
       genres = movieData.genres?.map((g) => g.name) ?? [];
     } else {
       const tvData = TVDetailsSchema.parse(detailsJson);
-      if (tvData.original_title) {
+      if (tvData.original_name) {
         allTitles.push({
-          title: tvData.original_title,
+          title: tvData.original_name,
           language: tvData.original_language,
         });
       } else {
@@ -390,12 +438,12 @@ export class TMDBMetadata {
           language: 'en',
         });
       }
-      primaryTitle =
-        tvData.original_language !== 'en'
-          ? (tvData.original_title ?? tvData.name)
-          : tvData.name;
+      primaryTitle = tvData.name;
       originalLanguage = tvData.original_language;
+      country = normaliseCountryCode(tvData.origin_country?.[0]);
       releaseDate = tvData.first_air_date ?? undefined;
+      firstAiredDate = tvData.first_air_date ?? undefined;
+      lastAiredDate = tvData.last_air_date ?? undefined;
       yearEnd = tvData.last_air_date
         ? this.parseReleaseDate(tvData.last_air_date)
         : undefined;
@@ -461,11 +509,14 @@ export class TMDBMetadata {
       year: Number(year),
       yearEnd: yearEnd ? Number(yearEnd) : undefined,
       originalLanguage,
+      country,
       seasons,
       tmdbId: Number(tmdbId),
       tvdbId: null,
       runtime: runtime,
       genres: genres.length > 0 ? genres : undefined,
+      firstAiredDate,
+      lastAiredDate,
     };
     // Cache the result
     TMDBMetadata.metadataCache.set(cacheKey, metadata, TITLE_CACHE_TTL);
@@ -497,16 +548,27 @@ export class TMDBMetadata {
     tmdbId: number,
     seasonNumber: number,
     episodeNumber: number
-  ): Promise<{ airDate?: string; runtime?: number } | undefined> {
+  ): Promise<EpisodeDetails | undefined> {
+    const cacheKey = `${tmdbId}:${seasonNumber}:${episodeNumber}`;
+    const cached = await TMDBMetadata.episodeCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
     const url = new URL(
       API_BASE_URL +
         `/tv/${tmdbId}/season/${seasonNumber}/episode/${episodeNumber}`
     );
+    // translations ride along free, giving localised episode names
+    url.searchParams.set('append_to_response', 'translations');
     this.addSearchParams(url);
     const response = await makeRequest(url.toString(), {
       timeout: 5000,
       headers: this.getHeaders(),
     });
+    if (response.status === 404) {
+      // episode doesn't exist under TMDB's numbering scheme
+      return undefined;
+    }
     if (!response.ok) {
       throw new Error(
         `Failed to fetch episode details: ${response.statusText}`
@@ -514,10 +576,61 @@ export class TMDBMetadata {
     }
     const json = await response.json();
     const episodeData = TVEpisodeDetailsSchema.parse(json);
-    return {
+    // translations first: the default name repeats one of them, and an
+    // untagged duplicate would strip that entry's language
+    const titles: MetadataTitle[] = [];
+    for (const translation of episodeData.translations?.translations ?? []) {
+      const title = translation.data?.name;
+      if (title && translation.iso_639_1) {
+        titles.push({ title, language: translation.iso_639_1 });
+      }
+    }
+    if (
+      episodeData.name &&
+      !titles.some((existing) => existing.title === episodeData.name)
+    ) {
+      titles.push({ title: episodeData.name });
+    }
+    const details: EpisodeDetails = {
       airDate: episodeData.air_date ?? undefined,
       runtime: episodeData.runtime ?? undefined,
+      titles: titles.length ? deduplicateTitles(titles) : undefined,
     };
+    await TMDBMetadata.episodeCache.set(cacheKey, details, EPISODE_CACHE_TTL);
+    return details;
+  }
+
+  public async searchSeries(query: string): Promise<TMDBSeriesSearchResult[]> {
+    return TMDBMetadata.searchCache.wrap(
+      async () => {
+        const url = new URL(API_BASE_URL + '/search/tv');
+        url.searchParams.set('query', query);
+        this.addSearchParams(url);
+        const response = await makeRequest(url.toString(), {
+          timeout: 5000,
+          headers: this.getHeaders(),
+        });
+        if (!response.ok) {
+          throw new Error(`Failed to search series: ${response.statusText}`);
+        }
+        const data = TVSearchResultsSchema.parse(await response.json());
+        return data.results.map((r) => {
+          const year = r.first_air_date
+            ? new Date(r.first_air_date).getFullYear()
+            : undefined;
+          return {
+            tmdbId: r.id,
+            name: r.name,
+            originalName: r.original_name,
+            year: year && !Number.isNaN(year) ? year : undefined,
+            country: normaliseCountryCode(r.origin_country?.[0]),
+            popularity: r.popularity,
+          };
+        });
+      },
+      query.toLowerCase(),
+      SEARCH_CACHE_TTL
+    );
   }
 
   public async getNextEpisodeAirDate(

@@ -35,7 +35,7 @@ export function SettingsNavCard({ title, children }: SettingsCardProps) {
       <div
         ref={cardRef}
         onMouseMove={handleMouseMove}
-        className="lg:p-2 lg:border lg:rounded-[--radius] lg:bg-gray-950/70 contents lg:block relative group/settings-nav"
+        className="contents lg:block relative group/settings-nav"
         // className=" contents lg:block relative group/settings-nav overflow-hidden"
       >
         {/* <div
@@ -79,7 +79,6 @@ export function SettingsCard({
         data-settings-card
         className={cn(
           'group/settings-card relative lg:bg-gray-950/70 scroll-mt-24',
-          'data-[command-target=true]:ring-2 data-[command-target=true]:ring-brand-500 data-[command-target=true]:ring-offset-2 data-[command-target=true]:ring-offset-[--background] transition-shadow',
           className
         )}
         onMouseMove={handleMouseMove}

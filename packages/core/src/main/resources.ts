@@ -1,10 +1,13 @@
 import pLimit from 'p-limit';
 import {
+  Cache,
   createLogger,
   constants,
   Env,
   ExtrasParser,
+  getSimpleTextHash,
   makeUrlLogSafe,
+  userScopeKey,
 } from '../utils/index.js';
 import { config as appConfig } from '../config/index.js';
 import { getAddonName } from '../utils/general.js';
@@ -12,7 +15,7 @@ import { Wrapper } from './wrapper.js';
 import { PresetManager } from '../presets/index.js';
 import { FeatureControl } from '../utils/feature.js';
 import { StreamContext, StreamUtils } from '../streams/index.js';
-import { populateNzbFallbacks } from './nzbFailover.js';
+import { buildPlayChain, type FailoverContentType } from './play-chain.js';
 import { resolveServiceWrappedStreams } from './serviceWrapper.js';
 import type { ServiceWrapServiceTiming } from './serviceWrapper.js';
 import type { PrecomputeSubTimings } from '../streams/precomputer.js';
@@ -22,6 +25,7 @@ import type {
   ParsedStream,
   Subtitle,
   AddonCatalog,
+  UserData,
 } from '../db/schemas.js';
 import type { Addon } from '../db/index.js';
 import type { Metadata } from '../metadata/utils.js';
@@ -48,6 +52,22 @@ import type { AddonDispositionMap } from '../streams/fetcher.js';
 const logger = createLogger('core');
 
 const PING_TIMEOUT_MS = 10_000;
+
+/** Shape returned by getStreams */
+type StreamsResponse = AIOStreamsResponse<{
+  streams: ParsedStream[];
+  statistics: { title: string; description: string; forced?: boolean }[];
+}>;
+
+/**
+ * Full-pipeline result cache: caches the final processed response for a whole
+ * request
+ */
+const pipelineResultCache = Cache.getInstance<string, StreamsResponse>(
+  'pipeline-result',
+  () => appConfig.resources.cache.pipeline.maxSize,
+  appConfig.bootstrap.redisUri ? undefined : 'memory'
+);
 
 async function pingStream(stream: ParsedStream, timeoutMs = PING_TIMEOUT_MS) {
   if (!stream.url) {
@@ -215,9 +235,19 @@ export async function processStreams(
   streams: ParsedStream[],
   context: StreamContext,
   isMeta: boolean = false,
-  nzbFailoverOpts?: {
-    count: number;
+  failoverOpts?: {
+    maxAttempts: number;
     position: 'beforeLimiting' | 'beforeSEL' | 'last';
+    contentTypes: FailoverContentType[];
+    allowCrossType: boolean;
+    parallel: number;
+    staggerMs: number;
+    preferredGraceMs: number;
+    maxWaitMs: number;
+    proxyConfig?: UserData['proxy'];
+    includeExternalFailover?: boolean;
+    sameReleaseLimit: number;
+    duplicateStaggerMs: number;
   }
 ): Promise<{
   streams: ParsedStream[];
@@ -278,6 +308,13 @@ export async function processStreams(
     filterMs = Date.now() - filterStart;
   }
 
+  // The fetcher path already blocklist-filtered its streams; this pass only
+  // covers streams that appeared after it (meta requests and service
+  // wrapping), and runs before dedup for the same failover-variant reason.
+  if (isMeta || resolvedResults.hasNewStreams) {
+    processedStreams = await ctx.filterer.filterBlocklisted(processedStreams);
+  }
+
   const dedupStart = Date.now();
   processedStreams = await ctx.deduplicator.deduplicate(processedStreams);
   deduplicationMs = Date.now() - dedupStart;
@@ -298,38 +335,30 @@ export async function processStreams(
   let finalStreams = await ctx.sorter.sort(processedStreams, context);
   sortMs = Date.now() - sortStart;
 
-  if (nzbFailoverOpts?.position === 'beforeLimiting') {
-    await populateNzbFallbacks(
+  if (failoverOpts?.position === 'beforeSEL') {
+    await buildPlayChain(
       finalStreams,
-      nzbFailoverOpts.count,
-      ctx.userData.uuid
-    ).catch((error) => {
-      logger.error(
-        {
-          err: error instanceof Error ? error.message : String(error),
-          position: 'beforeLimiting',
-        },
-        'error during nzb failover population'
-      );
-    });
-  }
-
-  const limitStart = Date.now();
-  finalStreams = await ctx.limiter.limit(finalStreams);
-  limitMs = Date.now() - limitStart;
-
-  if (nzbFailoverOpts?.position === 'beforeSEL') {
-    await populateNzbFallbacks(
-      finalStreams,
-      nzbFailoverOpts.count,
-      ctx.userData.uuid
+      {
+        maxAttempts: failoverOpts.maxAttempts,
+        contentTypes: failoverOpts.contentTypes,
+        allowCrossType: failoverOpts.allowCrossType,
+        parallel: failoverOpts.parallel,
+        staggerMs: failoverOpts.staggerMs,
+        preferredGraceMs: failoverOpts.preferredGraceMs,
+        maxWaitMs: failoverOpts.maxWaitMs,
+        proxyConfig: failoverOpts.proxyConfig,
+        includeExternal: failoverOpts.includeExternalFailover,
+        sameReleaseLimit: failoverOpts.sameReleaseLimit,
+        duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+      },
+      userScopeKey(ctx.userData)
     ).catch((error) => {
       logger.error(
         {
           err: error instanceof Error ? error.message : String(error),
           position: 'beforeSEL',
         },
-        'error during nzb failover population'
+        'error during play chain population'
       );
     });
   }
@@ -341,19 +370,63 @@ export async function processStreams(
   );
   selMs = Date.now() - selStart;
 
-  if (!nzbFailoverOpts?.position || nzbFailoverOpts.position === 'last') {
-    if (nzbFailoverOpts) {
-      await populateNzbFallbacks(
+  if (failoverOpts?.position === 'beforeLimiting') {
+    await buildPlayChain(
+      finalStreams,
+      {
+        maxAttempts: failoverOpts.maxAttempts,
+        contentTypes: failoverOpts.contentTypes,
+        allowCrossType: failoverOpts.allowCrossType,
+        parallel: failoverOpts.parallel,
+        staggerMs: failoverOpts.staggerMs,
+        preferredGraceMs: failoverOpts.preferredGraceMs,
+        maxWaitMs: failoverOpts.maxWaitMs,
+        proxyConfig: failoverOpts.proxyConfig,
+        includeExternal: failoverOpts.includeExternalFailover,
+        sameReleaseLimit: failoverOpts.sameReleaseLimit,
+        duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+      },
+      userScopeKey(ctx.userData)
+    ).catch((error) => {
+      logger.error(
+        {
+          err: error instanceof Error ? error.message : String(error),
+          position: 'beforeLimiting',
+        },
+        'error during play chain population'
+      );
+    });
+  }
+
+  const limitStart = Date.now();
+  finalStreams = await ctx.limiter.limit(finalStreams);
+  limitMs = Date.now() - limitStart;
+
+  if (!failoverOpts?.position || failoverOpts.position === 'last') {
+    if (failoverOpts) {
+      await buildPlayChain(
         finalStreams,
-        nzbFailoverOpts.count,
-        ctx.userData.uuid
+        {
+          maxAttempts: failoverOpts.maxAttempts,
+          contentTypes: failoverOpts.contentTypes,
+          allowCrossType: failoverOpts.allowCrossType,
+          parallel: failoverOpts.parallel,
+          staggerMs: failoverOpts.staggerMs,
+          preferredGraceMs: failoverOpts.preferredGraceMs,
+          maxWaitMs: failoverOpts.maxWaitMs,
+          proxyConfig: failoverOpts.proxyConfig,
+          includeExternal: failoverOpts.includeExternalFailover,
+          sameReleaseLimit: failoverOpts.sameReleaseLimit,
+          duplicateStaggerMs: failoverOpts.duplicateStaggerMs,
+        },
+        userScopeKey(ctx.userData)
       ).catch((error) => {
         logger.error(
           {
             err: error instanceof Error ? error.message : String(error),
             position: 'last',
           },
-          'error during nzb failover population'
+          'error during play chain population'
         );
       });
     }
@@ -510,7 +583,7 @@ async function precacheNextEpisode(
     'precaching streams'
   );
 
-  const cacheKey = `precache-${type}-${id}-${ctx.userData.uuid}`;
+  const cacheKey = `precache-${type}-${id}-${userScopeKey(ctx.userData)}`;
   await precacheCache.set(
     cacheKey,
     true,
@@ -597,12 +670,7 @@ export async function getStreams(
   id: string,
   type: string,
   preCaching: boolean = false
-): Promise<
-  AIOStreamsResponse<{
-    streams: ParsedStream[];
-    statistics: { title: string; description: string; forced?: boolean }[];
-  }>
-> {
+): Promise<StreamsResponse> {
   logger.debug({ type, id }, 'handling stream request');
   const statistics: { title: string; description: string; forced?: boolean }[] =
     [];
@@ -617,8 +685,32 @@ export async function getStreams(
     'found addons for stream resource'
   );
 
-  const context = StreamContext.create(type, id, ctx.userData);
+  const context = await StreamContext.create(type, id, ctx.userData);
   ctx.streamContext = context;
+
+  const pipelineTtl = appConfig.resources.cache.pipeline.ttl;
+  const usePipelineCache = !preCaching && pipelineTtl > 0;
+  // Hash the full userData: it captures everything the pipeline output depends
+  // on
+  let pipelineCacheKey = '';
+  if (usePipelineCache) {
+    pipelineCacheKey = `${getSimpleTextHash(
+      JSON.stringify(ctx.userData)
+    )}:${type}:${id}`;
+    const cached = await pipelineResultCache.get(pipelineCacheKey);
+    if (cached !== undefined) {
+      // The fetch pipeline that normally populates the context's backing fields
+      // was skipped, so await the ones toFormatterContext()/toExpressionContext()
+      // read directly manually.
+      await Promise.all([
+        context.getMetadata(),
+        context.getSeaDex(),
+        context.getEpisodeRuntime(),
+      ]);
+      logger.debug({ type, id }, 'pipeline result cache hit');
+      return cached;
+    }
+  }
 
   ctx.filterer.resetFilterTimings();
   ctx.precomputer.resetPrecomputeTimings();
@@ -651,10 +743,43 @@ export async function getStreams(
     streams,
     context,
     false,
-    ctx.userData.nzbFailover?.enabled && !preCaching
+    ctx.userData.failover?.enabled &&
+      (!preCaching || ctx.userData.failover?.precacheFailover)
       ? {
-          count: ctx.userData.nzbFailover.count ?? 3,
-          position: ctx.userData.nzbFailover.position ?? 'last',
+          maxAttempts: Math.min(
+            ctx.userData.failover.maxAttempts ??
+              constants.DEFAULT_FAILOVER_MAX_ATTEMPTS,
+            appConfig.userLimits.maxFailoverAttempts
+          ),
+          position: ctx.userData.failover.position ?? 'last',
+          contentTypes: (ctx.userData.failover.contentTypes ?? [
+            ...constants.DEFAULT_FAILOVER_CONTENT_TYPES,
+          ]) as FailoverContentType[],
+          allowCrossType: ctx.userData.failover.allowCrossType ?? false,
+          parallel: Math.min(
+            ctx.userData.failover.parallel ??
+              constants.DEFAULT_FAILOVER_PARALLEL,
+            appConfig.userLimits.maxParallelAttempts
+          ),
+          staggerMs:
+            ctx.userData.failover.staggerMs ??
+            constants.DEFAULT_FAILOVER_STAGGER_MS,
+          preferredGraceMs:
+            ctx.userData.failover.preferredGraceMs ??
+            constants.DEFAULT_FAILOVER_PREFERRED_GRACE_MS,
+          maxWaitMs:
+            ctx.userData.failover.maxWaitMs ??
+            constants.DEFAULT_FAILOVER_MAX_WAIT_MS,
+          proxyConfig: ctx.userData.proxy,
+          includeExternalFailover:
+            ctx.userData.failover.includeExternalFailover ??
+            constants.DEFAULT_FAILOVER_INCLUDE_EXTERNAL,
+          sameReleaseLimit:
+            ctx.userData.failover.sameReleaseLimit ??
+            constants.DEFAULT_FAILOVER_SAME_RELEASE_LIMIT,
+          duplicateStaggerMs:
+            ctx.userData.failover.duplicateStaggerMs ??
+            constants.DEFAULT_FAILOVER_DUPLICATE_STAGGER_MS,
         }
       : undefined
   );
@@ -693,7 +818,7 @@ export async function getStreams(
 
   if (ctx.userData.precacheNextEpisode && !preCaching) {
     let precache = false;
-    const cacheKey = `precache-${type}-${id}-${ctx.userData.uuid}`;
+    const cacheKey = `precache-${type}-${id}-${userScopeKey(ctx.userData)}`;
     const cachedNextEpisode = await precacheCache.get(cacheKey, false);
     if (cachedNextEpisode) {
       logger.debug(
@@ -720,7 +845,7 @@ export async function getStreams(
   if (ctx.userData.preloadStreams?.enabled && !preCaching) {
     let shouldPreload = true;
     if (appConfig.resources.preload.minInterval > 0) {
-      const preloadCooldownKey = `preload-${type}-${id}-${ctx.userData.uuid}`;
+      const preloadCooldownKey = `preload-${type}-${id}-${userScopeKey(ctx.userData)}`;
       const recentlyPreloaded = await precacheCache.get(
         preloadCooldownKey,
         false
@@ -768,6 +893,14 @@ export async function getStreams(
         streamsToPreload = [];
       }
       if (streamsToPreload.length > 0) {
+        // mark streams as preloading for formatter
+        for (const s of streamsToPreload) {
+          // cant mutate as select returns copys via zod parsing, so we need to find the original stream via ID.
+          const originalStream = finalStreams.find((fs) => fs.id === s.id);
+          if (originalStream) {
+            originalStream.preloading = true;
+          }
+        }
         setImmediate(() => {
           pingStreamUrls(streamsToPreload).catch((error) => {
             logger.error('Error during stream preloading:', {
@@ -848,11 +981,15 @@ export async function getStreams(
     },
     'stream request complete'
   );
-  return {
+  const response: StreamsResponse = {
     success: true,
     data: { streams: finalStreams, statistics },
     errors,
   };
+  if (usePipelineCache) {
+    await pipelineResultCache.set(pipelineCacheKey, response, pipelineTtl);
+  }
+  return response;
 }
 
 export async function getMeta(
@@ -892,7 +1029,7 @@ export async function getMeta(
         meta.links = convertDiscoverDeepLinks(ctx, meta.links);
       }
       if (meta.videos) {
-        const context = StreamContext.create(type, id, ctx.userData);
+        const context = await StreamContext.create(type, id, ctx.userData);
         ctx.streamContext = context;
         meta.videos = await Promise.all(
           meta.videos.map(async (video) => {

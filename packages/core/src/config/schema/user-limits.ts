@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { commaSeparatedList, positiveInt, seconds } from './helpers.js';
+import {
+  byteSize,
+  commaSeparatedList,
+  positiveInt,
+  seconds,
+} from './helpers.js';
 import type { RuntimeConfigSection } from '../types.js';
 
 /**
@@ -10,6 +15,8 @@ import type { RuntimeConfigSection } from '../types.js';
  * - `timeouts`: min/max bounds for user-configurable HTTP timeouts.
  * - `regex`: regex-filter access policy + whitelisted patterns.
  * - `sel`: SEL sync access + whitelisted URLs + stream-expression limits.
+ * - `variants`: config-variant access policy + script/instruction limits.
+ * - `healthChecks`: health-check access policy + fetch limits.
  * - `sync`: shared refresh interval for whitelisted regex/SEL syncs.
  * - `disabled`: hard-disabled addons/services/hosts/stream-types.
  * - `selfScraping`: prevents addons from scraping the same AIOStreams instance.
@@ -73,12 +80,23 @@ export const userLimitsSchema = {
     requiresRestart: false,
     secret: false,
   },
-  maxNzbFailoverCount: {
+  maxFailoverAttempts: {
     schema: positiveInt,
     default: 5,
-    label: 'Max NZB failover count',
-    description: 'Maximum NZB failover attempts a user can configure.',
-    env: 'MAX_NZB_FAILOVER_COUNT',
+    label: 'Max failover attempts',
+    description:
+      'Maximum total failover attempts (after de-duplication) a user can configure.',
+    env: ['MAX_FAILOVER_ATTEMPTS', 'MAX_NZB_FAILOVER_COUNT'],
+    requiresRestart: false,
+    secret: false,
+  },
+  maxParallelAttempts: {
+    schema: positiveInt,
+    default: 2,
+    label: 'Max parallel failover attempts',
+    description:
+      'Maximum concurrent failover attempts a user can configure. Caps load on upstream providers.',
+    env: 'MAX_PARALLEL_ATTEMPTS',
     requiresRestart: false,
     secret: false,
   },
@@ -221,6 +239,168 @@ export const userLimitsSchema = {
       description:
         'Maximum length (characters) of a single stream expression. Enforced during config validation.',
       env: 'MAX_SEL_LENGTH',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  variants: {
+    access: {
+      schema: accessLevel,
+      default: 'all',
+      label: 'Config variant access',
+      description:
+        'Who may define config variants. "all" = everyone, "trusted" = trusted users only, "none" = the feature is disabled.',
+      env: 'VARIANT_ACCESS',
+      requiresRestart: false,
+      secret: false,
+    },
+    max: {
+      schema: positiveInt,
+      default: 10,
+      label: 'Max config variants',
+      description: 'Maximum number of config variants a user may define.',
+      env: 'MAX_VARIANTS',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxScriptLength: {
+      schema: positiveInt,
+      default: 4000,
+      label: 'Max variant script length',
+      description:
+        'Maximum length (characters) of a single variant script. Enforced during config validation.',
+      env: 'MAX_VARIANT_SCRIPT_LENGTH',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxTotalScriptCharacters: {
+      schema: positiveInt,
+      default: 20000,
+      label: 'Max variant script characters',
+      description:
+        'Maximum total character count across every variant script in a configuration.',
+      env: 'MAX_VARIANT_TOTAL_SCRIPT_CHARACTERS',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxInstructions: {
+      schema: positiveInt,
+      default: 100,
+      label: 'Max variant instructions',
+      description: 'Maximum number of instructions in a single variant script.',
+      env: 'MAX_VARIANT_INSTRUCTIONS',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxActive: {
+      schema: positiveInt,
+      default: 4,
+      label: 'Max active variants',
+      description:
+        'Maximum number of variants that may be combined on a single request.',
+      env: 'MAX_ACTIVE_VARIANTS',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxDepth: {
+      schema: positiveInt,
+      default: 5,
+      label: 'Max variant nesting depth',
+      description:
+        'Maximum depth a variant may nest others through "use variant".',
+      env: 'MAX_VARIANT_DEPTH',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxPathMatches: {
+      schema: positiveInt,
+      default: 200,
+      label: 'Max variant path matches',
+      description:
+        'Maximum number of places a single variant instruction may write to.',
+      env: 'MAX_VARIANT_PATH_MATCHES',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxValueDepth: {
+      schema: positiveInt,
+      default: 10,
+      label: 'Max variant value depth',
+      description:
+        'Maximum nesting depth of an object or array literal in a variant script.',
+      env: 'MAX_VARIANT_VALUE_DEPTH',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxPathSegments: {
+      schema: positiveInt,
+      default: 12,
+      label: 'Max variant path segments',
+      description:
+        'Maximum number of segments in a single variant instruction path.',
+      env: 'MAX_VARIANT_PATH_SEGMENTS',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  healthChecks: {
+    access: {
+      schema: accessLevel,
+      default: 'all',
+      label: 'Health check access',
+      description:
+        'Who may define health checks, the URLs polled to decide whether a service is up. "all" = everyone, "trusted" = trusted users only, "none" = the feature is disabled.',
+      env: 'HEALTH_CHECK_ACCESS',
+      requiresRestart: false,
+      secret: false,
+    },
+    max: {
+      schema: positiveInt,
+      default: 5,
+      label: 'Max health checks',
+      description: 'Maximum number of health checks a user may define.',
+      env: 'MAX_HEALTH_CHECKS',
+      requiresRestart: false,
+      secret: false,
+    },
+    minTtl: {
+      schema: seconds,
+      default: 60,
+      label: 'Min health check interval',
+      description:
+        'Shortest interval a health check result may be reused for. A user asking for less is raised to this (accepts e.g. "5m", "1h").',
+      env: 'HEALTH_CHECK_MIN_TTL',
+      requiresRestart: false,
+      secret: false,
+      ui: { kind: 'duration' },
+    },
+    maxTimeout: {
+      schema: positiveInt,
+      default: 10000,
+      label: 'Max health check timeout (ms)',
+      description:
+        'Longest a health check may wait for a response. The first request needing a fresh result waits this long at worst.',
+      env: 'HEALTH_CHECK_MAX_TIMEOUT',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxBytes: {
+      schema: byteSize,
+      default: 65536,
+      label: 'Max health check response size',
+      description:
+        'How much of a health check response is read before giving up on it.',
+      env: 'HEALTH_CHECK_MAX_BYTES',
+      requiresRestart: false,
+      secret: false,
+    },
+    allowPrivateUrls: {
+      schema: z.boolean(),
+      default: false,
+      label: 'Allow private health check URLs',
+      description:
+        'Let health checks point at private addresses. Anyone who can save a configuration can then probe your internal network, so only enable this on an instance you trust the users of.',
+      env: 'HEALTH_CHECK_ALLOW_PRIVATE_URLS',
       requiresRestart: false,
       secret: false,
     },

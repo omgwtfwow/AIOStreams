@@ -4,6 +4,12 @@ This fork carries private deployment changes for the homeserver media stack.
 Keep production deployments pinned to explicit fork image tags; do not deploy a
 mutable `latest` tag from this fork.
 
+Migration ID 7 is permanently reserved for the fork's `proxy_aliases`
+migration because deployed databases already record it. Upstream migrations
+starting with `0007_usenet.ts` are intentionally assigned IDs one greater
+than their filenames in this fork. Keep that offset for future upstream syncs
+and test upgrades from an existing proxy-alias database before release.
+
 ## Publish A Private Image Release
 
 Use the `Fork Image` GitHub Actions workflow in this repository.

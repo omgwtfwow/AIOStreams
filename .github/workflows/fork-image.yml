@@ -47,6 +47,7 @@ jobs:
     outputs:
       image: ${{ steps.meta.outputs.image }}
       tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v6
 
@@ -100,6 +101,7 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Build image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -116,6 +118,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.create_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -132,7 +135,7 @@ jobs:
             echo "Pinned image:"
             echo
             echo "\`\`\`text"
-            echo "${IMAGE}"
+            echo "${IMAGE}@${IMAGE_DIGEST}"
             echo "\`\`\`"
             echo
             echo "Source commit: ${GITHUB_SHA}"

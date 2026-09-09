@@ -27,6 +27,7 @@ import {
   preprocessTitle,
   titleMatch,
 } from '../parser/utils.js';
+import { normaliseCountryCode } from '../utils/countries.js';
 import { partial_ratio } from 'fuzzball';
 import { ParsedResult } from '@viren070/parse-torrent-title';
 
@@ -54,29 +55,49 @@ export function cleanNzbUrl(url: string): string {
 }
 
 /**
- * Compute an MD5 hash of a cleaned NZB URL.
+ * Known NZB download URL shapes that have identifiers in query parameters.
+ */
+const NZB_URL_SHAPES: ReadonlyArray<{
+  pathSuffix: string;
+  /** Params retained in the hashed URL; all must be present for a match. */
+  keep: readonly string[];
+  matches?: (params: URLSearchParams) => boolean;
+}> = [
+  {
+    // newznab t=get / t=g requests. `t` is kept as part of the canonical form,
+    // not because it identifies the release.
+    pathSuffix: '/api',
+    keep: ['t', 'id'],
+    matches: (params) => ['get', 'g'].includes(params.get('t')!),
+  },
+  // prowlarr nzb urls
+  { pathSuffix: '/download', keep: ['link'] },
+  { pathSuffix: '/getnzb', keep: ['id'] },
+];
+
+const md5 = (value: string): string =>
+  createHash('md5').update(value).digest('hex');
+
+/**
+ * Compute an MD5 hash identifying an NZB URL.
  */
 export function hashNzbUrl(url: string, clean: boolean = true): string {
   try {
     const u = new URL(url);
     const pathName = u.pathname.replace(/\/$/, '');
-    if (pathName.endsWith('/api')) {
-      const t = u.searchParams.get('t');
-      const id = u.searchParams.get('id');
-      if (t === 'get' && id) {
-        const keys = Array.from(u.searchParams.keys());
-        for (const key of keys) {
-          if (key !== 't' && key !== 'id') {
-            u.searchParams.delete(key);
-          }
+    for (const shape of NZB_URL_SHAPES) {
+      if (!pathName.endsWith(shape.pathSuffix)) continue;
+      if (shape.keep.some((key) => !u.searchParams.get(key))) continue;
+      if (shape.matches && !shape.matches(u.searchParams)) continue;
+      for (const key of Array.from(u.searchParams.keys())) {
+        if (!shape.keep.includes(key)) {
+          u.searchParams.delete(key);
         }
-        return createHash('md5').update(u.toString()).digest('hex');
       }
+      return md5(u.toString());
     }
   } catch {}
-  return createHash('md5')
-    .update(clean ? cleanNzbUrl(url) : url)
-    .digest('hex');
+  return md5(clean ? cleanNzbUrl(url) : url);
 }
 
 /**
@@ -116,7 +137,8 @@ export function buildResolveKey(
 ): string {
   const { type, hash, fileIndex } = playbackInfo;
   const nzb = playbackInfo.type === 'usenet' ? playbackInfo.nzb : undefined;
-  const { season, episode, absoluteEpisode } = playbackInfo.metadata ?? {};
+  const { season, episode, absoluteEpisode, airDates } =
+    playbackInfo.metadata ?? {};
   const parts: (string | number)[] = [
     prefix,
     serviceName,
@@ -129,6 +151,7 @@ export function buildResolveKey(
     season ?? '-',
     episode ?? '-',
     absoluteEpisode ?? '-',
+    airDates?.[0] ?? '-',
     filename ?? '-',
   ];
   if (flags !== undefined) {
@@ -158,7 +181,6 @@ interface BaseFile {
   parsedMediaInfo?: ParsedMediaInfo;
   age?: number; // age in hours
   downloadvolumefactor?: number; // multiplier for the download volume that counts toward the user’s account on the tracker
-  duration?: number; // duration in seconds
   library?: boolean; // whether the file is already in the user's library
 }
 
@@ -175,6 +197,7 @@ export interface Torrent extends BaseFile {
 export interface UnprocessedTorrent extends BaseFile {
   type: 'torrent';
   hash?: string;
+  guid?: string;
   downloadUrl?: string;
   sources: string[];
   private?: boolean;
@@ -188,6 +211,7 @@ export interface NZB extends BaseFile {
   easynewsUrl?: string;
   zyclopsHealth?: string;
   serviceItemId?: string;
+  releaseKey?: string;
 }
 
 export interface TorrentWithSelectedFile extends Torrent {
@@ -274,6 +298,11 @@ export const isEpisodeWrong = (
   parsed: ParsedResult,
   metadata?: TitleMetadata
 ) => {
+  // a parsed release date is authoritative when the requested air date is known
+  const parsedDate = parsed.date || undefined;
+  if (parsedDate && metadata?.airDates?.length) {
+    return !metadata.airDates.includes(parsedDate);
+  }
   if (
     parsed.episodes?.length &&
     metadata?.episode &&
@@ -289,6 +318,21 @@ export const isEpisodeWrong = (
   }
   return false;
 };
+/**
+ * A country tag identifies which same-name show a release belongs to, even
+ * when the bare title matches. Only discriminates when both sides are known.
+ */
+export const isCountryWrong = (
+  parsed: { country?: string },
+  metadata?: { country?: string }
+) => {
+  const parsedCountry = normaliseCountryCode(parsed.country);
+  const metadataCountry = normaliseCountryCode(metadata?.country);
+  return (
+    !!parsedCountry && !!metadataCountry && parsedCountry !== metadataCountry
+  );
+};
+
 export const isTitleWrong = (
   parsed: { title?: string },
   metadata?: { titles?: string[] }
@@ -366,7 +410,7 @@ export async function selectFileInTorrentOrNZB(
   const normTitles: Set<string> | null = metadata?.titles?.length
     ? new Set(metadata.titles.map(normaliseTitle))
     : null;
-  const titleCache = new Map<string, string>();
+  const knownTitles = metadata?.titles ?? [];
   const files = debridDownload.files;
   const maxSize =
     torrentOrNZB.size || files.reduce((max, f) => Math.max(max, f.size), 0);
@@ -466,7 +510,17 @@ export async function selectFileInTorrentOrNZB(
       }
     }
 
-    if (parsed && !isEpisodeWrong(parsed, metadata)) {
+    const parsedDate = parsed?.date || undefined;
+    if (parsedDate && metadata?.airDates?.length) {
+      if (metadata.airDates.includes(parsedDate)) {
+        score += 800;
+        fileReport.scoreBreakdown.episodeMatchType = 'date';
+        fileReport.scoreBreakdown.episodeScore = 800;
+      } else {
+        score -= 800;
+        fileReport.scoreBreakdown.wrongDatePenalty = -800;
+      }
+    } else if (parsed && !isEpisodeWrong(parsed, metadata)) {
       const parsedEpisodesCount = parsed.episodes?.length || 0;
       const parsedHasSeason = parsed.seasons && parsed.seasons.length > 0;
       const isExactMatch = parsedEpisodesCount === 1;
@@ -572,7 +626,8 @@ export async function selectFileInTorrentOrNZB(
     }
     if (
       !parsed?.episodes?.length &&
-      (metadata?.episode || metadata?.absoluteEpisode)
+      (metadata?.episode || metadata?.absoluteEpisode) &&
+      !metadata?.isDateBased
     ) {
       score -= 500;
       fileReport.scoreBreakdown.missingEpisodePenalty = -500;
@@ -580,20 +635,19 @@ export async function selectFileInTorrentOrNZB(
 
     // Title matching (third priority)
     if (parsed?.title && (videoExists ? isVideo[index] : true)) {
-      let preprocessed = titleCache.get(parsed.title);
-      if (preprocessed === undefined) {
-        preprocessed = preprocessTitle(
-          parsed.title,
-          torrentOrNZB.title ?? '',
-          metadata?.titles ?? []
-        );
-        titleCache.set(parsed.title, preprocessed);
-      }
+      const preprocessed = preprocessTitle(
+        parsed.title,
+        [file.name, torrentOrNZB.title],
+        knownTitles
+      );
       const titleMatches =
         normTitles === null
           ? true
           : normTitles.has(normaliseTitle(preprocessed));
-      if (titleMatches) {
+      if (titleMatches && isCountryWrong(parsed, metadata)) {
+        score -= 200;
+        fileReport.scoreBreakdown.countryMismatchPenalty = -200;
+      } else if (titleMatches) {
         score += 200;
         fileReport.scoreBreakdown.titleMatch = 200;
       }
@@ -736,6 +790,7 @@ export const VIDEO_FILE_EXTENSIONS = [
   '.yuv',
   '.m3u8',
   '.m2ts',
+  '.ts',
 ];
 
 export function isVideoFile(file: DebridFile): boolean {
@@ -850,6 +905,13 @@ export const fileInfoStore = () => {
 //   return `${appConfig.bootstrap.baseUrl}/api/v1/debrid/playback/${encryptedStoreAuth.data}/${playbackId}/${encodeURIComponent(filename)}`;
 // }
 
+/**
+ * Placeholder for the playback URL's fallback-key path segment when no failover
+ * chain applies. The failover builder rewrites this in place; the route treats
+ * it as "no chain".
+ */
+export const PLAYBACK_FALLBACK_PLACEHOLDER = '-';
+
 export function generatePlaybackUrl(
   encryptedStoreAuth: string,
   metadataId: string,
@@ -866,5 +928,91 @@ export function generatePlaybackUrl(
       appConfig.builtins.debrid.playbackLinkValidity
     );
   }
-  return `${appConfig.bootstrap.baseUrl}/api/v1/debrid/playback/${encryptedStoreAuth}/${fileInfoStr}/${metadataId}/${encodeURIComponent(filename ?? 'unknown')}`;
+  // The fallback-key segment lives right after the store auth so the failover
+  // builder can rewrite it without touching the rest of the URL. Carrying it as
+  // a PATH segment (not a query param) keeps it intact for clients like Infuse
+  // that strip query strings.
+  return `${appConfig.bootstrap.baseUrl}/api/v1/debrid/playback/${encryptedStoreAuth}/${PLAYBACK_FALLBACK_PLACEHOLDER}/${fileInfoStr}/${metadataId}/${encodeURIComponent(filename ?? 'unknown')}`;
+}
+
+/** Marker that prefixes the path of a playback URL we generated. */
+export const PLAYBACK_PATH_PREFIX = '/api/v1/debrid/playback/';
+
+/**
+ * Rewrite the fallback-key segment of a playback URL produced by
+ * {@link generatePlaybackUrl}. Returns the URL unchanged if it isn't one of
+ * ours (e.g. an external/arbitrary URL).
+ */
+export function setPlaybackFallbackKey(
+  url: string,
+  fallbackKey: string
+): string {
+  const idx = url.indexOf(PLAYBACK_PATH_PREFIX);
+  if (idx === -1) return url;
+  const headEnd = idx + PLAYBACK_PATH_PREFIX.length;
+  const rest = url.slice(headEnd); // {storeAuth}/{fbk}/{fileInfo}/...
+  const segments = rest.split('/');
+  if (segments.length < 2) return url;
+  segments[1] = fallbackKey; // storeAuth is [0], fallback key is [1]
+  return url.slice(0, headEnd) + segments.join('/');
+}
+
+/**
+ * Remove a debrid download if the resolve attempt that created it loses a
+ * parallel failover race (its `signal` aborts). This is how a discarded
+ * attempt undoes its side effect — every torrent/usenet resolve adds the item
+ * to the account, even cached ones. Private torrents are left intact (seeding).
+ * Idempotent and safe to call with an already-aborted signal.
+ */
+export function removeDownloadOnAbort(
+  signal: AbortSignal | undefined,
+  download: { id?: string | number; private?: boolean } | undefined,
+  remove: (id: string) => Promise<void>,
+  onError?: (message: string) => void
+): void {
+  if (!signal || download?.id === undefined || download.private) return;
+  const id = String(download.id);
+  let done = false;
+  const onAbort = () => {
+    if (done) return;
+    done = true;
+    remove(id).catch((err) =>
+      onError?.(
+        `failed to remove download ${id} after failover abort: ${err?.message}`
+      )
+    );
+  };
+  if (signal.aborted) {
+    onAbort();
+    return;
+  }
+  signal.addEventListener('abort', onAbort, { once: true });
+}
+
+/** Encode the failover chain reference carried in the playback URL path. */
+export function encodeFallbackKey(
+  index: number,
+  count: number,
+  listKey: string
+): string {
+  return `${index}.${count}.${listKey}`;
+}
+
+/**
+ * Decode the failover chain reference. Returns undefined for the placeholder or
+ * any malformed value.
+ */
+export function decodeFallbackKey(
+  fallbackKey: string | undefined
+): { index: number; count: number; listKey: string } | undefined {
+  if (!fallbackKey || fallbackKey === PLAYBACK_FALLBACK_PLACEHOLDER) {
+    return undefined;
+  }
+  const parts = fallbackKey.split('.');
+  if (parts.length !== 3) return undefined;
+  const index = parseInt(parts[0], 10);
+  const count = parseInt(parts[1], 10);
+  const listKey = parts[2];
+  if (isNaN(index) || isNaN(count) || !listKey) return undefined;
+  return { index, count, listKey };
 }

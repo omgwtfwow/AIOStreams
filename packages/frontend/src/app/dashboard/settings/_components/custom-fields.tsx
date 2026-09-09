@@ -7,9 +7,15 @@ import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { Button, IconButton } from '@/components/ui/button';
 import { BasicField } from '@/components/ui/basic-field';
+import { parseDuration, formatDurationMs } from '@/lib/format';
+import MarkdownLite from '@/components/shared/markdown-lite';
 import type { SettingsUiHint } from '../queries';
 /** Sentinel value that signals "clear this secret" on save. */
 export const SECRET_CLEAR_SENTINEL = '\x00CLEAR\x00';
+
+/** Render a help string through MarkdownLite (`code`, **bold**, links, \n). */
+export const md = (text?: string) =>
+  text ? <MarkdownLite>{text}</MarkdownLite> : undefined;
 
 interface CommonProps {
   name: string;
@@ -23,6 +29,47 @@ type MapValueKind = NonNullable<SettingsUiHint['mapValueKind']>;
 
 /** Layout hint controlling key vs value column widths in `KeyValueListField`. */
 export type KvWidth = 'equal' | 'wide-key' | 'wide-value';
+
+/**
+ * Byte-size cell for `KeyValueListField`. Same contract as {@link SizeField};
+ * the text is local so a half-typed "5G" isn't reformatted mid-keystroke.
+ */
+function SizeCell({
+  value,
+  disabled,
+  onValueChange,
+}: {
+  value: unknown;
+  disabled?: boolean;
+  onValueChange: (bytes: number) => void;
+}) {
+  const numeric = typeof value === 'number' ? value : Number(value ?? 0) || 0;
+  const [text, setText] = React.useState(() => formatSize(numeric));
+  const [err, setErr] = React.useState(false);
+
+  React.useEffect(() => {
+    if (parseSizeToBytes(text) !== numeric) {
+      setText(formatSize(numeric));
+      setErr(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [numeric]);
+
+  return (
+    <TextInput
+      value={text}
+      disabled={disabled}
+      placeholder='e.g. "500GB"'
+      error={err ? 'Invalid size' : undefined}
+      onValueChange={(v) => {
+        setText(v);
+        const bytes = parseSizeToBytes(v);
+        setErr(bytes == null);
+        if (bytes != null) onValueChange(bytes);
+      }}
+    />
+  );
+}
 
 /**
  * `Field.KeyValueList` — generic editor for the map / list helper schemas
@@ -87,7 +134,11 @@ export function KeyValueListField({
   };
 
   const defaultVal = (): unknown =>
-    valueKind === 'boolean' ? false : valueKind === 'number' ? 0 : '';
+    valueKind === 'boolean'
+      ? false
+      : valueKind === 'number' || valueKind === 'size'
+        ? 0
+        : '';
 
   const keyClass =
     width === 'wide-key'
@@ -103,7 +154,7 @@ export function KeyValueListField({
         : 'basis-1/2 grow shrink-0';
 
   return (
-    <BasicField label={label} help={help}>
+    <BasicField label={label} help={md(help)}>
       <div className="space-y-2">
         {rows.length === 0 && (
           <p className="text-xs text-[--muted] italic">No entries.</p>
@@ -122,6 +173,12 @@ export function KeyValueListField({
               {valueKind === 'boolean' ? (
                 <Switch
                   value={Boolean(v)}
+                  disabled={disabled}
+                  onValueChange={(nv) => setRow(i, k, nv)}
+                />
+              ) : valueKind === 'size' ? (
+                <SizeCell
+                  value={v}
                   disabled={disabled}
                   onValueChange={(nv) => setRow(i, k, nv)}
                 />
@@ -202,7 +259,7 @@ export function StringListField({ name, label, help, disabled }: CommonProps) {
   };
 
   return (
-    <BasicField label={label} help={help}>
+    <BasicField label={label} help={md(help)}>
       <div className="space-y-2">
         {rows.length === 0 && (
           <p className="text-xs text-[--muted] italic">No entries.</p>
@@ -262,7 +319,7 @@ export function BoolOrListField({ name, label, help, disabled }: CommonProps) {
   }, [isList]);
 
   return (
-    <BasicField label={label} help={help}>
+    <BasicField label={label} help={md(help)}>
       <div className="space-y-3">
         <div className="flex items-center gap-3">
           <Switch
@@ -312,59 +369,30 @@ export function BoolOrListField({ name, label, help, disabled }: CommonProps) {
 }
 
 /**
- * Client mirror of core `formatDurationAsText` — up to two units, including
- * weeks. Used to show stored second-counts in a human-readable way.
+ * DurationField stores whole SECONDS (the backend's unit for config
+ * durations). Display/parse delegate to the shared millisecond helpers in
+ * `lib/format` (the single decimal-aware duration implementation), converting
+ * at the seconds⇄ms boundary.
  */
 function formatDuration(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '';
   if (totalSeconds === 0) return '0s';
-  const units: Array<[string, number]> = [
-    ['w', 604800],
-    ['d', 86400],
-    ['h', 3600],
-    ['m', 60],
-    ['s', 1],
-  ];
-  let rem = Math.floor(totalSeconds);
-  const parts: string[] = [];
-  for (const [unit, size] of units) {
-    if (rem >= size) {
-      parts.push(`${Math.floor(rem / size)}${unit}`);
-      rem %= size;
-    }
-  }
-  return parts.slice(0, 2).join(' ');
+  return formatDurationMs(Math.round(totalSeconds) * 1000);
 }
 
-const UNIT_SECONDS: Record<string, number> = {
-  w: 604800,
-  d: 86400,
-  h: 3600,
-  m: 60,
-  s: 1,
-};
-
 /**
- * Client mirror of core `parseTime` (compound durations + weeks), returning
- * whole seconds. Also accepts a plain integer (already seconds). Returns
- * `null` for unparseable input so the field can surface a validation error
- * without committing a bad value.
+ * Parse a friendly duration string to whole seconds. A bare integer is taken
+ * as seconds (config unit); unit strings (`30m`, `1h`, `1.5h`) go through the
+ * shared ms parser. Returns `null` for unparseable input so the field can
+ * surface a validation error without committing a bad value.
  */
 function parseDurationToSeconds(text: string): number | null {
   const t = text.trim();
   if (t === '') return null;
-  if (/^-?\d+$/.test(t)) return Number(t);
-  const compact = t.replace(/\s+/g, '').toLowerCase();
-  const re = /(\d+)(w|d|h|m|s)/g;
-  let total = 0;
-  let consumed = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(compact)) !== null) {
-    total += Number(m[1]) * UNIT_SECONDS[m[2]];
-    consumed += m[0].length;
-  }
-  if (consumed === 0 || consumed !== compact.length) return null;
-  return total;
+  if (/^-?\d+$/.test(t)) return Number(t); // bare integer = seconds
+  if (!/[a-z]/i.test(t)) return null; // bare non-integer without a unit = invalid
+  const ms = parseDuration(t);
+  return ms == null ? null : Math.round(ms / 1000);
 }
 
 /**
@@ -396,7 +424,7 @@ export function DurationField({ name, label, help, disabled }: CommonProps) {
   }, [numeric]);
 
   return (
-    <BasicField label={label} help={help} error={err ?? undefined}>
+    <BasicField label={label} help={md(help)} error={err ?? undefined}>
       <TextInput
         value={text}
         disabled={disabled}
@@ -431,7 +459,7 @@ export function MultilineStringField({
     ? `${help ? help + ' · ' : ''}Will be cleared on save.`
     : help;
   return (
-    <BasicField label={label} help={effectiveHelp}>
+    <BasicField label={label} help={md(effectiveHelp)}>
       {secretSet && (
         <div className="flex justify-end mb-1">
           <Button
@@ -466,6 +494,7 @@ export function MultilineStringField({
 }
 
 const SIZE_UNITS: Array<[string, number]> = [
+  ['TB', 1_000_000_000_000],
   ['GB', 1_000_000_000],
   ['MB', 1_000_000],
   ['KB', 1_000],
@@ -488,7 +517,7 @@ function parseSizeToBytes(text: string): number | null {
   const t = text.trim();
   if (t === '') return null;
   if (/^\d+$/.test(t)) return Number(t);
-  const m = t.match(/^(\d+(?:\.\d+)?)\s*([kmg]?b)?$/i);
+  const m = t.match(/^(\d+(?:\.\d+)?)\s*([kmgt]?b)?$/i);
   if (!m) return null;
   const n = Number(m[1]);
   const unit = (m[2] || 'b').toLowerCase();
@@ -497,6 +526,7 @@ function parseSizeToBytes(text: string): number | null {
     kb: 1_000,
     mb: 1_000_000,
     gb: 1_000_000_000,
+    tb: 1_000_000_000_000,
   };
   return Math.floor(n * mult[unit]);
 }
@@ -525,7 +555,7 @@ export function SizeField({ name, label, help, disabled }: CommonProps) {
   }, [numeric]);
 
   return (
-    <BasicField label={label} help={help} error={err ?? undefined}>
+    <BasicField label={label} help={md(help)} error={err ?? undefined}>
       <TextInput
         value={text}
         disabled={disabled}
@@ -562,7 +592,7 @@ export function JsonField({ name, label, help, disabled }: CommonProps) {
   }, [field.value]);
 
   return (
-    <BasicField label={label} help={help} error={err ?? undefined}>
+    <BasicField label={label} help={md(help)} error={err ?? undefined}>
       <Textarea
         value={text}
         disabled={disabled}

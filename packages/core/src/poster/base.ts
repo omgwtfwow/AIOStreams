@@ -2,7 +2,7 @@
 import { Cache } from '../utils/cache.js';
 import { makeRequest } from '../utils/http.js';
 import { IdParser } from '../utils/id-parser.js';
-import { AnimeDatabase } from '../utils/anime-database.js';
+import { AnimeDatabase } from '../anime-database/index.js';
 
 export type ParsedPosterId = {
   idType: 'tmdb' | 'imdb' | 'tvdb';
@@ -58,7 +58,10 @@ export abstract class BasePosterService {
    * Parse a Stremio-style `id` + `type` into an ID type and value
    * that this poster service understands.
    */
-  protected parseId(type: string, id: string): ParsedPosterId | null {
+  protected async parseId(
+    type: string,
+    id: string
+  ): Promise<ParsedPosterId | null> {
     const parsedId = IdParser.parse(id, type);
     if (!parsedId) return null;
 
@@ -79,7 +82,7 @@ export abstract class BasePosterService {
     }
 
     // Fallback: try AnimeDatabase mapping
-    const entry = AnimeDatabase.getInstance().getEntryById(
+    const entry = await AnimeDatabase.getInstance().getEntryById(
       parsedId.type,
       parsedId.value
     );
@@ -127,15 +130,15 @@ export abstract class BasePosterService {
     id: string,
     checkExists: boolean = true
   ): Promise<string | null> {
-    const parsed = this.parseId(type, id);
-    if (!parsed) return null;
-    const { idType, idValue } = parsed;
-
     const cacheKey = this.getCacheKey(type, id);
     const cached = await this.posterCheckCache.get(cacheKey);
     if (cached !== undefined) {
       return cached;
     }
+
+    const parsed = await this.parseId(type, id);
+    if (!parsed) return null;
+    const { idType, idValue } = parsed;
 
     const posterUrl = this.buildPosterUrl(idType, idValue);
     if (!checkExists) {

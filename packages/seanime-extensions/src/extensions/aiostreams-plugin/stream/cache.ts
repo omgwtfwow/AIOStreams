@@ -22,8 +22,9 @@ export class StreamCache {
     $storage.set(this.storeKey, store);
   }
 
-  static keyFor(parsedId: ParsedId): string {
-    return `${parsedId.type}:${parsedId.value}:s${parsedId.season ?? 0}:e${parsedId.episode ?? 0}`;
+  static keyFor(parsedId: ParsedId, variants: string[] = []): string {
+    const scope = variants.length ? `${variants.join(',')}:` : '';
+    return `${scope}${parsedId.type}:${parsedId.value}:s${parsedId.season ?? 0}:e${parsedId.episode ?? 0}`;
   }
 
   get(key: string): StreamResult[] | null {
@@ -32,6 +33,8 @@ export class StreamCache {
     const entry = this.read()[key];
     if (!entry) return null;
     if (Date.now() - entry.ts > ttl * 60 * 1000) return null;
+    // Guard against malformed/partial entries coming back from $storage.
+    if (!Array.isArray(entry.results)) return null;
     return entry.results;
   }
 

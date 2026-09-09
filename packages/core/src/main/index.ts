@@ -5,7 +5,8 @@ import {
   StrictManifestResource,
   UserData,
 } from '../db/index.js';
-import { Cache, createLogger, IdParser } from '../utils/index.js';
+import { Cache, createLogger, IdParser, userScopeKey } from '../utils/index.js';
+import { withVariantSelector } from '../variants/runtime.js';
 import Proxifier from '../streams/proxifier.js';
 import StreamLimiter from '../streams/limiter.js';
 import {
@@ -42,7 +43,12 @@ export class AIOStreams {
     this.ctx = {
       userData,
       options,
-      manifestUrl: `${appConfig.bootstrap.baseUrl}/stremio/${userData.uuid}/${userData.encryptedPassword}/manifest.json`,
+      manifestUrl: withVariantSelector(
+        `${appConfig.bootstrap.baseUrl}/stremio/${userData.uuid}/${userData.encryptedPassword}`,
+        '/manifest.json',
+        userData.activeVariants,
+        userData.variantSelectorLocation
+      ),
       manifests: {},
       supportedResources: {},
       finalResources: [],
@@ -149,7 +155,7 @@ export class AIOStreams {
     const baseSeriesKey = parsed
       ? `${parsed.type}:${parsed.value}`
       : id.split(':')[0] || id;
-    const key = `${this.ctx.userData.uuid}:${baseSeriesKey}`;
+    const key = `${userScopeKey(this.ctx.userData)}:${baseSeriesKey}`;
     logger.trace({ key }, 'formed ays cache key');
     const now = Date.now();
     const prev = (await cache.get(key)) || { count: 0, lastAt: 0 };

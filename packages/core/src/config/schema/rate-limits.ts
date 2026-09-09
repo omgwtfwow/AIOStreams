@@ -76,6 +76,12 @@ export const rateLimitsSchema = {
     envPrefix: 'USER_API',
     label: 'user API',
   }),
+  userCreate: rateLimit({
+    windowDefault: 3600,
+    maxDefault: 10,
+    envPrefix: 'USER_CREATE',
+    label: 'config creation',
+  }),
   streamApi: rateLimit({
     windowDefault: 10,
     maxDefault: 5,
@@ -130,16 +136,28 @@ export const rateLimitsSchema = {
     envPrefix: 'STREMIO_META',
     label: 'Stremio meta',
   }),
-  easynewsNzb: rateLimit({
+  linkedAccountsApi: rateLimit({
     windowDefault: 60,
-    maxDefault: 15,
-    envPrefix: 'EASYNEWS_NZB',
-    label: 'Easynews NZB',
+    maxDefault: 20,
+    envPrefix: 'LINKED_ACCOUNTS_API',
+    label: 'linked accounts API',
+  }),
+  communityApi: rateLimit({
+    windowDefault: 60,
+    maxDefault: 60,
+    envPrefix: 'COMMUNITY_API',
+    label: 'community API',
   }),
   login: rateLimit({
     windowDefault: 300,
     maxDefault: 5,
     envPrefix: 'LOGIN',
     label: 'login',
+  }),
+  oidc: rateLimit({
+    windowDefault: 300,
+    maxDefault: 20,
+    envPrefix: 'OIDC',
+    label: 'SSO login',
   }),
 } as const satisfies RuntimeConfigSection;

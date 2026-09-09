@@ -1,4 +1,4 @@
-﻿import { Addon, Option, Stream, UserData } from '../db/index.js';
+import { Addon, Option, Stream, UserData } from '../db/index.js';
 import { Preset, baseOptions } from './preset.js';
 import {
   Env,
@@ -21,6 +21,7 @@ export class ProwlarrPreset extends BuiltinAddonPreset {
       constants.ALTMOUNT_SERVICE,
       constants.STREMIO_NNTP_SERVICE,
       constants.STREMTHRU_NEWZ_SERVICE,
+      constants.AIOSTREAMS_SERVICE,
     ];
     const options: Option[] = [
       ...(appConfig.builtins.prowlarr.url && appConfig.builtins.prowlarr.apiKey
@@ -213,7 +214,11 @@ export class ProwlarrPreset extends BuiltinAddonPreset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     if (!usableServices || usableServices.length === 0) {
       throw new Error(
         `${this.METADATA.NAME} requires at least one usable service, but none were found. Please enable at least one of the following services: ${this.METADATA.SUPPORTED_SERVICES.join(

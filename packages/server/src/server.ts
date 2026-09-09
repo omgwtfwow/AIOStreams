@@ -1,4 +1,11 @@
 ﻿import app from './app.js';
+import {
+  startMetricsHistory,
+  settleMetricsHistory,
+  stopMetricsHistory,
+} from './utils/system-metrics.js';
+import { startNfsShare, stopNfsShare } from './nfs.js';
+import { startFuseMount, stopFuseMount } from './fuse.js';
 
 import {
   Env,
@@ -14,17 +21,36 @@ import {
   SelAccess,
   AnimeDatabase,
   ConfigStartupError,
+  arrConfigured,
   ProwlarrAddon,
   TemplateManager,
-  maskSensitiveInfo,
-  constants,
+  CommunityService,
+  CommunityFederation,
   SeaDexDataset,
+  SceneMappingDataset,
+  IdMappingDataset,
   ensureConfigAccessKey,
+  warnLegacyAuthVarsIfNeeded,
+  warnMissingConfigPermission,
+  initialiseOidc,
   startAnalytics,
   stopAnalytics,
+  ConfigSessionRepository,
   TaskManager,
+  instanceId,
+  drainUsenetMetrics,
+  pruneUsenetMetrics,
+  runLibraryRecheck,
+  runUsenetArrQueueCleanup,
+  requeueInterruptedInspects,
+  flushAllDiskCaches,
+  ReleaseBlocklistRemoteService,
+  ReleaseBlocklistPublishService,
+  flushStreamSessions,
+  pruneStreamSessions,
+  recoverStreamSessions,
+  streamRegistry,
 } from '@aiostreams/core';
-import { randomBytes } from 'crypto';
 
 const logger = createLogger('server');
 
@@ -63,6 +89,24 @@ function registerPruneTask() {
   });
 }
 
+function registerConfigSessionTask() {
+  TaskManager.register({
+    id: 'prune-config-sessions',
+    label: 'Prune expired sign-in sessions',
+    description: 'Deletes remembered configuration sign-ins that have expired.',
+    category: 'users',
+    kind: 'scheduled',
+    intervalMs: 60 * 60 * 1000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'single',
+    run: async () => {
+      const n = await ConfigSessionRepository.prune();
+      return { ok: true, message: `pruned ${n} sessions` };
+    },
+  });
+}
+
 function registerCacheTasks() {
   TaskManager.register({
     id: 'clear-all-cache',
@@ -94,6 +138,150 @@ function registerCacheTasks() {
   });
 }
 
+// Retain usenet provider rollups for ~13 months so the "all time" / monthly
+// views have history without the table growing unbounded.
+const USENET_METRICS_RETENTION_DAYS = 400;
+
+function registerUsenetTasks() {
+  TaskManager.register({
+    id: 'usenet-metrics-drain',
+    label: 'Flush usenet provider metrics',
+    description:
+      'Drains the in-memory native usenet engine counters into the hourly ' +
+      'provider metrics table that powers the dashboard charts.',
+    category: 'usenet',
+    kind: 'scheduled',
+    intervalMs: 60_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'all',
+    run: async () => {
+      const n = await drainUsenetMetrics();
+      return { ok: true, message: `flushed ${n} provider deltas` };
+    },
+  });
+  TaskManager.register({
+    id: 'usenet-metrics-prune',
+    label: 'Prune old usenet metrics',
+    description:
+      'Deletes native usenet provider rollups older than the retention window.',
+    category: 'usenet',
+    kind: 'scheduled',
+    intervalMs: 24 * 60 * 60_000,
+    enabled: true,
+    destructive: true,
+    multiReplica: 'single',
+    run: async () => {
+      const n = await pruneUsenetMetrics(USENET_METRICS_RETENTION_DAYS);
+      return { ok: true, message: `pruned ${n} metric rows` };
+    },
+  });
+  TaskManager.register({
+    id: 'usenet-library-recheck',
+    label: 'Recheck usenet library',
+    description:
+      'Re-verifies library entries against your providers on a schedule keyed ' +
+      'to how old each post is, so a release taken down after it was added is ' +
+      'marked failed instead of staying playable on paper. Does nothing until ' +
+      'the recheck scope is turned on in the usenet settings.',
+    category: 'usenet',
+    kind: 'scheduled',
+    intervalMs: 5 * 60_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'single',
+    // Scope is read at run time, so switching it on takes effect immediately.
+    run: async (ctx) => runLibraryRecheck({ signal: ctx?.signal }),
+  });
+  TaskManager.register({
+    id: 'arr-queue-cleanup',
+    label: 'Clean up stuck Sonarr/Radarr imports',
+    description:
+      'Looks through the queues of your Sonarr/Radarr instances for downloads ' +
+      'AIOStreams handed over that they could not import, and acts on the ' +
+      'reason they gave: replace a bad release, push an import through, or ' +
+      'clear a stale entry. Does nothing until queue cleanup is turned on in ' +
+      'the Sonarr/Radarr settings.',
+    category: 'usenet',
+    kind: 'scheduled',
+    intervalMs: 5 * 60_000,
+    enabled: true,
+    destructive: true,
+    multiReplica: 'single',
+    run: async () => runUsenetArrQueueCleanup(),
+  });
+}
+
+function registerStreamTasks() {
+  TaskManager.register({
+    id: 'streams-flush',
+    label: 'Flush stream sessions',
+    description:
+      'Writes live stream sessions and their served bytes to the database, ' +
+      'ends sessions that have gone quiet, and applies bandwidth limits, ' +
+      'bans and stop requests raised on another instance.',
+    category: 'data-sync',
+    kind: 'scheduled',
+    intervalMs: 5_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'all',
+    run: async () => {
+      const { written, ended } = await flushStreamSessions();
+      return { ok: true, message: `wrote ${written} sessions, ended ${ended}` };
+    },
+  });
+  TaskManager.register({
+    id: 'streams-prune',
+    label: 'Prune stream history',
+    description:
+      'Deletes finished stream sessions past the retention window, expired ' +
+      'bans, and bandwidth rollups older than the retention window.',
+    category: 'data-sync',
+    kind: 'scheduled',
+    intervalMs: 24 * 60 * 60_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'single',
+    run: async () => {
+      const n = await pruneStreamSessions();
+      return { ok: true, message: `pruned ${n} rows` };
+    },
+  });
+}
+
+function registerReleaseBlocklistTasks() {
+  TaskManager.register({
+    id: 'release-blocklist-refresh',
+    label: 'Refresh remote blocklists',
+    description:
+      'Re-fetches subscribed remote release blocklists whose per-source ' +
+      'refresh interval has elapsed.',
+    category: 'data-sync',
+    kind: 'scheduled',
+    intervalMs: 15 * 60_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'single',
+    run: async () => ReleaseBlocklistRemoteService.refreshDue(),
+  });
+  TaskManager.register({
+    id: 'release-blocklist-publish',
+    label: 'Publish blocklist to remote targets',
+    description:
+      'Pushes the release blocklist to configured publish targets ' +
+      '(GitHub gists, repositories, HTTP endpoints) whose per-target ' +
+      'interval has elapsed. Unchanged lists are skipped.',
+    category: 'data-sync',
+    kind: 'scheduled',
+    intervalMs: 15 * 60_000,
+    enabled: true,
+    destructive: false,
+    multiReplica: 'single',
+    run: async () => ReleaseBlocklistPublishService.publishDue(),
+  });
+}
+
 async function initialiseRedis() {
   if (appConfig.bootstrap.redisUri) {
     await Cache.testRedisConnection();
@@ -114,6 +302,24 @@ async function initialiseSeaDexDataset() {
   } catch {}
 }
 
+async function initialiseSceneMappingDataset() {
+  if (!appConfig.metadata.sceneMappings.enabled) {
+    return;
+  }
+  try {
+    await SceneMappingDataset.getInstance().initialise();
+  } catch {}
+}
+
+async function initialiseIdMappingDataset() {
+  if (!appConfig.metadata.idMappings.enabled) {
+    return;
+  }
+  try {
+    await IdMappingDataset.getInstance().initialise();
+  } catch {}
+}
+
 async function initialiseProwlarr() {
   try {
     await ProwlarrAddon.fetchpreconfiguredIndexers();
@@ -125,6 +331,8 @@ async function initialiseProwlarr() {
 async function initialiseTemplates() {
   try {
     await TemplateManager.loadTemplates();
+    await CommunityService.registerTrustedOnBoot();
+    CommunityFederation.initialise();
   } catch (error) {
     logger.error('Failed to initialise templates:', error);
   }
@@ -132,36 +340,43 @@ async function initialiseTemplates() {
 
 async function initialiseAuth() {
   await ensureConfigAccessKey();
-  if (appConfig.nzbProxy.publicEnabled) {
-    appConfig.bootstrap.auth.set(
-      constants.PUBLIC_NZB_PROXY_USERNAME,
-      appConfig.bootstrap.auth.get(constants.PUBLIC_NZB_PROXY_USERNAME) ||
-        randomBytes(32).toString('hex')
-    );
-    logger.info('AIOStreams Public NZB Proxy is enabled.', {
-      username: constants.PUBLIC_NZB_PROXY_USERNAME,
-      password: maskSensitiveInfo(
-        appConfig.bootstrap.auth.get(constants.PUBLIC_NZB_PROXY_USERNAME) || ''
-      ),
-    });
-  }
+  warnLegacyAuthVarsIfNeeded();
+  warnMissingConfigPermission();
+  await initialiseOidc();
 }
 
 async function start() {
   try {
+    startMetricsHistory();
     await initialiseDatabase();
+    // Before anything registers a task: it is the identity runs are recorded
+    // under.
+    TaskManager.setInstanceId(instanceId());
     await initialiseTemplates();
     logStartupInfo();
     await initialiseRedis();
-    initialiseAnimeDatabase();
-    initialiseSeaDexDataset();
+    await initialiseAnimeDatabase();
+    await initialiseSeaDexDataset();
+    await initialiseSceneMappingDataset();
+    await initialiseIdMappingDataset();
     RegexAccess.initialise();
     SelAccess.initialise();
     await initialiseProwlarr();
     registerPruneTask();
+    registerConfigSessionTask();
     registerCacheTasks();
+    registerUsenetTasks();
+    registerStreamTasks();
+    registerReleaseBlocklistTasks();
+    // Otherwise sessions from the last run stay active forever.
+    await recoverStreamSessions().catch((error) =>
+      logger.warn('Failed to recover orphaned stream sessions:', error)
+    );
+    void requeueInterruptedInspects();
     await initialiseAuth();
     startAnalytics();
+    await startNfsShare();
+    await startFuseMount();
     const server = app.listen(appConfig.bootstrap.port, (error) => {
       if (error) {
         logger.error('Failed to start server:', error);
@@ -170,6 +385,7 @@ async function start() {
       logger.info(
         `Server running on port ${appConfig.bootstrap.port}: ${JSON.stringify(server.address())}`
       );
+      settleMetricsHistory();
     });
   } catch (error) {
     if (error instanceof ConfigStartupError) throw error;
@@ -180,12 +396,26 @@ async function start() {
 
 async function shutdown() {
   TaskManager.stopAll();
+  stopMetricsHistory();
+  await stopFuseMount().catch(() => undefined);
+  await stopNfsShare().catch(() => undefined);
+  // Write live sessions out so the next boot doesn't reclaim them as stale.
+  streamRegistry.closeAll('stale');
+  await flushStreamSessions().catch(() => undefined);
   await stopAnalytics().catch(() => undefined);
+  await flushAllDiskCaches().catch(() => undefined);
   await Cache.close();
   RegexAccess.cleanup();
   SelAccess.cleanup();
   await closeDb();
 }
+
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ err: reason }, 'unhandled promise rejection ');
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaught exception ');
+});
 
 process.on('SIGTERM', async () => {
   logger.info('SIGTERM received. Shutting down gracefully...');

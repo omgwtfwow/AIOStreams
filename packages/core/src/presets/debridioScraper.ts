@@ -10,7 +10,17 @@ import {
   debridioApiKeyOption,
 } from './debridio.js';
 
+class DebridioStreamParser extends StreamParser {
+  protected override get indexerRegex(): RegExp | undefined {
+    return undefined;
+  }
+}
+
 export class DebridioPreset extends Preset {
+  static override getParser(): typeof StreamParser {
+    return DebridioStreamParser;
+  }
+
   static override get METADATA() {
     const supportedServices: ServiceId[] = [
       constants.REALDEBRID_SERVICE,
@@ -97,7 +107,11 @@ export class DebridioPreset extends Preset {
       );
     }
 
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
 
     // if no services are usable, return a single addon with no services
     if (!usableServices || usableServices.length === 0) {

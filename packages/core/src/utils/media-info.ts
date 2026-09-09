@@ -2,11 +2,14 @@ import * as constants from './constants.js';
 import { normaliseLanguage, normaliseLangCode } from './languages.js';
 
 export interface ParsedMediaInfo {
+  /** Provenance tier; unset means unconfirmed. */
+  mediaInfoQuality?: 'probe' | 'indexer' | 'addon';
   languages?: string[];
   subtitles?: string[];
   audioTags?: string[];
   audioChannels?: string[];
   visualTags?: string[];
+  /** Duration in seconds */
   duration?: number;
   bitrate?: number;
   encode?: string;
@@ -100,7 +103,7 @@ function normaliseLanguageList(values: unknown[]): string[] {
   return out;
 }
 
-function normaliseAudioTag(
+export function normaliseAudioTag(
   codec: unknown,
   profile: unknown
 ): string | undefined {
@@ -111,7 +114,7 @@ function normaliseAudioTag(
   if (codecStr === 'eac3' || codecStr === 'ec-3') return 'DD+';
   if (codecStr === 'ac3' || codecStr === 'ac-3') return 'DD';
   if (codecStr === 'truehd') return 'TrueHD';
-  if (codecStr === 'dts') {
+  if (codecStr === 'dts' || codecStr === 'dca') {
     if (profileStr.includes('dts-hd ma')) return 'DTS-HD MA';
     if (profileStr.includes('dts-hd')) return 'DTS-HD';
     if (profileStr.includes('dts-es')) return 'DTS-ES';
@@ -119,7 +122,7 @@ function normaliseAudioTag(
   }
   if (codecStr === 'opus') return 'OPUS';
   if (codecStr === 'flac') return 'FLAC';
-  if (codecStr === 'aac') return 'AAC';
+  if (codecStr === 'aac' || codecStr === 'faad') return 'AAC';
 
   if (profileStr.includes('dolby digital plus')) return 'DD+';
   if (profileStr.includes('dolby digital')) return 'DD';
@@ -165,22 +168,30 @@ function normaliseVisualTags(video: MediaInfoVideo | undefined): string[] {
   return [...tags];
 }
 
-function normaliseEncode(
+export function normaliseEncode(
   video: MediaInfoVideo | undefined
 ): string | undefined {
   const codec =
     typeof video?.codec === 'string' ? video.codec.toLowerCase().trim() : '';
 
   if (codec === 'hevc' || codec === 'h265' || codec === 'x265') return 'HEVC';
-  if (codec === 'avc' || codec === 'h264' || codec === 'x264') return 'AVC';
+  if (
+    codec === 'avc' ||
+    codec === 'h264' ||
+    codec === 'x264' ||
+    codec === 'avc1'
+  ) {
+    return 'AVC';
+  }
   if (codec === 'av1') return 'AV1';
   if (codec === 'xvid') return 'XviD';
-  if (codec === 'divx') return 'DivX';
+  if (codec === 'divx' || codec === 'dx50') return 'DivX';
+  if (codec === 'vc1' || codec === 'vc-1' || codec === 'wvc1') return 'VC-1';
 
   return undefined;
 }
 
-function normaliseResolution(
+export function normaliseResolution(
   width: unknown,
   height: unknown
 ): string | undefined {
@@ -192,25 +203,19 @@ function normaliseResolution(
   if (!h && !w) return undefined;
 
   const heightLevels = [2160, 1440, 1080, 720, 576, 480, 360, 240, 144];
+  const widthThresholds = [3840, 2560, 1920, 1280, 1024, 854, 640, 426, 256];
 
-  if (h && w) {
-    const widthThresholds = [3840, 2560, 1920, 1280, 1024, 854, 640, 426, 256];
-    const idx = widthThresholds.reduce(
-      (bestIdx, wLevel, i) =>
-        Math.abs(wLevel - w) < Math.abs(widthThresholds[bestIdx] - w)
-          ? i
-          : bestIdx,
+  const closestIdx = (levels: number[], ref: number) =>
+    levels.reduce(
+      (bestIdx, level, i) =>
+        Math.abs(level - ref) < Math.abs(levels[bestIdx] - ref) ? i : bestIdx,
       0
     );
-    return `${heightLevels[idx]}p`;
-  }
 
-  // Single dimension (e.g. height extracted from a "Np" string): use height thresholds.
-  const ref = w ?? h!;
-  const closest = heightLevels.reduce((prev, curr) =>
-    Math.abs(curr - ref) < Math.abs(prev - ref) ? curr : prev
-  );
-  return `${closest}p`;
+  const fromH = h ? heightLevels[closestIdx(heightLevels, h)] : 0;
+  const fromW = w ? heightLevels[closestIdx(widthThresholds, w)] : 0;
+
+  return `${Math.max(fromH, fromW)}p`;
 }
 
 export function normaliseParsedMediaInfo(
@@ -262,7 +267,22 @@ export function normaliseParsedMediaInfo(
       : undefined;
   }
 
+  const hasAnyData =
+    languages.length > 0 ||
+    subtitles.length > 0 ||
+    audioTags.length > 0 ||
+    audioChannels.length > 0 ||
+    visualTags.length > 0 ||
+    !!encode ||
+    !!resolution ||
+    !!parsedMediaInfo?.duration ||
+    !!parsedMediaInfo?.bitrate ||
+    !!parsedMediaInfo?.hasChapters;
+
   const result: ParsedMediaInfo = {
+    ...(parsedMediaInfo.mediaInfoQuality && hasAnyData
+      ? { mediaInfoQuality: parsedMediaInfo.mediaInfoQuality }
+      : {}),
     ...(languages.length > 0 ? { languages } : {}),
     ...(subtitles.length > 0 ? { subtitles } : {}),
     ...(audioTags.length > 0 ? { audioTags } : {}),
@@ -319,7 +339,7 @@ export function parseMediaInfo(
     typeof info.format?.dur === 'number' &&
     Number.isFinite(info.format.dur) &&
     info.format.dur > 0
-      ? info.format.dur / 1_000_000
+      ? info.format.dur / 1_000_000_000
       : undefined;
 
   const bitrate =
@@ -330,6 +350,7 @@ export function parseMediaInfo(
       : undefined;
 
   const normalised = normaliseParsedMediaInfo({
+    mediaInfoQuality: 'probe',
     languages,
     subtitles,
     audioTags,
@@ -352,14 +373,12 @@ export function mergeParsedMediaInfo(
   if (!base && !preferred) return undefined;
 
   const merged = normaliseParsedMediaInfo({
-    languages: [...(base?.languages ?? []), ...(preferred?.languages ?? [])],
-    subtitles: [...(base?.subtitles ?? []), ...(preferred?.subtitles ?? [])],
-    audioTags: [...(base?.audioTags ?? []), ...(preferred?.audioTags ?? [])],
-    audioChannels: [
-      ...(base?.audioChannels ?? []),
-      ...(preferred?.audioChannels ?? []),
-    ],
-    visualTags: [...(base?.visualTags ?? []), ...(preferred?.visualTags ?? [])],
+    mediaInfoQuality: preferred?.mediaInfoQuality ?? base?.mediaInfoQuality,
+    languages: preferred?.languages ?? base?.languages,
+    subtitles: preferred?.subtitles ?? base?.subtitles,
+    audioTags: preferred?.audioTags ?? base?.audioTags,
+    audioChannels: preferred?.audioChannels ?? base?.audioChannels,
+    visualTags: preferred?.visualTags ?? base?.visualTags,
     encode: preferred?.encode ?? base?.encode,
     resolution: preferred?.resolution ?? base?.resolution,
     duration: preferred?.duration ?? base?.duration,

@@ -8,6 +8,8 @@
   DistributedLock,
   fromUrlSafeBase64,
   formatZodError,
+  getSimpleTextHash,
+  makeUrlLogSafe,
   Time,
 } from '../utils/index.js';
 import {
@@ -24,12 +26,15 @@ import {
   DebridFile,
   UsenetDebridService,
   DebridFailureCache,
+  convertStatusCodeToError,
 } from './base.js';
-import { ParsedResult, parseTorrentTitle } from '@viren070/parse-torrent-title';
+import { ParsedResult } from '@viren070/parse-torrent-title';
+import { parseTorrentTitleCached } from '../parser/title.js';
 import z, { ZodError } from 'zod';
 import { createClient, WebDAVClient, FileStat } from 'webdav';
 import { fetch } from 'undici';
 import { BuiltinProxy } from '../proxy/builtin.js';
+import { createProxy } from '../proxy/index.js';
 import { basename } from 'path';
 import type { Logger } from '../logging/logger.js';
 
@@ -89,29 +94,6 @@ const transformHistoryResponse = (
   error: data.error,
 });
 
-const convertStatusCodeToError = (code: number): DebridError['code'] => {
-  switch (code) {
-    case 400:
-      return 'BAD_REQUEST';
-    case 401:
-      return 'UNAUTHORIZED';
-    case 403:
-      return 'FORBIDDEN';
-    case 404:
-      return 'NOT_FOUND';
-    case 429:
-      return 'TOO_MANY_REQUESTS';
-    case 500:
-      return 'INTERNAL_SERVER_ERROR';
-    case 501:
-      return 'NOT_IMPLEMENTED';
-    case 503:
-      return 'SERVICE_UNAVAILABLE';
-    default:
-      return 'UNKNOWN';
-  }
-};
-
 /**
  * API client for SABnzbd APIs
  */
@@ -146,8 +128,16 @@ export class SABnzbdApi {
       url.searchParams.append(key, val);
     });
 
+    // `name` is the NZB URL for addUrl requests and can embed credentials in
+    // its path (query-param and apikey-field redaction happen in the logger).
     this.logger.debug(
-      { service: this.serviceName, ...params },
+      {
+        service: this.serviceName,
+        ...params,
+        ...(typeof params.name === 'string'
+          ? { name: makeUrlLogSafe(params.name) }
+          : {}),
+      },
       'making api request'
     );
 
@@ -378,7 +368,7 @@ export class SABnzbdApi {
           throw new DebridError(`NZB failed: ${failMessage}`, {
             statusCode: 400,
             statusText: 'Bad Request',
-            code: 'UNKNOWN',
+            code: 'DOWNLOAD_FAILED',
             headers: {},
             type: 'api_error',
           });
@@ -393,7 +383,7 @@ export class SABnzbdApi {
       {
         statusCode: 504,
         statusText: 'Gateway Timeout',
-        code: 'UNKNOWN',
+        code: 'TIMEOUT',
         headers: {},
         body: { nzoId, category },
         type: 'api_error',
@@ -425,6 +415,17 @@ enum Category {
 }
 
 const CATEGORIES_CACHE_TTL = Time.Hour;
+
+/**
+ * WebDAV `FileStat` paths are URL-decoded, so characters like `?` and `#`
+ * must be percent-encoded per segment before being placed in a URL.
+ */
+function encodeWebdavPath(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
 
 /**
  * Base class for streaming usenet services (NzbDAV, Altmount).
@@ -684,12 +685,18 @@ export abstract class UsenetStreamService implements UsenetDebridService {
     return directories;
   }
 
+  // Token hashed: library keys reach distributed-lock log lines and file
+  // lock paths.
+  private getLibraryCacheKey(): string {
+    return `${this.serviceName}:${getSimpleTextHash(this.config.token)}`;
+  }
+
   /**
    * Fetch the category folders under the content path prefix by listing the
    * base WebDAV directory.
    */
   private async getCategories(): Promise<string[]> {
-    const cacheKey = `${this.serviceName}:${this.config.token}:categories`;
+    const cacheKey = `${this.getLibraryCacheKey()}:categories`;
     const cached = await UsenetStreamService.categoriesCache.get(cacheKey);
     if (cached) return cached;
 
@@ -733,7 +740,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
   }
 
   public async listNzbs(): Promise<DebridDownload[]> {
-    const cacheKey = `${this.serviceName}:${this.config.token}`;
+    const cacheKey = this.getLibraryCacheKey();
 
     // Check for stale cache before acquiring the lock
     const cached = await UsenetStreamService.libraryCache.get(cacheKey);
@@ -891,7 +898,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
   public async refreshLibraryCache(
     sources?: ('torrent' | 'nzb')[]
   ): Promise<void> {
-    const cacheKey = `${this.serviceName}:${this.config.token}`;
+    const cacheKey = this.getLibraryCacheKey();
     await UsenetStreamService.libraryCache.delete(cacheKey);
     await this.fetchAndCacheNzbs(cacheKey);
   }
@@ -905,7 +912,11 @@ export abstract class UsenetStreamService implements UsenetDebridService {
       try {
         BuiltinProxy.validateAuth(this.auth.aiostreamsAuth);
       } catch (error) {
-        throw new DebridError('Invalid AIOStreams Proxy Auth', {
+        const message =
+          error instanceof Error
+            ? error.message
+            : 'Invalid AIOStreams Proxy Auth';
+        throw new DebridError(message, {
           statusCode: 401,
           statusText: 'Unauthorized',
           code: 'UNAUTHORIZED',
@@ -964,7 +975,57 @@ export abstract class UsenetStreamService implements UsenetDebridService {
         ttl: this.maxWaitTime + this.pollInterval + 10000,
       }
     );
-    return result;
+    // Proxy the resolved WebDAV URL through the builtin proxy when the service
+    // is configured with aiostreamsAuth.
+    if (!result || !this.auth.aiostreamsAuth) return result;
+    return this.proxyResolvedUrl(result, filename);
+  }
+
+  /**
+   * Wrap a resolved WebDAV stream URL in a builtin-proxy URL using the service's
+   * `aiostreamsAuth`, carrying the WebDAV Basic auth in the (encrypted) proxy
+   * payload. On any failure, falls back to serving the direct URL.
+   */
+  private async proxyResolvedUrl(
+    url: string,
+    filename: string
+  ): Promise<string> {
+    const aiostreamsAuth = this.auth.aiostreamsAuth;
+    if (!aiostreamsAuth) return url;
+    const basic =
+      this.auth.webdavUser && this.auth.webdavPassword
+        ? `Basic ${Buffer.from(
+            `${this.auth.webdavUser}:${this.auth.webdavPassword}`
+          ).toString('base64')}`
+        : undefined;
+    try {
+      const proxied = await createProxy({
+        id: 'builtin',
+        enabled: true,
+        credentials: aiostreamsAuth,
+      }).generateUrls([
+        {
+          url,
+          filename,
+          headers: basic ? { request: { Authorization: basic } } : undefined,
+        },
+      ]);
+      if (proxied && !('error' in proxied) && proxied[0]) {
+        return proxied[0];
+      }
+      this.serviceLogger.warn(
+        'failed to proxy resolved stream url; serving direct'
+      );
+      return url;
+    } catch (error) {
+      this.serviceLogger.warn(
+        {
+          err: error instanceof Error ? error.message : String(error),
+        },
+        'error proxying resolved stream url; serving direct'
+      );
+      return url;
+    }
   }
 
   protected async _resolve(
@@ -985,7 +1046,9 @@ export abstract class UsenetStreamService implements UsenetDebridService {
     const cachedResponse = await UsenetStreamService.resolveCache.get(cacheKey);
 
     if (cachedResponse) {
-      this.serviceLogger.debug(`Using cached stream URL for ${nzb}`);
+      this.serviceLogger.debug(
+        `Using cached stream URL for ${makeUrlLogSafe(nzb)}`
+      );
       return cachedResponse;
     }
 
@@ -1196,7 +1259,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
       // Parse all file names for matching
       const allStrings = [jobName, ...debridFiles.map((f) => f.name ?? '')];
       const parseResults: ParsedResult[] = allStrings.map((string) =>
-        parseTorrentTitle(string)
+        parseTorrentTitleCached(string)
       );
       const parsedFiles = new Map<string, ParsedResult>();
       for (const [index, result] of parseResults.entries()) {
@@ -1239,7 +1302,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
     });
 
     const filePath = selectedFile.path || `${contentPath}/${selectedFile.name}`;
-    const playbackLink = `${this.getPublicWebdavUrlWithAuth()}${filePath}`;
+    const playbackLink = `${this.getPublicWebdavUrlWithAuth()}${encodeWebdavPath(filePath)}`;
 
     this.serviceLogger.debug(`Generated playback link`, { playbackLink });
 
@@ -1330,7 +1393,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
       const title = playbackInfo.title ?? '';
       const allStrings = [title, ...debridFiles.map((f) => f.name ?? '')];
       const parseResults: ParsedResult[] = allStrings.map((string) =>
-        parseTorrentTitle(string)
+        parseTorrentTitleCached(string)
       );
       const parsedFiles = new Map<string, ParsedResult>();
       for (const [index, result] of parseResults.entries()) {
@@ -1381,7 +1444,7 @@ export abstract class UsenetStreamService implements UsenetDebridService {
     });
 
     const filePath = selectedFile.path || `${contentPath}/${selectedFile.name}`;
-    const playbackLink = `${this.getPublicWebdavUrlWithAuth()}${filePath}`;
+    const playbackLink = `${this.getPublicWebdavUrlWithAuth()}${encodeWebdavPath(filePath)}`;
 
     await UsenetStreamService.resolveCache.set(
       cacheKey,

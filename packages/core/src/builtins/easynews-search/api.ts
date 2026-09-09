@@ -11,19 +11,68 @@ import {
   createLogger,
   formatZodError,
   makeRequest,
-  NzbProxyManager,
   DistributedLock,
 } from '../../utils/index.js';
 import { config as appConfig } from '../../config/index.js';
 import { searchWithBackgroundRefresh } from '../utils/general.js';
 import { VIDEO_FILE_EXTENSIONS } from '../../debrid/utils.js';
 import { parseDuration } from '../../parser/utils.js';
-import { createQueryLimit } from '../utils/general.js';
 import bytes from 'bytes';
+import pLimit, { type LimitFunction } from 'p-limit';
 
 const logger = createLogger('easynews');
 
+export type EasynewsApiVersion = '2.0' | '3.0';
+
+/**
+ * Easynews serves at most two concurrent searches per account on the 2.0
+ * endpoint. The 3.0 endpoint is not limited, but it is fenced by the same counter: while two 2.0
+ * requests are in flight, a 3.0 request is stalled too, so any 2.0 use pins the
+ * whole account to the lower limit.
+ */
+const SEARCH_CONCURRENCY: Record<EasynewsApiVersion, number> = {
+  '2.0': 2,
+  '3.0': 10,
+};
+
+/**
+ * The cap follows the account rather than the IP, so one limiter per account
+ * covers every request made with those credentials, across queries, pages and
+ * background refreshes.
+ */
+interface AccountSearchLimit {
+  limit: LimitFunction;
+  versions: Set<EasynewsApiVersion>;
+}
+
+const searchLimits = new Map<string, AccountSearchLimit>();
+
+function getSearchLimit(
+  account: string,
+  apiVersion: EasynewsApiVersion
+): LimitFunction {
+  let entry = searchLimits.get(account);
+  if (!entry) {
+    entry = {
+      limit: pLimit(SEARCH_CONCURRENCY[apiVersion]),
+      versions: new Set(),
+    };
+    searchLimits.set(account, entry);
+  }
+  entry.versions.add(apiVersion);
+
+  const concurrency = entry.versions.has('2.0')
+    ? SEARCH_CONCURRENCY['2.0']
+    : SEARCH_CONCURRENCY['3.0'];
+  if (entry.limit.concurrency !== concurrency) {
+    entry.limit.concurrency = concurrency;
+  }
+  return entry.limit;
+}
+
 export const EASYNEWS_BASE = 'https://members.easynews.com';
+// Page size for the 2.0 API. The 3.0 API ignores page-size params entirely
+// and always returns 100 items per page.
 export const EASYNEWS_DEFAULT_PER_PAGE = 250;
 
 /**
@@ -50,6 +99,20 @@ export interface EasynewsSearchItem {
   posted?: string | number;
   /** Video duration in seconds */
   duration?: number;
+  /** Audio track language codes, e.g. ['eng','spa'] (from audio_tracks/alangs/alang) */
+  audioLangs?: string[];
+  /** Subtitle track language codes (from subtitle_tracks/slangs/slang) */
+  subLangs?: string[];
+  /** Raw audio codec reported by Easynews, e.g. 'EAC3','AC3','AAC','DCA' */
+  acodec?: string;
+  /** Raw video codec reported by Easynews, e.g. 'H264','HEVC','AVC1','XVID' */
+  vcodec?: string;
+  /** Horizontal resolution in pixels, e.g. 1920 */
+  xres?: number;
+  /** Vertical resolution in pixels, e.g. 1080 */
+  yres?: number;
+  /** Overall bitrate in bits/sec */
+  bps?: number;
 }
 
 /**
@@ -86,7 +149,7 @@ const EasynewsSearchResponseSchema = z.object({
   perPage: z.union([z.string(), z.number()]).optional(),
   thumbURL: z.string().optional(),
   thumbUrl: z.string().optional(),
-  dlFarm: z.string().optional(),
+  dlFarm: z.union([z.string(), z.number()]).optional(),
   dlPort: z.union([z.string(), z.number()]).optional(),
   downURL: z.string().optional(),
 });
@@ -156,12 +219,18 @@ export class EasynewsApiError extends Error {
 const MIN_DURATION_SECONDS = 60;
 
 /**
+ * Retries for an empty response body. Easynews only drops requests that are
+ * over its concurrency cap, so the limiter should keep this from triggering.
+ */
+const EMPTY_RESPONSE_RETRIES = 1;
+const EMPTY_RESPONSE_RETRY_DELAY = 500;
+
+/**
  * Easynews API client
  */
 export class EasynewsApi {
   private readonly auth: string;
   private readonly encodedAuth: string;
-  private readonly userKey: string;
   private readonly searchCache = Cache.getInstance<
     string,
     EasynewsSearchResult
@@ -170,8 +239,9 @@ export class EasynewsApi {
   private skipReasons = new Map<string, string[]>();
 
   constructor(
-    private readonly username: string,
-    private readonly password: string
+    username: string,
+    password: string,
+    private readonly apiVersion: EasynewsApiVersion = '3.0'
   ) {
     // HTTP Basic Auth header
     this.auth = Buffer.from(`${username}:${password}`).toString('base64');
@@ -181,15 +251,9 @@ export class EasynewsApi {
       JSON.stringify({ username, password })
     ).toString('base64url');
 
-    // User key for rate limiting (hashed to avoid storing PII)
-    this.userKey = NzbProxyManager.getUserKey(username);
-  }
-
-  /**
-   * Get the user key for rate limiting
-   */
-  getUserKey(): string {
-    return this.userKey;
+    // Registered up front so a 2.0 client pins the account's cap even while it
+    // is idle and only a 3.0 client is searching.
+    getSearchLimit(this.auth, this.apiVersion);
   }
 
   /**
@@ -202,6 +266,7 @@ export class EasynewsApi {
 
     const reasonLabels: Record<string, string> = {
       invalid: 'Invalid (missing hash/ext)',
+      password: 'Password-protected',
       extension: 'Non-video extension',
       duration: 'Too short duration',
       sample: 'Sample file detected',
@@ -233,7 +298,10 @@ export class EasynewsApi {
    * Returns results along with download server info
    */
   async search(options: EasynewsSearchOptions): Promise<EasynewsSearchResult> {
-    const cacheKey = JSON.stringify(options);
+    const cacheKey = JSON.stringify({
+      ...options,
+      apiVersion: this.apiVersion,
+    });
 
     return searchWithBackgroundRefresh({
       searchCache: this.searchCache,
@@ -291,14 +359,13 @@ export class EasynewsApi {
     }
 
     // Fetch remaining pages concurrently
-    const queryLimit = createQueryLimit();
     const remainingPages = Array.from(
       { length: pagesToFetch - 1 },
       (_, i) => i + 2
     );
 
     const pagePromises = remainingPages.map((page) =>
-      queryLimit(() => this.performSearch({ ...options, page, perPage }))
+      this.performSearch({ ...options, page, perPage })
     );
 
     const settledResults = await Promise.allSettled(pagePromises);
@@ -349,28 +416,43 @@ export class EasynewsApi {
     const { query, page = 1, perPage = EASYNEWS_DEFAULT_PER_PAGE } = options;
 
     const params = new URLSearchParams({
-      fly: '2',
-      sb: '1', // search backend
-      pno: page.toString(),
-      pby: perPage.toString(),
-      u: '1', // remove duplicates
-      chxu: '1', //
-      chxgx: '1', // group exclusions
-      st: 'basic', // search type (basic or adv)
-      gps: query,
-      vv: '1', // video hover/preview data
+      gps: query, // keyword query
+      pno: page.toString(), // page number
+      u: '1', // server-side dedupe of identical posts (webapp always sends it)
       safeO: '0', // safe search off
-      s1: 'relevance',
-      s1d: '-',
+      s1: 'relevance', // primary sort (server appends s2=nrfile, s3=dsize)
+      s1d: '-', // descending
       'fty[]': 'VIDEO', // file type filter
     });
+    if (this.apiVersion === '3.0') {
+      // The 3.0 API ignores all page-size params (pby/dni are no-ops): pages
+      // are fixed at 100 items and numPages reflects that.
+    } else {
+      params.set('pby', perPage.toString()); // page size
+      // fly=2 selects the JSON response format, sb=1 marks a
+      // search-button submission, st=basic is the plain keyword search mode,
+      // chxu/chxgx are legacy checkbox states, vv adds video preview data.
+      params.set('fly', '2');
+      params.set('sb', '1');
+      params.set('st', 'basic');
+      params.set('chxu', '1');
+      params.set('chxgx', '1');
+      params.set('vv', '1');
+    }
 
-    const url = `${EASYNEWS_BASE}/2.0/search/solr-search/?${params.toString()}`;
+    const url =
+      this.apiVersion === '3.0'
+        ? `${EASYNEWS_BASE}/3.0/api/search?${params.toString()}`
+        : `${EASYNEWS_BASE}/2.0/search/solr-search/?${params.toString()}`;
     const lockKey = `easynews-search:${url}`;
 
     const { result } = await DistributedLock.getInstance().withLock(
       lockKey,
-      () => this._performSearch(query, page, perPage, url),
+      () =>
+        getSearchLimit(
+          this.auth,
+          this.apiVersion
+        )(() => this._performSearch(query, page, perPage, url)),
       {
         timeout: appConfig.builtins.easynews.searchTimeout,
         ttl: appConfig.builtins.easynews.searchTimeout + 1000,
@@ -387,6 +469,30 @@ export class EasynewsApi {
   ): Promise<ParsedSearchResponse> {
     logger.debug(`Searching Easynews page ${page} for: ${query}`);
 
+    for (let attempt = 1; ; attempt++) {
+      const result = await this._searchOnce(url);
+      if (result) {
+        return result;
+      }
+      if (attempt > EMPTY_RESPONSE_RETRIES) {
+        throw new EasynewsApiError('Easynews returned an empty response');
+      }
+      logger.warn('Easynews returned an empty response, retrying', {
+        query,
+        page,
+        attempt,
+      });
+      await new Promise((resolve) =>
+        setTimeout(resolve, EMPTY_RESPONSE_RETRY_DELAY)
+      );
+    }
+  }
+
+  /**
+   * A single search request. Resolves to null when Easynews answers with an
+   * empty body.
+   */
+  private async _searchOnce(url: string): Promise<ParsedSearchResponse | null> {
     try {
       const response = await makeRequest(url, {
         method: 'GET',
@@ -417,11 +523,14 @@ export class EasynewsApi {
 
       let json;
       const raw = await response.text();
+      if (raw.length === 0) {
+        return null;
+      }
       try {
         json = JSON.parse(raw);
       } catch (error) {
         throw new EasynewsApiError(
-          `Invalid JSON response from API${raw.length > 0 ? ': ' + (raw.length > 50 ? raw.slice(0, 50) + '...' : raw) : ''}`
+          `Invalid JSON response from API: ${raw.length > 50 ? raw.slice(0, 50) + '...' : raw}`
         );
       }
       const parsed = EasynewsSearchResponseSchema.safeParse(json);
@@ -465,8 +574,8 @@ export class EasynewsApi {
       numPages: response.numPages,
       currentPage: response.page ?? 1,
       downloadInfo: {
-        dlFarm: response.dlFarm ?? '',
-        dlPort: String(response.dlPort ?? ''),
+        dlFarm: String(response.dlFarm ?? 'auto'),
+        dlPort: String(response.dlPort ?? 'auto'),
         downURL: response.downURL ?? `${EASYNEWS_BASE}/dl`,
       },
     };
@@ -487,6 +596,13 @@ export class EasynewsApi {
     let sig: string | null = null;
     let displayFn: string | null = null;
     let durationRaw: number | string | null = null;
+    let audioLangs: string[] = [];
+    let subLangs: string[] = [];
+    let acodec: string | undefined;
+    let vcodec: string | undefined;
+    let xres: number | undefined;
+    let yres: number | undefined;
+    let bps: number | undefined;
 
     const parseSize = (size: unknown): number | undefined => {
       if (typeof size === 'number') return size;
@@ -495,6 +611,31 @@ export class EasynewsApi {
       }
       return undefined;
     };
+
+    const toLangArray = (v: unknown): string[] => {
+      if (Array.isArray(v)) {
+        return v.filter((x): x is string => typeof x === 'string');
+      }
+      if (typeof v === 'string') {
+        return v
+          .split(',')
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+      return [];
+    };
+    const numOrUndef = (v: unknown): number | undefined => {
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+      if (
+        typeof v === 'string' &&
+        v.trim() !== '' &&
+        Number.isFinite(Number(v))
+      )
+        return Number(v);
+      return undefined;
+    };
+    const strOrUndef = (v: unknown): string | undefined =>
+      typeof v === 'string' && v.trim() !== '' ? v : undefined;
 
     if (Array.isArray(raw)) {
       if (raw.length >= 12) {
@@ -511,7 +652,9 @@ export class EasynewsApi {
       const obj = raw as Record<string, unknown>;
       // hash field contains the full hash, "0" also has it.
       hash = String(obj['hash'] ?? obj['0'] ?? obj['id'] ?? '');
-      id = String(obj['id']);
+      // 4-char suffix appended to the hash in direct download URLs; guard
+      // against a missing value becoming the literal string "undefined".
+      id = obj['id'] != null ? String(obj['id']) : null;
       subject = String(obj['subject'] ?? obj['6'] ?? '');
       // fn = 10
       filenameNoExt = String(obj['fn'] ?? obj['10'] ?? '');
@@ -536,6 +679,28 @@ export class EasynewsApi {
         | number
         | string
         | null;
+      const firstNonEmpty = (...vals: unknown[]): string[] => {
+        for (const v of vals) {
+          const arr = toLangArray(v);
+          if (arr.length) return arr;
+        }
+        return [];
+      };
+      audioLangs = firstNonEmpty(
+        obj['audio_tracks'],
+        obj['alangs'],
+        obj['alang']
+      );
+      subLangs = firstNonEmpty(
+        obj['subtitle_tracks'],
+        obj['slangs'],
+        obj['slang']
+      );
+      acodec = strOrUndef(obj['acodec']);
+      vcodec = strOrUndef(obj['vcodec']);
+      xres = numOrUndef(obj['xres']);
+      yres = numOrUndef(obj['yres']);
+      bps = numOrUndef(obj['bps']);
     }
 
     if (!hash || !ext) {
@@ -609,6 +774,13 @@ export class EasynewsApi {
       poster: poster || undefined,
       posted: postedRaw ?? undefined,
       duration,
+      audioLangs: audioLangs.length ? audioLangs : undefined,
+      subLangs: subLangs.length ? subLangs : undefined,
+      acodec,
+      vcodec,
+      xres,
+      yres,
+      bps,
     };
   }
 
@@ -730,6 +902,12 @@ export class EasynewsApi {
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
+
+    if (!buffer.includes('<segment')) {
+      throw new EasynewsApiError(
+        'Easynews returned an empty NZB (no segments)'
+      );
+    }
 
     return { content: buffer, filename };
   }

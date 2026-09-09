@@ -1,6 +1,7 @@
 import React from 'react';
 import { BiLockAlt, BiTrash } from 'react-icons/bi';
 import { useFormContext } from 'react-hook-form';
+import { Alert } from '@/components/ui/alert';
 import { Field } from '@/components/ui/form';
 import { BasicField } from '@/components/ui/basic-field';
 import { PasswordInput } from '@/components/ui/password-input';
@@ -16,6 +17,7 @@ import {
   DurationField,
   SizeField,
   SECRET_CLEAR_SENTINEL,
+  md,
 } from './custom-fields';
 
 export { SECRET_CLEAR_SENTINEL };
@@ -43,15 +45,16 @@ function SecretTextField({
   return (
     <BasicField
       label={label}
-      help={
+      help={md(
         isClearing
           ? `${help ? help + ' · ' : ''}Will be cleared on save.`
           : help
-      }
+      )}
     >
       <div className="flex items-center gap-2">
         <div className="flex-1">
           <PasswordInput
+            autoComplete="new-password"
             value={isClearing ? '' : (value ?? '')}
             placeholder={
               isClearing
@@ -100,8 +103,26 @@ function LockBadge({ env }: { env: string }) {
  * Renders one config key into the appropriate Field.* based on the
  * server-provided UI hint + metadata. Env-overridden fields are read-only
  * with a lock badge (the effective value is shown, not hidden).
+ *
+ * Deprecated fields are only served while an override is active; they render
+ * with a warning carrying the migration guidance.
  */
 export function SettingsField({ k }: { k: SettingsKey }) {
+  const control = <SettingsFieldControl k={k} />;
+  if (k.deprecated === undefined) return control;
+  return (
+    <div className="space-y-2">
+      <Alert
+        intent="warning-basic"
+        title="Deprecated"
+        description={md(k.deprecated)}
+      />
+      {control}
+    </div>
+  );
+}
+
+function SettingsFieldControl({ k }: { k: SettingsKey }) {
   const name = toName(k.key);
   const envLocked = k.source === 'environment';
   const disabled = envLocked;
@@ -149,7 +170,7 @@ export function SettingsField({ k }: { k: SettingsKey }) {
         <Field.Switch
           name={name}
           label={labelNode as unknown as string}
-          help={help}
+          help={md(help)}
           side="right"
           disabled={disabled}
         />
@@ -159,9 +180,11 @@ export function SettingsField({ k }: { k: SettingsKey }) {
         <Field.Number
           name={name}
           label={labelNode as unknown as string}
-          help={help}
+          help={md(help)}
           disabled={disabled}
           min={k.ui.min}
+          max={k.ui.max}
+          step={k.ui.step}
         />
       );
     case 'enum':
@@ -169,7 +192,7 @@ export function SettingsField({ k }: { k: SettingsKey }) {
         <Field.Select
           name={name}
           label={labelNode as unknown as string}
-          help={help}
+          help={md(help)}
           disabled={disabled}
           options={(k.ui.options ?? []).map((o) => ({ label: o, value: o }))}
         />
@@ -247,7 +270,7 @@ export function SettingsField({ k }: { k: SettingsKey }) {
         <Field.Text
           name={name}
           label={labelNode as unknown as string}
-          help={help}
+          help={md(help)}
           disabled={disabled}
         />
       );

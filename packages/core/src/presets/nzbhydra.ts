@@ -1,4 +1,4 @@
-﻿import { NewznabPreset } from './newznab.js';
+import { NewznabPreset } from './newznab.js';
 import { constants, ServiceId } from '../utils/index.js';
 import { Option, UserData } from '../db/index.js';
 import { appConfig } from '../utils/index.js';
@@ -12,6 +12,7 @@ export class NZBHydraPreset extends NewznabPreset {
       constants.ALTMOUNT_SERVICE,
       constants.STREMIO_NNTP_SERVICE,
       constants.STREMTHRU_NEWZ_SERVICE,
+      constants.AIOSTREAMS_SERVICE,
     ] as ServiceId[];
     const options: Option[] = [
       {
@@ -78,29 +79,42 @@ export class NZBHydraPreset extends NewznabPreset {
           ]
         : []),
       {
-        id: 'nzbhydraUrl',
-        name: 'NZBHydra URL',
-        description: 'Provide the URL to the NZBHydra endpoint ',
-        type: 'url',
+        id: 'api',
+        name: 'NZBHydra Endpoint',
+        description: '',
+        type: 'nab-endpoint',
+        nab: { namespace: 'newznab', preset: 'nzbhydra' },
         required:
           !appConfig.builtins.nzbhydra.url ||
           !appConfig.builtins.nzbhydra.apiKey,
-      },
-      {
-        id: 'nzbhydraApiKey',
-        name: 'API Key',
-        description:
-          'The password for the NZBHydra API. This is used to authenticate with the NZBHydra endpoint.',
-        type: 'password',
-        required:
-          !appConfig.builtins.nzbhydra.url ||
-          !appConfig.builtins.nzbhydra.apiKey,
+        subOptions: [
+          {
+            id: 'url',
+            name: 'NZBHydra URL',
+            description:
+              'The base URL of your NZBHydra instance, e.g. `http://localhost:5076`.',
+            type: 'url',
+            required:
+              !appConfig.builtins.nzbhydra.url ||
+              !appConfig.builtins.nzbhydra.apiKey,
+          },
+          {
+            id: 'apiKey',
+            name: 'API Key',
+            description:
+              'The password for the NZBHydra API. This is used to authenticate with the NZBHydra endpoint.',
+            type: 'password',
+            required:
+              !appConfig.builtins.nzbhydra.url ||
+              !appConfig.builtins.nzbhydra.apiKey,
+          },
+        ],
       },
       {
         id: 'searchMode',
         name: 'Search Mode',
         description:
-          'The search mode to use when querying the Torznab endpoint. **Note**: `Both` will result in two addons being created, one for each search mode.',
+          '`Auto` searches by ID (TVDB/IMDb/TMDB + season/episode) when the indexer supports it; `Forced Query` always searches by title text instead. **Note**: `Both` creates two separate addons, one per mode.',
         type: 'select',
         required: false,
         showInSimpleMode: false,
@@ -169,9 +183,9 @@ export class NZBHydraPreset extends NewznabPreset {
     let nzbhydraUrl = undefined;
     let nzbhydraApiKey = undefined;
 
-    if (options.nzbhydraUrl || options.nzbhydraApiKey) {
-      nzbhydraUrl = options.nzbhydraUrl;
-      nzbhydraApiKey = options.nzbhydraApiKey;
+    if (options.api?.url || options.api?.apiKey) {
+      nzbhydraUrl = options.api.url;
+      nzbhydraApiKey = options.api.apiKey;
     } else {
       nzbhydraUrl = appConfig.builtins.nzbhydra.url;
       nzbhydraApiKey = appConfig.builtins.nzbhydra.apiKey;
@@ -184,7 +198,8 @@ export class NZBHydraPreset extends NewznabPreset {
     const config = {
       ...this.getBaseConfig(userData, services),
       url: nzbhydraUrl,
-      apiPath: options.apiPath,
+      // always a base url, since NZBHydra only ever serves its api at /api
+      apiPath: '/api',
       apiKey: nzbhydraApiKey,
       forceQuerySearch: options.forceQuerySearch ?? true,
       forceInitialLimit: options.initialLimit ?? 250,
