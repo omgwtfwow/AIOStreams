@@ -10,8 +10,8 @@ import { cn, defineStyleAnatomy } from '../core/styling';
 export const TooltipAnatomy = defineStyleAnatomy({
   root: cva([
     'UI-Tooltip__root',
-    'z-50 overflow-hidden rounded-[--radius] px-3 py-1.5 text-sm shadow-md animate-in fade-in-50',
-    'bg-gray-800 text-white',
+    'z-50 overflow-hidden rounded-xl px-3 py-1.5 text-sm shadow-md animate-in fade-in-50',
+    'bg-gray-900 border text-white',
     'data-[side=bottom]:slide-in-from-top-1 data-[side=left]:slide-in-from-right-1',
     'data-[side=right]:slide-in-from-left-1 data-[side=top]:slide-in-from-bottom-1',
   ]),
@@ -57,13 +57,19 @@ export const Tooltip = React.forwardRef<HTMLDivElement, TooltipProps>(
           onOpenChange={onOpenChange}
         >
           <TooltipPrimitive.Trigger asChild>{trigger}</TooltipPrimitive.Trigger>
-          <TooltipPrimitive.Content
-            ref={ref}
-            className={cn(TooltipAnatomy.root(), className)}
-            {...rest}
-          >
-            {children}
-          </TooltipPrimitive.Content>
+          {/* Portal the content to <body> so an opened tooltip never becomes an
+              in-flow sibling of its trigger — without this, tapping a clamped
+              title on touch devices mounts the full-width text inside the flex
+              row and stretches the card, hiding trailing action buttons. */}
+          <TooltipPrimitive.Portal>
+            <TooltipPrimitive.Content
+              ref={ref}
+              className={cn(TooltipAnatomy.root(), className)}
+              {...rest}
+            >
+              {children}
+            </TooltipPrimitive.Content>
+          </TooltipPrimitive.Portal>
         </TooltipPrimitive.Root>
       </TooltipProvider>
     );

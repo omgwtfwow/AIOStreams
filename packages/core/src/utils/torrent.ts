@@ -5,9 +5,8 @@ import {
   extractTrackersFromMagnet,
 } from '../builtins/utils/debrid.js';
 import { createLogger } from '../logging/logger.js';
-import { Cache } from './cache.js';
-// import { makeRequest } from './http.js';
-import { fetch } from 'undici';
+import { GrabCache } from './grab-cache.js';
+import { makeRequest, makeUrlLogSafe } from './http.js';
 import parseTorrent, { Instance } from 'parse-torrent';
 import { config as appConfig } from '../config/index.js';
 import { getTimeTakenSincePoint } from './index.js';
@@ -22,18 +21,33 @@ interface TorrentMetadata {
   private?: boolean;
 }
 
-export class TorrentClient {
-  static readonly #metadataCache = Cache.getInstance<string, TorrentMetadata>(
-    'torrent-metadata',
-    undefined,
-    appConfig.bootstrap.redisUri ? 'redis' : 'sql'
-  );
-
-  // Track in-progress fetches to avoid duplicate requests
-  static readonly #inProgressFetches = new Map<
-    string,
-    Promise<TorrentMetadata | undefined>
-  >();
+/**
+ * Grabs torrent metadata (info hash + file list) from a download URL, on the
+ * shared {@link GrabCache} primitive — the torrent counterpart of the NZB
+ * grabbing in {@link DownloadManager}. Both single-flight + disk-cache by URL;
+ * the difference is that torrents are parsed at grab time here (magnet-redirect
+ * handling, `parse-torrent`), whereas NZB bodies are parsed later by the usenet
+ * engine. This module stays out of the `utils` barrel because that torrent
+ * parsing pulls in `debrid`/`builtins` helpers.
+ */
+export class TorrentGrabber {
+  // Grabbed-torrent metadata cache (shares the `<data>/cache` root + dashboard
+  // cache page with the NZB grabber). Built lazily so class-init doesn't read config.
+  static #cacheImpl: GrabCache<TorrentMetadata> | null = null;
+  static get #cache(): GrabCache<TorrentMetadata> {
+    if (!this.#cacheImpl) {
+      const g = appConfig.builtins.grab;
+      this.#cacheImpl = new GrabCache<TorrentMetadata>({
+        name: 'grab-torrent',
+        maxMemBytes: g.torrentCacheBytes,
+        maxDiskBytes: g.torrentDiskCacheBytes,
+        serialize: (v) => Buffer.from(JSON.stringify(v), 'utf8'),
+        deserialize: (b) => JSON.parse(b.toString('utf8')) as TorrentMetadata,
+        sizeOf: (v) => Buffer.byteLength(JSON.stringify(v), 'utf8'),
+      });
+    }
+    return this.#cacheImpl;
+  }
 
   // Limit concurrent requests. Constructed lazily on first use so the
   // module-load class-init doesn't read runtime config.
@@ -67,52 +81,39 @@ export class TorrentClient {
       return undefined;
     }
 
-    // Try to get from cache if we have a download URL
+    const cache = this.#cache;
+    const url = torrent.downloadUrl;
+    const key =
+      torrent.guid && torrent.indexer
+        ? `${torrent.indexer}:${torrent.guid}`
+        : url;
+    const lazy = appConfig.builtins.getTorrent.lazily;
 
-    const cachedMetadata = await this.#metadataCache.get(torrent.downloadUrl);
-    if (cachedMetadata) {
-      return cachedMetadata;
-    }
+    // Cache hit — done.
+    const cached = await cache.cached(key);
+    if (cached) return cached;
 
-    // Check if there's already a fetch in progress for this URL
-    const inProgressFetch = this.#inProgressFetches.get(torrent.downloadUrl);
-    if (inProgressFetch) {
-      if (appConfig.builtins.getTorrent.lazily) {
-        return undefined;
-      }
-      return inProgressFetch;
-    }
+    // Already fetching this URL: lazy callers bail, eager callers join.
+    const inFlight = cache.inFlight(key);
+    if (inFlight) return lazy ? undefined : inFlight.catch(() => undefined);
 
-    const fetchTask = async () => {
-      try {
-        const metadata = await this.#fetchMetadata(torrent);
-        // On success, clean up the in-progress fetch.
-        return metadata;
-      } catch (error: any) {
-        // On failure, log the error and clean up.
-        logger.warn(
-          `Failed to fetch metadata for ${torrent.downloadUrl}: ${error.message}`
-        );
-        return undefined;
-      } finally {
-        this.#inProgressFetches.delete(torrent.downloadUrl!);
-      }
-    };
+    // Kick off a single-flighted, concurrency-limited grab+parse.
+    const fetchPromise = cache.fetch(key, () =>
+      this.#fetchLimit(() => this.#fetchMetadata(torrent))
+    );
 
-    // Create a new fetch promise with concurrency limit
-    const fetchPromise = this.#fetchLimit(fetchTask);
-    this.#inProgressFetches.set(torrent.downloadUrl!, fetchPromise);
-
-    if (appConfig.builtins.getTorrent.lazily) {
-      // Queue the fetch but don't wait for it
+    if (lazy) {
+      // Queue the fetch but don't wait for it.
       fetchPromise.catch(() => {});
       return undefined;
     }
 
-    // Wait for the fetch if not lazy loading
     try {
       return await fetchPromise;
-    } catch (error) {
+    } catch (error: any) {
+      logger.warn(
+        `Failed to fetch metadata for ${makeUrlLogSafe(url)}: ${error.message}`
+      );
       if (torrent.hash) {
         // If we have a hash but metadata fetch failed, return basic info
         return {
@@ -137,9 +138,12 @@ export class TorrentClient {
       : appConfig.builtins.getTorrent.timeout;
     const start = Date.now();
 
-    const response = await fetch(downloadUrl, {
-      signal: AbortSignal.timeout(timeout),
-      redirect: 'manual',
+    const response = await makeRequest(downloadUrl, {
+      timeout,
+      // User-agent comes from a `[torrent_grabs]` (or per-host) entry in
+      // REQUEST_HEADER_OVERRIDES, applied inside makeRequest.
+      context: 'torrent_grabs',
+      rawOptions: { redirect: 'manual' },
     });
 
     let metadata: TorrentMetadata;
@@ -153,17 +157,17 @@ export class TorrentClient {
       );
       if (!hash) {
         if (redirectCount >= 3) {
-          throw new Error(`Too many redirects: ${redirectUrl}`);
+          throw new Error(`Too many redirects: ${makeUrlLogSafe(redirectUrl)}`);
         }
         logger.debug(
-          `Invalid magnet URL in redirect: ${redirectUrl}, retrying...`
+          `Invalid magnet URL in redirect: ${makeUrlLogSafe(redirectUrl)}, retrying...`
         );
         return this.#fetchMetadata(torrent, redirectCount + 1);
       }
 
       const sources = extractTrackersFromMagnet(redirectUrl);
       logger.debug(
-        `Got info for ${downloadUrl} from magnet redirect in ${getTimeTakenSincePoint(start)}`,
+        `Got info for ${makeUrlLogSafe(downloadUrl)} from magnet redirect in ${getTimeTakenSincePoint(start)}`,
         {
           hash,
         }
@@ -189,7 +193,7 @@ export class TorrentClient {
       }
 
       logger.debug(
-        `Got info for ${downloadUrl} from downloaded torrent in ${getTimeTakenSincePoint(start)}`,
+        `Got info for ${makeUrlLogSafe(downloadUrl)} from downloaded torrent in ${getTimeTakenSincePoint(start)}`,
         {
           hash: parsedTorrent.infoHash,
         }
@@ -212,11 +216,7 @@ export class TorrentClient {
       );
     }
 
-    await this.#metadataCache.set(
-      downloadUrl,
-      metadata,
-      appConfig.builtins.torrent.metadataCacheTtl
-    );
+    // Caching is handled by the GrabCache wrapper on success.
     return metadata;
   }
 }

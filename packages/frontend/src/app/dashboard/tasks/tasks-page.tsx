@@ -12,6 +12,16 @@ import {
 } from '@/components/shared/confirmation-dialog';
 import { DashboardQueryBoundary } from '@/components/shared/dashboard-query-boundary';
 import { api } from '@/lib/api';
+import { formatDuration } from '@/lib/format';
+
+interface TaskRunState {
+  instanceId: string;
+  self: boolean;
+  lastRunAt: number | null;
+  lastDurationMs: number | null;
+  lastStatus: 'ok' | 'error' | 'skipped' | null;
+  lastError: string | null;
+}
 
 interface TaskState {
   id: string;
@@ -29,40 +39,8 @@ interface TaskState {
   lastStatus: 'ok' | 'error' | 'skipped' | null;
   lastError: string | null;
   nextRunAt: number | null;
-}
-
-/**
- * Format a duration (in seconds) using two adjacent units at most (`2h 14m`,
- * `3d 4h`, `2w 1d`). Returns a single short token for sub-minute values so
- * lists stay aligned. Negative values are formatted unsigned — callers prepend
- * "in " or append " ago" as needed.
- */
-export function formatDuration(seconds: number): string {
-  const s = Math.max(0, Math.round(seconds));
-  if (s < 1) return '0s';
-  if (s < 60) return `${s}s`;
-  const units: Array<[string, number]> = [
-    ['w', 604800],
-    ['d', 86400],
-    ['h', 3600],
-    ['m', 60],
-    ['s', 1],
-  ];
-  // Find the first unit with a non-zero count, emit it + the next unit.
-  for (let i = 0; i < units.length; i++) {
-    const [u, secs] = units[i];
-    const n = Math.floor(s / secs);
-    if (n > 0) {
-      const rem = s - n * secs;
-      const next = units[i + 1];
-      if (next && rem > 0) {
-        const m = Math.floor(rem / next[1]);
-        if (m > 0) return `${n}${u} ${m}${next[0]}`;
-      }
-      return `${n}${u}`;
-    }
-  }
-  return `${s}s`;
+  runs: TaskRunState[];
+  claimedBy: string | null;
 }
 
 function humanInterval(ms?: number): string {
@@ -77,11 +55,22 @@ const rel = (ms: number | null) => {
   return `${formatDuration(diff)} ago`;
 };
 
+/** Replica ids are UUIDs; the leading block is enough to tell them apart. */
+const shortId = (id: string) => id.slice(0, 8);
+
+const took = (ms: number | null) =>
+  ms == null
+    ? ''
+    : formatDuration(ms / 1000) === '0s'
+      ? `${ms}ms`
+      : formatDuration(ms / 1000);
+
 export function TasksPage() {
   const qc = useQueryClient();
   const query = useQuery({
     queryKey: ['dashboard', 'tasks'],
-    queryFn: () => api<{ tasks: TaskState[] }>('/dashboard/tasks'),
+    queryFn: () =>
+      api<{ tasks: TaskState[]; instanceId: string }>('/dashboard/tasks'),
     refetchInterval: 5000,
   });
 
@@ -136,7 +125,7 @@ export function TasksPage() {
                           <div className="flex items-center gap-2 flex-wrap">
                             <span className="font-medium">{t.label}</span>
                             {t.destructive && (
-                              <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-red-500/10 text-red-500 border border-red-500/20">
+                              <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-400/20">
                                 destructive
                               </span>
                             )}
@@ -150,6 +139,11 @@ export function TasksPage() {
                             >
                               {t.enabled ? 'enabled' : 'disabled'}
                             </span>
+                            {t.claimedBy && (
+                              <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-400 border border-blue-400/20">
+                                running on {shortId(t.claimedBy)}
+                              </span>
+                            )}
                           </div>
                           <p className="text-xs text-[--muted] mt-0.5">
                             {t.description}
@@ -163,13 +157,13 @@ export function TasksPage() {
                           <span>Last run</span>
                           <span
                             className={cn(
-                              t.lastStatus === 'error' && 'text-red-500',
+                              t.lastStatus === 'error' && 'text-red-400',
                               t.lastStatus === 'ok' && 'text-emerald-500'
                             )}
                           >
                             {rel(t.lastRunAt)}
                             {t.lastDurationMs != null &&
-                              ` · ${formatDuration(t.lastDurationMs / 1000) === '0s' ? `${t.lastDurationMs}ms` : formatDuration(t.lastDurationMs / 1000)}`}
+                              ` · ${took(t.lastDurationMs)}`}
                           </span>
                           {t.kind === 'scheduled' && (
                             <>
@@ -200,13 +194,49 @@ export function TasksPage() {
                           Run now
                         </Button>
                       </div>
+                      {t.runs.length > 1 && (
+                        <details className="mt-3 group">
+                          <summary className="cursor-pointer text-xs text-[--muted] flex items-center gap-1 list-none [&::-webkit-details-marker]:hidden">
+                            <BiChevronDown className="transition-transform group-open:rotate-180" />
+                            {t.runs.length} replicas
+                          </summary>
+                          <div className="mt-2 grid gap-1">
+                            {t.runs.map((r) => (
+                              <div
+                                key={r.instanceId}
+                                className="flex items-center gap-2 text-xs"
+                              >
+                                <span className="font-mono text-[--muted]">
+                                  {shortId(r.instanceId)}
+                                </span>
+                                {r.self && (
+                                  <span className="text-[10px] text-[--muted]">
+                                    this one
+                                  </span>
+                                )}
+                                <span
+                                  className={cn(
+                                    'ml-auto',
+                                    r.lastStatus === 'error' && 'text-red-400',
+                                    r.lastStatus === 'ok' && 'text-emerald-500'
+                                  )}
+                                >
+                                  {rel(r.lastRunAt)}
+                                  {r.lastDurationMs != null &&
+                                    ` · ${took(r.lastDurationMs)}`}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </details>
+                      )}
                       {t.lastStatus === 'error' && t.lastError && (
                         <details className="mt-3 group">
-                          <summary className="cursor-pointer text-xs text-red-500 flex items-center gap-1 list-none [&::-webkit-details-marker]:hidden">
+                          <summary className="cursor-pointer text-xs text-red-400 flex items-center gap-1 list-none [&::-webkit-details-marker]:hidden">
                             <BiChevronDown className="transition-transform group-open:rotate-180" />
                             Last error
                           </summary>
-                          <pre className="mt-2 p-2 text-[11px] font-mono whitespace-pre-wrap break-words bg-red-500/5 border border-red-500/20 rounded text-red-500/90">
+                          <pre className="mt-2 p-2 text-[11px] font-mono whitespace-pre-wrap break-words bg-red-500/5 border border-red-400/20 rounded text-red-400/90">
                             {t.lastError}
                           </pre>
                         </details>

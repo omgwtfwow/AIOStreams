@@ -9,11 +9,12 @@ import {
   UnprocessedTorrent,
   DebridDownload,
   getDebridService,
+  isCountryWrong,
   isTorrentDebridService,
   isUsenetDebridService,
 } from '../../debrid/index.js';
 import { titleMatch, cleanTitle, preprocessTitle } from '../../parser/utils.js';
-import { parseTorrentTitle } from '@viren070/parse-torrent-title';
+import { parseTorrentTitleCached } from '../../parser/title.js';
 import { SearchMetadata } from '../base/debrid.js';
 
 const logger = createLogger('library');
@@ -28,15 +29,15 @@ export function isItemMatch(
   metadata: SearchMetadata,
   parsedId: ParsedId
 ): boolean {
-  const parsed = parseTorrentTitle(itemName);
+  const parsed = parseTorrentTitleCached(itemName);
   const preprocessedTitle = preprocessTitle(
     parsed.title ?? '',
-    itemName,
+    [itemName],
     metadata.titles
   );
 
   // Title match
-  const cleanedTitles = metadata.titles.map(cleanTitle);
+  const cleanedTitles = metadata.titles.map((title) => cleanTitle(title));
   if (
     !titleMatch(cleanTitle(preprocessedTitle), cleanedTitles, {
       threshold: TITLE_MATCH_THRESHOLD,
@@ -45,10 +46,21 @@ export function isItemMatch(
     return false;
   }
 
+  if (isCountryWrong(parsed, metadata)) {
+    return false;
+  }
+
   // For series, check season/episode matching
   if (parsedId.mediaType === 'series') {
     const season = parsedId.season ? Number(parsedId.season) : undefined;
     const episode = parsedId.episode ? Number(parsedId.episode) : undefined;
+
+    // a parsed release date is authoritative when the requested air date is
+    // known
+    const parsedDate = parsed.date || undefined;
+    if (parsedDate && metadata.airDates?.length) {
+      return metadata.airDates.includes(parsedDate);
+    }
 
     // If the item has season info, check it matches
     if (parsed.seasons && parsed.seasons.length > 0 && season !== undefined) {

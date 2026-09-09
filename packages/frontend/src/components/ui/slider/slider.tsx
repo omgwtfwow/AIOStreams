@@ -64,7 +64,7 @@ export const SliderAnatomy = defineStyleAnatomy({
       'UI-Slider__thumb',
       'block h-4 w-4 rounded-full',
       'border border-brand/50 bg-white shadow transition-colors',
-      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[--ring] focus-visible:ring-offset-1',
+      'focus-visible:outline-none focus-visible:ring-1 ring-offset-1 ring-offset-[--background] focus-visible:ring-white/40',
       'disabled:pointer-events-none disabled:opacity-50',
       'data-[disabled=true]:opacity-50',
     ],
@@ -127,10 +127,6 @@ export type SliderProps = BasicFieldOptions &
      */
     marks?: { value: number; label: string }[];
     /**
-     * Additional help text shown in a popover
-     */
-    moreHelp?: React.ReactNode;
-    /**
      * The size of the slider
      */
     size?: 'sm' | 'md' | 'lg';
@@ -152,11 +148,10 @@ export const Slider = React.forwardRef<HTMLSpanElement, SliderProps>(
         labelClass,
         showMarks,
         marks,
-        moreHelp,
         size,
         ...rest
       },
-      { label, ...basicFieldProps },
+      { label, moreHelp, ...basicFieldProps },
     ] = extractBasicFieldProps(props, React.useId());
 
     const isFirst = React.useRef(true);
@@ -165,10 +160,13 @@ export const Slider = React.forwardRef<HTMLSpanElement, SliderProps>(
       controlledValue ?? defaultValue ?? [0]
     );
 
-    const handleOnValueChange = React.useCallback((value: number[]) => {
-      _setValue(value);
-      onValueChange?.(value);
-    }, []);
+    const handleOnValueChange = React.useCallback(
+      (value: number[]) => {
+        _setValue(value);
+        onValueChange?.(value);
+      },
+      [onValueChange]
+    );
 
     React.useEffect(() => {
       if (!defaultValue || !isFirst.current) {

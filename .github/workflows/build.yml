@@ -6,8 +6,10 @@ on:
       - main
     paths:
       - 'packages/**'
-      - 'package-lock.json'
       - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'patches/**'
       - 'tsconfig.json'
       - 'tsconfig.base.json'
 
@@ -25,5 +27,7 @@ jobs:
         run: corepack enable
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
+      - name: Test Addon
+        run: pnpm -r --if-present test
       - name: Build Addon
         run: pnpm run build

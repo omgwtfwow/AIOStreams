@@ -1,4 +1,4 @@
-﻿import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
+import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
 import StreamParser from '../parser/streams.js';
 import { appConfig, constants, ServiceId } from '../utils/index.js';
 import { BuiltinAddonPreset, BuiltinStreamParser } from './builtin.js';
@@ -21,6 +21,7 @@ export class LibraryPreset extends BuiltinAddonPreset {
     constants.NZBDAV_SERVICE,
     constants.ALTMOUNT_SERVICE,
     constants.STREMTHRU_NEWZ_SERVICE,
+    constants.AIOSTREAMS_SERVICE,
   ];
 
   static override get METADATA() {
@@ -176,7 +177,11 @@ export class LibraryPreset extends BuiltinAddonPreset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     if (!usableServices || usableServices.length === 0) {
       throw new Error(
         `${this.METADATA.NAME} requires at least one usable service, but none were found. Please enable at least one of the following services: ${this.METADATA.SUPPORTED_SERVICES.join(

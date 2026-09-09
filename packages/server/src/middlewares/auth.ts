@@ -6,6 +6,11 @@ import {
   verifySession,
   issueSession,
   getConfigAccessKey,
+  sessionHasPermission,
+  Permission,
+  SessionSource,
+  encodeSignedPayload,
+  decodeSignedPayload,
 } from '@aiostreams/core';
 
 export const SESSION_COOKIE = 'aiostreams.session';
@@ -27,9 +32,12 @@ function readCookie(req: Request, name: string): string | undefined {
 export function setSessionCookie(
   req: Request,
   res: Response,
-  username: string
+  user: { username: string; permissions?: Permission[]; source?: SessionSource }
 ): void {
-  const token = issueSession(username);
+  const token = issueSession(user.username, {
+    permissions: user.permissions,
+    source: user.source,
+  });
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true,
     secure: req.secure,
@@ -43,6 +51,114 @@ export function clearSessionCookie(res: Response): void {
   res.clearCookie(SESSION_COOKIE, { path: '/' });
 }
 
+export const CONFIG_SESSION_COOKIE = 'aiostreams.config-session';
+
+/** Carries no secret; lets the page tell whether a restore is worth a request. */
+export const CONFIG_SESSION_MARKER_COOKIE = 'aiostreams.has-config-session';
+
+const CONFIG_SESSION_PATH = '/api';
+
+// Must be readable from the configure page, which is not under /api.
+const CONFIG_SESSION_MARKER_PATH = '/';
+
+export function readConfigSessionToken(req: Request): string | undefined {
+  return readCookie(req, CONFIG_SESSION_COOKIE);
+}
+
+export function setConfigSessionCookie(
+  req: Request,
+  res: Response,
+  token: string,
+  remembered: boolean,
+  expiresAt: number
+): void {
+  // No maxAge means the browser drops it on close.
+  const maxAge = remembered ? Math.max(expiresAt - Date.now(), 0) : undefined;
+  res.cookie(CONFIG_SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: req.secure,
+    sameSite: 'strict',
+    path: CONFIG_SESSION_PATH,
+    ...(maxAge === undefined ? {} : { maxAge }),
+  });
+  res.cookie(CONFIG_SESSION_MARKER_COOKIE, '1', {
+    httpOnly: false,
+    secure: req.secure,
+    sameSite: 'strict',
+    path: CONFIG_SESSION_MARKER_PATH,
+    ...(maxAge === undefined ? {} : { maxAge }),
+  });
+}
+
+export function clearConfigSessionCookie(res: Response): void {
+  res.clearCookie(CONFIG_SESSION_COOKIE, { path: CONFIG_SESSION_PATH });
+  res.clearCookie(CONFIG_SESSION_MARKER_COOKIE, {
+    path: CONFIG_SESSION_MARKER_PATH,
+  });
+}
+
+export const OIDC_STATE_COOKIE = 'aiostreams.oidc';
+const OIDC_COOKIE_PATH = '/api/v1/auth/oidc';
+const OIDC_STATE_TTL_SECONDS = 600;
+
+export interface OidcStateBlob {
+  /** state */
+  st: string;
+  /** nonce */
+  n: string;
+  /** PKCE code verifier */
+  v: string;
+  /** post-login redirect target */
+  nx: string;
+  exp: number;
+}
+
+/**
+ * CSRF binding for one in-flight login.
+ *
+ * sameSite must be 'lax': the callback is a top-level navigation from the
+ * provider's origin, and a 'strict' cookie is withheld from it.
+ */
+export function setOidcStateCookie(
+  req: Request,
+  res: Response,
+  blob: Omit<OidcStateBlob, 'exp'>
+): void {
+  const payload: OidcStateBlob = {
+    ...blob,
+    exp: Math.floor(Date.now() / 1000) + OIDC_STATE_TTL_SECONDS,
+  };
+  res.cookie(OIDC_STATE_COOKIE, encodeSignedPayload(payload), {
+    httpOnly: true,
+    secure: req.secure,
+    sameSite: 'lax',
+    path: OIDC_COOKIE_PATH,
+    maxAge: OIDC_STATE_TTL_SECONDS * 1000,
+  });
+}
+
+export function readOidcStateCookie(req: Request): OidcStateBlob | null {
+  const blob = decodeSignedPayload<OidcStateBlob>(
+    readCookie(req, OIDC_STATE_COOKIE)
+  );
+  if (!blob) return null;
+  if (
+    typeof blob.st !== 'string' ||
+    typeof blob.n !== 'string' ||
+    typeof blob.v !== 'string' ||
+    typeof blob.exp !== 'number' ||
+    blob.exp < Math.floor(Date.now() / 1000)
+  ) {
+    return null;
+  }
+  return blob;
+}
+
+export function clearOidcStateCookie(res: Response): void {
+  // The path must match the one it was set with or this is a no-op.
+  res.clearCookie(OIDC_STATE_COOKIE, { path: OIDC_COOKIE_PATH });
+}
+
 /**
  * Reads the session cookie if present and attaches req.user. Never rejects —
  * downstream middleware decides whether a session is required.
@@ -54,7 +170,7 @@ export function attachSession(
 ): void {
   const session = verifySession(readCookie(req, SESSION_COOKIE));
   if (session) {
-    req.user = { username: session.username, isAdmin: session.isAdmin };
+    req.user = session;
   }
   next();
 }
@@ -90,7 +206,7 @@ export function requireSession(
   if (!req.user) {
     const session = verifySession(readCookie(req, SESSION_COOKIE));
     if (session) {
-      req.user = { username: session.username, isAdmin: session.isAdmin };
+      req.user = session;
     }
   }
   if (req.user) {
@@ -106,32 +222,36 @@ export function requireSession(
 }
 
 /**
- * Requires a valid admin session. Chains requireSession, then rejects
- * non-admins (403 / redirect to /).
+ * Requires a valid session whose user holds the given permission. Chains
+ * requireSession, then rejects users lacking the permission (403 / redirect to
+ * /). `admin` implies every permission.
  */
-export function requireAdmin(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void {
-  requireSession(req, res, (err?: unknown) => {
-    if (err) {
-      next(err);
-      return;
-    }
-    if (!res.headersSent && req.user) {
-      if (req.user.isAdmin) {
-        next();
+export function requirePermission(permission: Permission) {
+  return function (req: Request, res: Response, next: NextFunction): void {
+    requireSession(req, res, (err?: unknown) => {
+      if (err) {
+        next(err);
         return;
       }
-      if (req.accepts(['html', 'json']) === 'html') {
-        res.redirect(302, '/');
-        return;
+      if (!res.headersSent && req.user) {
+        if (sessionHasPermission(req.user, permission)) {
+          next();
+          return;
+        }
+        if (req.accepts(['html', 'json']) === 'html') {
+          res.redirect(302, '/');
+          return;
+        }
+        next(new APIError(constants.ErrorCode.FORBIDDEN));
       }
-      next(new APIError(constants.ErrorCode.FORBIDDEN));
-    }
-  });
+    });
+  };
 }
+
+/**
+ * Requires a valid admin session. Rejects non-admins (403 / redirect to /).
+ */
+export const requireAdmin = requirePermission(Permission.Admin);
 
 /**
  * Applies requireSession only when the config page is auth-gated

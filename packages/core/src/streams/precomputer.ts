@@ -301,57 +301,40 @@ class StreamPrecomputer {
     );
     let seadexBestCount = 0;
     let seadexCount = 0;
-    let seadexGroupFallbackCount = 0;
-    let anyHashMatched = false;
+    let seadexGroupMatchCount = 0;
 
-    // First pass: try hash matching for all streams
     for (const stream of streams) {
       const infoHash = stream.torrent?.infoHash?.toLowerCase();
 
-      if (infoHash) {
-        const isBest = seadexResult.bestHashes.has(infoHash);
-        const isSeadex = seadexResult.allHashes.has(infoHash);
+      if (infoHash && seadexResult.allHashes.has(infoHash)) {
+        stream.seadex = {
+          isBest: seadexResult.bestHashes.has(infoHash),
+          isSeadex: true,
+          method: 'hash',
+        };
 
-        if (isSeadex) {
-          stream.seadex = {
-            isBest,
-            isSeadex: true,
-          };
-
-          if (isBest) {
-            seadexBestCount++;
-          }
-          seadexCount++;
-          anyHashMatched = true;
+        if (stream.seadex.isBest) {
+          seadexBestCount++;
         }
+        seadexCount++;
+        continue;
       }
-    }
 
-    // Second pass: fallback to release group matching ONLY if no hash matched
-    if (!anyHashMatched) {
-      for (const stream of streams) {
-        // Skip streams already tagged
-        if (stream.seadex) {
-          continue;
+      // Group matching covers releases whose hashes SeaDex redacts
+      // (private trackers).
+      const releaseGroup = stream.parsedFile?.releaseGroup?.toLowerCase();
+      if (releaseGroup && seadexResult.allGroups.has(releaseGroup)) {
+        stream.seadex = {
+          isBest: seadexResult.bestGroups.has(releaseGroup),
+          isSeadex: true,
+          method: 'group',
+        };
+
+        if (stream.seadex.isBest) {
+          seadexBestCount++;
         }
-
-        const releaseGroup = stream.parsedFile?.releaseGroup?.toLowerCase();
-        if (releaseGroup) {
-          const isBestGroup = seadexResult.bestGroups.has(releaseGroup);
-          const isSeadexGroup = seadexResult.allGroups.has(releaseGroup);
-
-          if (isBestGroup || isSeadexGroup) {
-            stream.seadex = {
-              isBest: isBestGroup,
-              isSeadex: true,
-            };
-            if (isBestGroup) {
-              seadexBestCount++;
-            }
-            seadexCount++;
-            seadexGroupFallbackCount++;
-          }
-        }
+        seadexCount++;
+        seadexGroupMatchCount++;
       }
     }
 
@@ -360,7 +343,7 @@ class StreamPrecomputer {
         {
           tagged: seadexCount,
           best: seadexBestCount,
-          groupFallback: seadexGroupFallbackCount,
+          groupMatched: seadexGroupMatchCount,
           anilistId,
         },
         'seadex tagging complete'

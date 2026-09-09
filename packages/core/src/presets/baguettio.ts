@@ -144,6 +144,20 @@ export class BaguettioPreset extends Preset {
         type: 'boolean',
         default: true,
       },
+      {
+        id: 'trTr4kerApiKey',
+        name: 'Tr4ker API Key',
+        description: 'API Key for Tr4ker (Optional)',
+        type: 'string',
+        required: false,
+      },
+      {
+        id: 'trTr4kerMagnetOnly',
+        name: 'Tr4ker - Magnet Only',
+        description: 'Retrieve only magnets for Tr4ker',
+        type: 'boolean',
+        default: true,
+      },
     ];
 
     return {
@@ -169,7 +183,11 @@ export class BaguettioPreset extends Preset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     const services = usableServices?.map((s) => s.id) || [];
 
     return [this.generateAddon(userData, options, services)];
@@ -299,6 +317,11 @@ export class BaguettioPreset extends Preset {
     if (options.trOldSchoolApiKey) {
       config.TR_OLDSCHOOL_APIKEY = options.trOldSchoolApiKey;
       config.OLDSCHOOL_MAGNET_ONLY = options.oldSchoolMagnetOnly ?? true;
+    }
+
+    if (options.trTr4kerApiKey) {
+      config.TR_TR4KER_APIKEY = options.trTr4kerApiKey;
+      config.TR4KER_MAGNET_ONLY = options.trTr4kerMagnetOnly ?? true;
     }
 
     const configString = this.base64EncodeJSON(config, 'urlSafe');

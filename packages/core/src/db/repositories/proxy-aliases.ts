@@ -1,7 +1,6 @@
 import { randomBytes, createHash } from 'crypto';
 import { getDb } from '../db.js';
 import { sql } from '../sql.js';
-import { decryptString, encryptString } from '../../utils/crypto.js';
 import { createLogger } from '../../logging/logger.js';
 
 const logger = createLogger('proxy-aliases');
@@ -40,7 +39,10 @@ function createAliasId(): string {
   return `pa_${randomBytes(18).toString('base64url')}`;
 }
 
-function encryptPayload(payload: ProxyAliasPayload): string {
+async function encryptPayload(payload: ProxyAliasPayload): Promise<string> {
+  // Loading the config-backed crypto module lazily avoids a startup cycle:
+  // config -> tasks -> db barrel -> proxy aliases -> crypto -> config.
+  const { encryptString } = await import('../../utils/crypto.js');
   const encrypted = encryptString(JSON.stringify(payload));
   if (!encrypted.success || !encrypted.data) {
     throw new Error(encrypted.error || 'Failed to encrypt proxy alias payload');
@@ -48,7 +50,10 @@ function encryptPayload(payload: ProxyAliasPayload): string {
   return encrypted.data;
 }
 
-function decryptPayload(payload: string): ProxyAliasPayload | null {
+async function decryptPayload(
+  payload: string
+): Promise<ProxyAliasPayload | null> {
+  const { decryptString } = await import('../../utils/crypto.js');
   const decrypted = decryptString(payload);
   if (!decrypted.success || !decrypted.data) {
     logger.warn('Failed to decrypt proxy alias payload', {
@@ -73,7 +78,7 @@ export class ProxyAliasRepository {
     payload: ProxyAliasPayload
   ): Promise<{ id: string; created: boolean }> {
     const stableKeyHash = hashStableKey(stableKey);
-    const encryptedPayload = encryptPayload(payload);
+    const encryptedPayload = await encryptPayload(payload);
     const db = getDb();
 
     return db.tx(async (tx) => {

@@ -6,32 +6,25 @@ import {
   SERVICE_DETAILS,
   DEFAULT_PRECACHE_SELECTOR,
   DEFAULT_SMART_DETECT_ATTRIBUTES,
+  DEFAULT_FAILOVER_CONTENT_TYPES,
+  DEFAULT_FAILOVER_PARALLEL,
 } from '../../../core/src/utils/constants';
 import { useStatus } from './status';
-
-const USER_DATA_KEY = 'aiostreams-user-data';
+import { filterForDiff } from '../utils/diff/userData';
+import {
+  clearDrafts,
+  isDraftOptOut,
+  migrateLegacyDraft,
+  pruneExpiredLocalDrafts,
+  readDraftFor,
+  readSessionDraft,
+  setDraftOptOut,
+  writeLocalDraft,
+  writeSessionDraft,
+  type Draft,
+} from '@/lib/drafts';
 
 export function applyMigrations(config: any): UserData {
-  if (
-    config &&
-    config.addonPassword !== undefined &&
-    config.accessToken === undefined
-  ) {
-    config.accessToken = config.addonPassword;
-  }
-  if (config && config.addonPassword !== undefined) {
-    delete config.addonPassword;
-  }
-  if (
-    config &&
-    config.accessToken !== undefined &&
-    config.accessKey === undefined
-  ) {
-    config.accessKey = config.accessToken;
-  }
-  if (config && config.accessToken !== undefined) {
-    delete config.accessToken;
-  }
   if (
     config.deduplicator &&
     typeof config.deduplicator.multiGroupBehaviour === 'string'
@@ -215,6 +208,25 @@ export function applyMigrations(config: any): UserData {
     delete config.p2pWrap;
   }
 
+  // migrate nzbFailover -> generic failover (usenet-only, sequential = old behaviour)
+  if (config.failover === undefined && config.nzbFailover !== undefined) {
+    config.failover = {
+      enabled: config.nzbFailover.enabled,
+      maxAttempts: config.nzbFailover.count,
+      position: config.nzbFailover.position,
+      contentTypes: [...DEFAULT_FAILOVER_CONTENT_TYPES],
+      allowCrossType: false,
+      parallel: DEFAULT_FAILOVER_PARALLEL,
+    };
+  }
+  delete config.nzbFailover;
+
+  // migrate failover.count -> failover.maxAttempts (renamed)
+  if (config.failover && (config.failover as any).count !== undefined) {
+    config.failover.maxAttempts ??= (config.failover as any).count;
+    delete (config.failover as any).count;
+  }
+
   // migrate stream expressions from string[] to {expression, enabled}[]
   const streamExpressionKeys = [
     'excludedStreamExpressions',
@@ -253,6 +265,49 @@ export function applyMigrations(config: any): UserData {
     });
   }
 
+  // migrate nab url/apiKey/apiPath options into a single `api` object holding
+  // the complete endpoint
+  if (config.presets && Array.isArray(config.presets)) {
+    // [urlOption, apiKeyOption, urlIsBaseOnly]
+    const nabOptionKeys: Record<string, [string, string, boolean?]> = {
+      newznab: ['newznabUrl', 'apiKey'],
+      torznab: ['torznabUrl', 'apiKey'],
+      nzbhydra: ['nzbhydraUrl', 'nzbhydraApiKey', true],
+    };
+    config.presets = config.presets.map((preset: any) => {
+      const keys = nabOptionKeys[preset.type];
+      if (!keys || !preset.options || preset.options.api !== undefined) {
+        return preset;
+      }
+      const [urlKey, apiKeyKey, urlIsBaseOnly] = keys;
+      const {
+        [urlKey]: url,
+        [apiKeyKey]: apiKey,
+        apiPath,
+        ...rest
+      } = preset.options;
+      if (url === undefined && apiKey === undefined && apiPath === undefined) {
+        return preset;
+      }
+      const api: { url?: string; apiKey?: string } = {};
+      // a preconfigured NZBHydra stores no url, and must not gain a bare '/api'
+      if (typeof url === 'string' && url.trim()) {
+        const base = url.trim().replace(/\/+$/, '');
+        if (urlIsBaseOnly) {
+          api.url = base;
+        } else {
+          const path = apiPath === undefined ? '/api' : String(apiPath).trim();
+          const normalised = path.replace(/^\/+|\/+$/g, '');
+          api.url = base + (normalised ? `/${normalised}` : '');
+        }
+      }
+      if (apiKey !== undefined) {
+        api.apiKey = apiKey;
+      }
+      return { ...preset, options: { ...rest, api } };
+    });
+  }
+
   if (config.formatter && config.formatter.definition) {
     config.formatter.definitions = {
       ...(config.formatter.definitions ?? {}),
@@ -285,6 +340,12 @@ export function removeInvalidPresetReferences(config: UserData) {
   if (config.seasonEpisodeMatching) {
     config.seasonEpisodeMatching.addons =
       config.seasonEpisodeMatching.addons?.filter((addon) =>
+        existingPresetIds?.includes(addon)
+      );
+  }
+  if (config.episodeTitleMatching) {
+    config.episodeTitleMatching.addons =
+      config.episodeTitleMatching.addons?.filter((addon) =>
         existingPresetIds?.includes(addon)
       );
   }
@@ -420,6 +481,14 @@ export const DefaultUserData: UserData = {
     addons: [],
     requestTypes: [],
   },
+  episodeTitleMatching: {
+    addons: [],
+    requestTypes: [],
+  },
+  languageInference: {
+    enabled: true,
+    sources: [],
+  },
   yearMatching: {
     addons: [],
     requestTypes: [],
@@ -436,6 +505,75 @@ export const DefaultUserData: UserData = {
   checkOwned: true,
 };
 
+type Status = NonNullable<ReturnType<typeof useStatus>['status']>;
+
+/**
+ * Overlays the instance's forced and default settings. Applied to both the live
+ * configuration and the draft baseline, so it must not mutate its input.
+ */
+function applyStatusDefaults(data: UserData, status: Status): UserData {
+  const forced = status.settings.forced;
+  const defaults = status.settings.defaults;
+  const services = status.settings.services;
+
+  const next: UserData = { ...data };
+  next.proxy = {
+    ...next.proxy,
+    enabled: forced.proxy.enabled ?? defaults.proxy?.enabled ?? undefined,
+    id: (forced.proxy.id ?? defaults.proxy?.id ?? 'builtin') as
+      | 'builtin'
+      | 'mediaflow'
+      | 'stremthru'
+      | undefined,
+    url: forced.proxy.url ?? defaults.proxy?.url ?? undefined,
+    publicUrl: forced.proxy.publicUrl ?? defaults.proxy?.publicUrl ?? undefined,
+    publicIp: forced.proxy.publicIp ?? defaults.proxy?.publicIp ?? undefined,
+    credentials:
+      forced.proxy.credentials ?? defaults.proxy?.credentials ?? undefined,
+    proxiedServices:
+      forced.proxy.proxiedServices ?? defaults.proxy?.proxiedServices ?? [],
+  };
+
+  next.services = (data.services ?? []).map((service) => {
+    const serviceMeta = services[service.id];
+    if (!serviceMeta) return service;
+    const credentials = { ...service.credentials };
+    serviceMeta.credentials.forEach((credential) => {
+      if (credential.forced) {
+        credentials[credential.id] = credential.forced;
+      } else if (credential.default) {
+        credentials[credential.id] = credential.default;
+      }
+    });
+    return {
+      ...service,
+      credentials,
+      // enable if every credential is set
+      enabled: serviceMeta.credentials.every(
+        (credential) =>
+          credential.forced ||
+          credential.default ||
+          credentials[credential.id] !== undefined
+      ),
+    };
+  });
+
+  return next;
+}
+
+/** Stable comparison that ignores identity and other volatile fields. */
+function sameConfig(a: UserData, b: UserData): boolean {
+  return JSON.stringify(filterForDiff(a)) === JSON.stringify(filterForDiff(b));
+}
+
+/** Whether a configuration holds work worth offering to restore. */
+function hasWork(data: UserData): boolean {
+  return (
+    (data.presets ?? []).length > 0 ||
+    (data.services ?? []).some((service) => service.enabled)
+  );
+}
+
 interface UserDataContextType {
   userData: UserData;
   setUserData: (data: ((prev: UserData) => UserData | null) | null) => void;
@@ -445,6 +583,14 @@ interface UserDataContextType {
   setPassword: (password: string | null) => void;
   encryptedPassword: string | null;
   setEncryptedPassword: (encryptedPassword: string | null) => void;
+  /** Edits past this point count as a draft; matching it again clears one. */
+  setBaseline: (data: UserData) => void;
+  /** Null unless it belongs to the configuration currently held. */
+  pendingDraft: Draft | null;
+  restoreDraft: () => void;
+  discardDraft: () => void;
+  /** Discards the draft and stops keeping drafts on this browser. */
+  disableDrafts: () => void;
 }
 
 const UserDataContext = React.createContext<UserDataContextType | undefined>(
@@ -454,16 +600,28 @@ const UserDataContext = React.createContext<UserDataContextType | undefined>(
 export function UserDataProvider({ children }: { children: React.ReactNode }) {
   const { status } = useStatus();
 
-  // Initialize userData from local storage or apply default
-  const [userData, setUserData] = React.useState<UserData>(() => {
-    try {
-      const stored = localStorage.getItem(USER_DATA_KEY);
-      const data = stored ? JSON.parse(stored) : DefaultUserData;
-      return applyMigrations(data);
-    } catch {
-      return DefaultUserData;
+  // Only a same-tab reload restores silently; anything older is offered.
+  const [boot] = React.useState(() => {
+    migrateLegacyDraft(hasWork);
+    pruneExpiredLocalDrafts();
+    const session = readSessionDraft();
+    if (session && session.uuid === null) {
+      try {
+        return { initial: applyMigrations(session.data), pending: null };
+      } catch {
+        /* fall through to the prompt */
+      }
     }
+    return {
+      initial: DefaultUserData,
+      pending: readDraftFor(null),
+    };
   });
+
+  const [userData, setUserData] = React.useState<UserData>(boot.initial);
+  const [pendingDraft, setPendingDraft] = React.useState<Draft | null>(
+    boot.pending
+  );
 
   const [uuid, setUuid] = React.useState<string | null>(null);
   const [password, setPassword] = React.useState<string | null>(null);
@@ -471,10 +629,14 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
     string | null
   >(null);
 
-  // Effect to persist userData to local storage
-  React.useEffect(() => {
-    localStorage.setItem(USER_DATA_KEY, JSON.stringify(userData));
-  }, [userData]);
+  // Last configuration known to be saved; a draft exists only while it differs.
+  const baselineRef = React.useRef<UserData>(DefaultUserData);
+  const anonBaselineRef = React.useRef<UserData>(DefaultUserData);
+  const [baselineReady, setBaselineReady] = React.useState(false);
+
+  const setBaseline = React.useCallback((data: UserData) => {
+    baselineRef.current = data;
+  }, []);
 
   const statusApplied = React.useRef(false);
 
@@ -482,64 +644,84 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
     if (!status || statusApplied.current) return;
     statusApplied.current = true;
 
-    const forced = status.settings.forced;
-    const defaults = status.settings.defaults;
-    const services = status.settings.services;
+    // The baseline takes the same overlay, or defaults read as unsaved edits.
+    const anonBaseline = applyStatusDefaults(DefaultUserData, status);
+    anonBaselineRef.current = anonBaseline;
+    baselineRef.current = anonBaseline;
+    setUserData((prev) => applyStatusDefaults(prev, status));
+    setBaselineReady(true);
+  }, [status]);
 
-    setUserData((prev) => {
-      const newData = { ...prev };
-      newData.proxy = {
-        ...newData.proxy,
-        enabled: forced.proxy.enabled ?? defaults.proxy?.enabled ?? undefined,
-        id: (forced.proxy.id ?? defaults.proxy?.id ?? 'builtin') as
-          | 'builtin'
-          | 'mediaflow'
-          | 'stremthru'
-          | undefined,
-        url: forced.proxy.url ?? defaults.proxy?.url ?? undefined,
-        publicUrl:
-          forced.proxy.publicUrl ?? defaults.proxy?.publicUrl ?? undefined,
-        publicIp:
-          forced.proxy.publicIp ?? defaults.proxy?.publicIp ?? undefined,
-        credentials:
-          forced.proxy.credentials ?? defaults.proxy?.credentials ?? undefined,
-        proxiedServices:
-          forced.proxy.proxiedServices ?? defaults.proxy?.proxiedServices ?? [],
-      };
+  // The identity is unknown at boot, so a configuration's draft is picked up
+  // once its uuid arrives, and is never offered to any other identity.
+  const draftIdentity = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (draftIdentity.current === uuid) return;
+    draftIdentity.current = uuid;
+    setPendingDraft(readDraftFor(uuid));
+  }, [uuid]);
 
-      newData.services = (newData.services ?? []).map((service) => {
-        const serviceMeta = services[service.id];
-        if (!serviceMeta) return service;
-        serviceMeta.credentials.forEach((credential) => {
-          if (credential.forced) {
-            service.credentials[credential.id] = credential.forced;
-          } else if (credential.default) {
-            service.credentials[credential.id] = credential.default;
-          }
-        });
-        // enable if every credential is set
-        service.enabled = serviceMeta.credentials.every(
-          (credential) =>
-            credential.forced ||
-            credential.default ||
-            service.credentials[credential.id] !== undefined
-        );
-        return service;
-      });
+  React.useEffect(() => {
+    if (!baselineReady) return;
+    const handle = setTimeout(() => {
+      if (sameConfig(userData, baselineRef.current)) {
+        clearDrafts(uuid);
+        return;
+      }
+      writeSessionDraft(userData, uuid, userData.addonName);
+      writeLocalDraft(userData, uuid, userData.addonName);
+    }, 400);
+    return () => clearTimeout(handle);
+  }, [userData, uuid, baselineReady]);
 
-      return newData;
+  const restoreDraft = React.useCallback(() => {
+    setPendingDraft((draft) => {
+      if (draft) {
+        try {
+          const restored = applyMigrations(draft.data);
+          setUserData(() =>
+            status ? applyStatusDefaults(restored, status) : restored
+          );
+        } catch {
+          /* unusable draft; drop it rather than breaking the page */
+        }
+      }
+      return null;
     });
   }, [status]);
 
+  const discardDraft = React.useCallback(() => {
+    setPendingDraft((draft) => {
+      if (draft) clearDrafts(draft.uuid);
+      return null;
+    });
+  }, []);
+
+  const applicableDraft =
+    pendingDraft && pendingDraft.uuid === uuid ? pendingDraft : null;
+
+  const disableDrafts = React.useCallback(() => {
+    setDraftOptOut();
+    setPendingDraft((draft) => {
+      if (draft) clearDrafts(draft.uuid);
+      return null;
+    });
+  }, []);
+
+  // Clearing means signing out; resetting to the baseline writes no draft.
   const safeSetUserData = (
     data: ((prev: UserData) => UserData | null) | null
   ) => {
+    const reset = () => {
+      baselineRef.current = anonBaselineRef.current;
+      return anonBaselineRef.current;
+    };
     if (data === null) {
-      setUserData(DefaultUserData);
+      setUserData(reset);
     } else {
       setUserData((prev) => {
         const result = data(prev);
-        return result === null ? DefaultUserData : result;
+        return result === null ? reset() : result;
       });
     }
   };
@@ -555,6 +737,11 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
         setPassword,
         encryptedPassword,
         setEncryptedPassword,
+        setBaseline,
+        pendingDraft: applicableDraft,
+        restoreDraft,
+        discardDraft,
+        disableDrafts,
       }}
     >
       {children}

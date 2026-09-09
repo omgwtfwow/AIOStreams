@@ -1,4 +1,3 @@
-import React from 'react';
 import { Outlet, useLocation, useNavigate } from '@tanstack/react-router';
 import {
   AppLayout,
@@ -13,35 +12,40 @@ import {
   useConfirmationDialog,
 } from '@/components/shared/confirmation-dialog';
 import { useSession } from '@/context/session';
-import {
-  BiBarChartAlt2,
-  BiListUl,
-  BiServer,
-  BiCog,
-  BiNetworkChart,
-  BiLogOutCircle,
-  BiGridAlt,
-  BiGroup,
-  BiTask,
-  BiData,
-  BiSliderAlt,
-} from 'react-icons/bi';
+import { BiLogOutCircle, BiSliderAlt } from 'react-icons/bi';
 import { LayoutHeaderBackground } from '@/components/layout-header-background';
+import { NAV, SECTIONED } from '@/app/dashboard/nav';
+import {
+  DashboardCommandPaletteProvider,
+  useDashboardCommandPalette,
+} from '@/context/dashboard-command-palette';
+import { DashboardCommandPalette } from '@/components/shared/command-palette';
+import {
+  CommandPaletteSearchButton,
+  CommandPaletteTopBarButton,
+} from '@/components/shared/command-palette/search-button';
 
-// Order mirrors how operators typically navigate the dashboard: dashboards
-// at the top, operational tools in the middle, infrastructure (Proxy) before
-// the dangerous Settings page which lives last.
-const NAV: { label: string; href: string; icon: React.ElementType }[] = [
-  { label: 'Overview', href: '/dashboard', icon: BiGridAlt },
-  { label: 'Analytics', href: '/dashboard/analytics', icon: BiBarChartAlt2 },
-  { label: 'Logs', href: '/dashboard/logs', icon: BiListUl },
-  { label: 'System', href: '/dashboard/system', icon: BiServer },
-  { label: 'Users', href: '/dashboard/users', icon: BiGroup },
-  { label: 'Tasks', href: '/dashboard/tasks', icon: BiTask },
-  { label: 'Cache', href: '/dashboard/cache', icon: BiData },
-  { label: 'Proxy', href: '/dashboard/proxy', icon: BiNetworkChart },
-  { label: 'Settings', href: '/dashboard/settings', icon: BiCog },
-];
+function SidebarHeader() {
+  const { open } = useDashboardCommandPalette();
+  return (
+    <>
+      <div className="mb-4 p-4 pb-0 flex flex-col items-center w-full">
+        <img
+          src="/logo.png"
+          alt="AIOStreams"
+          className="max-w-[90px] max-h-[60px] object-contain p-4"
+        />
+        <span className="text-xs text-gray-500 mb-3">Dashboard</span>
+      </div>
+      <CommandPaletteSearchButton label="Search dashboard" onOpen={open} />
+    </>
+  );
+}
+
+function MobileSearchBar() {
+  const { open } = useDashboardCommandPalette();
+  return <CommandPaletteTopBarButton label="Search dashboard" onOpen={open} />;
+}
 
 export function DashboardLayout() {
   // session is guaranteed by the route's beforeLoad — no loading gate needed
@@ -58,23 +62,31 @@ export function DashboardLayout() {
     },
   });
 
-  const items: SidebarItem[] = NAV.map((n) => ({
-    name: n.label,
-    iconType: n.icon,
-    isCurrent: pathname === n.href || pathname === `${n.href}/`,
-    onClick: () => navigate({ to: n.href }),
-  }));
-
-  const header = (
-    <div className="mb-4 p-4 pb-0 flex flex-col items-center w-full">
-      <img
-        src="/logo.png"
-        alt="AIOStreams"
-        className="max-w-[90px] max-h-[60px] object-contain p-4"
-      />
-      <span className="text-xs text-gray-500">Dashboard</span>
-    </div>
-  );
+  const items: SidebarItem[] = NAV.map((n) => {
+    const sections = SECTIONED[n.href];
+    if (sections) {
+      const isOn = pathname.startsWith(n.href);
+      return {
+        name: n.label,
+        iconType: n.icon,
+        isCurrent: isOn,
+        expanded: isOn,
+        onClick: () => navigate({ to: n.href }),
+        subItems: sections.map((s) => ({
+          name: s.label,
+          iconType: s.icon,
+          isCurrent: pathname === `${n.href}/${s.id}`,
+          onClick: () => navigate({ to: `${n.href}/${s.id}` }),
+        })),
+      };
+    }
+    return {
+      name: n.label,
+      iconType: n.icon,
+      isCurrent: pathname === n.href || pathname === `${n.href}/`,
+      onClick: () => navigate({ to: n.href }),
+    };
+  });
 
   const footerItems: SidebarItem[] = [
     {
@@ -90,28 +102,33 @@ export function DashboardLayout() {
   ];
 
   return (
-    <AppSidebarProvider>
-      <AppLayout withSidebar sidebarSize="slim">
-        <AppLayoutSidebar>
-          <Sidebar header={header} items={items} footerItems={footerItems} />
-        </AppLayoutSidebar>
-        <AppLayout>
-          <AppLayoutContent>
-            <div
-              data-dashboard-top-navbar
-              className="lg:hidden w-full h-[5rem] relative overflow-hidden flex items-center gap-3 px-4"
-            >
-              <AppSidebarTrigger />
-              <span className="text-sm font-medium text-[--muted]">
-                Dashboard
-              </span>
-              <LayoutHeaderBackground />
-            </div>
-            <Outlet />
-          </AppLayoutContent>
+    <DashboardCommandPaletteProvider>
+      <AppSidebarProvider>
+        <AppLayout withSidebar sidebarSize="slim">
+          <AppLayoutSidebar>
+            <Sidebar
+              header={<SidebarHeader />}
+              items={items}
+              footerItems={footerItems}
+            />
+          </AppLayoutSidebar>
+          <AppLayout>
+            <AppLayoutContent>
+              <div
+                data-dashboard-top-navbar
+                className="lg:hidden w-full h-[5rem] relative overflow-hidden flex items-center gap-3 px-4"
+              >
+                <AppSidebarTrigger />
+                <MobileSearchBar />
+                <LayoutHeaderBackground />
+              </div>
+              <Outlet />
+            </AppLayoutContent>
+          </AppLayout>
         </AppLayout>
-      </AppLayout>
-      <ConfirmationDialog {...confirmSignOut} />
-    </AppSidebarProvider>
+        <ConfirmationDialog {...confirmSignOut} />
+      </AppSidebarProvider>
+      <DashboardCommandPalette />
+    </DashboardCommandPaletteProvider>
   );
 }

@@ -190,31 +190,39 @@ export class NekoBtStreamParser extends BuiltinStreamParser {
         }
       }
       // audio languages
-      [...(fileMetadata.audioLanguages ?? [])]
+      const normalizedAudioLanguages = [...(fileMetadata.audioLanguages ?? [])]
         .map(NekoBtStreamParser.normalizeNekoBtLangCode)
         .map(mapLanguageCode)
         .map(convertLangCodeToName)
-        .forEach((lang: string | undefined) => {
-          if (lang && !parsedFile.languages?.includes(lang)) {
-            parsedFile.languages = parsedFile.languages || [];
-            parsedFile.languages.push(lang);
-          }
-        });
+        .filter((lang): lang is string => !!lang);
+      if (normalizedAudioLanguages.length > 0) {
+        parsedFile.mediaInfoQuality = 'indexer';
+      }
+      normalizedAudioLanguages.forEach((lang) => {
+        if (!parsedFile.languages?.includes(lang)) {
+          parsedFile.languages = parsedFile.languages || [];
+          parsedFile.languages.push(lang);
+        }
+      });
 
       // subtitle languages (includes fansubs)
-      [
+      const normalizedSubtitleLanguages = [
         ...(fileMetadata.fansubLanguages ?? []),
         ...(fileMetadata.subtitleLanguages ?? []),
       ]
         .map(NekoBtStreamParser.normalizeNekoBtLangCode)
         .map(mapLanguageCode)
         .map(convertLangCodeToName)
-        .forEach((lang: string | undefined) => {
-          if (lang && !parsedFile.subtitles?.includes(lang)) {
-            parsedFile.subtitles = parsedFile.subtitles || [];
-            parsedFile.subtitles.push(lang);
-          }
-        });
+        .filter((lang): lang is string => !!lang);
+      if (normalizedSubtitleLanguages.length > 0) {
+        parsedFile.mediaInfoQuality = 'indexer';
+      }
+      normalizedSubtitleLanguages.forEach((lang) => {
+        if (!parsedFile.subtitles?.includes(lang)) {
+          parsedFile.subtitles = parsedFile.subtitles || [];
+          parsedFile.subtitles.push(lang);
+        }
+      });
     }
 
     // add back after parsing so it is not interfering with filename parsing.
@@ -290,7 +298,7 @@ export class NekoBtPreset extends TorznabPreset {
         id: 'searchMode',
         name: 'Search Mode',
         description:
-          'The search mode to use when querying the nekoBT endpoint. **Note**: `Both` will result in two addons being created, one for each search mode.',
+          '`Auto` searches by ID (TVDB/IMDb/TMDB + season/episode) when the indexer supports it; `Forced Query` always searches by title text instead. **Note**: `Both` creates two separate addons, one per mode.',
         type: 'select',
         required: false,
         showInSimpleMode: false,

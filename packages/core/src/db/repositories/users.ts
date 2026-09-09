@@ -3,11 +3,13 @@ import { getDb } from '../db.js';
 import { sql } from '../sql.js';
 import { config as appConfig } from '../../config/index.js';
 import {
+  Cache,
   decryptString,
   deriveKey,
   encryptString,
   generateUUID,
   getTextHash,
+  getSimpleTextHash,
   createLogger,
   constants,
   Env,
@@ -17,6 +19,9 @@ import {
   mergeConfigs,
   assertConfigAccessKey,
 } from '../../utils/index.js';
+import { ConfigProfileRepository } from './config-profiles.js';
+import { ConfigSessionRepository } from './config-sessions.js';
+import { LinkedAccountRepository } from './linked-accounts.js';
 
 const APIError = constants.APIError;
 const logger = createLogger('users');
@@ -42,6 +47,33 @@ function toDateString(v: unknown): string {
   return String(v);
 }
 
+interface ConfigKeyEntry {
+  /** Row values the entry was derived from; a change to either invalidates it. */
+  passwordHash: string;
+  configSalt: string;
+  /** Hex, so the entry survives serialisation as a plain value. */
+  key: string;
+}
+
+const CONFIG_KEY_CACHE_TTL = 30 * 60;
+
+const configKeyCache = Cache.getInstance<string, string>('config-key', 5000);
+
+let trustedUuidsSource: string | null | undefined;
+let trustedUuidPatterns: RegExp[] = [];
+
+/** Recompiles only when the configured list changes, not per request. */
+export function isTrustedUuid(uuid: string): boolean {
+  const source = appConfig.userLimits.trusted.uuids;
+  if (source !== trustedUuidsSource) {
+    trustedUuidsSource = source;
+    trustedUuidPatterns = source
+      ? source.split(',').map((pattern) => new RegExp(pattern))
+      : [];
+  }
+  return trustedUuidPatterns.some((pattern) => pattern.test(uuid));
+}
+
 export class UserRepository {
   static async createUser(
     config: UserData,
@@ -53,6 +85,10 @@ export class UserRepository {
     assertConfigAccessKey(config);
     config.trusted = false;
     config.ip = undefined;
+    config.activeVariants = undefined;
+    config.autoVariants = undefined;
+    config.healthResults = undefined;
+    config.variantSelectorLocation = undefined;
 
     let configToValidate: UserData = config;
     if (config.parentConfig?.uuid) {
@@ -165,6 +201,9 @@ export class UserRepository {
             config.parentConfig.password
           );
           config = mergeConfigs(parent, config);
+          // mergeConfigs starts from the child, so trust has to be carried
+          // over by hand, the way both save paths already do it.
+          config.trusted = parent.trusted || config.trusted;
           logger.info(
             `Merged parent config ${config.parentConfig!.uuid} for user ${uuid}`
           );
@@ -199,28 +238,93 @@ export class UserRepository {
       throw new APIError(constants.ErrorCode.USER_INVALID_DETAILS);
     }
 
+    const key = await this.resolveConfigKey(uuid, password, row);
+
     await db.exec(
       sql`UPDATE users SET accessed_at = CURRENT_TIMESTAMP WHERE uuid = ${uuid}`
     );
 
+    const decryptedConfig = this.decryptConfigWithKey(row.config, key);
+
+    decryptedConfig.trusted = isTrustedUuid(uuid);
+    decryptedConfig.uuid = uuid;
+    decryptedConfig.ip = undefined;
+    decryptedConfig.activeVariants = undefined;
+    decryptedConfig.autoVariants = undefined;
+    decryptedConfig.healthResults = undefined;
+    decryptedConfig.variantSelectorLocation = undefined;
+    return applyMigrations(decryptedConfig);
+  }
+
+  /**
+   * Verifies the password and returns the key its config is encrypted with.
+   */
+  private static async resolveConfigKey(
+    uuid: string,
+    password: string,
+    row: UserRow
+  ): Promise<Buffer> {
+    const cacheKey = `${uuid}:${getSimpleTextHash(
+      `${password}:${appConfig.bootstrap.secretKey}`
+    )}`;
+    const cached = await this.readCachedConfigKey(cacheKey, row);
+    if (cached) {
+      return cached;
+    }
+
     const isValid = await verifyHash(password, row.password_hash);
     if (!isValid) {
+      await configKeyCache.delete(cacheKey);
       throw new APIError(constants.ErrorCode.USER_INVALID_DETAILS);
     }
 
-    const decryptedConfig = await this.decryptConfig(
-      row.config,
-      password,
+    const { key } = await deriveKey(
+      `${password}:${appConfig.bootstrap.secretKey}`,
       row.config_salt
     );
 
-    decryptedConfig.trusted =
-      appConfig.userLimits.trusted.uuids
-        ?.split(',')
-        .some((u) => new RegExp(u).test(uuid)) ?? false;
-    decryptedConfig.uuid = uuid;
-    decryptedConfig.ip = undefined;
-    return applyMigrations(decryptedConfig);
+    const entry: ConfigKeyEntry = {
+      passwordHash: row.password_hash,
+      configSalt: row.config_salt,
+      key: key.toString('hex'),
+    };
+    const encrypted = encryptString(JSON.stringify(entry));
+    if (encrypted.success) {
+      await configKeyCache.set(cacheKey, encrypted.data, CONFIG_KEY_CACHE_TTL);
+    }
+
+    return key;
+  }
+
+  /**
+   * Returns the cached key only when it still matches the stored row. Anything
+   * unreadable is dropped rather than reported.
+   */
+  private static async readCachedConfigKey(
+    cacheKey: string,
+    row: UserRow
+  ): Promise<Buffer | undefined> {
+    const cached = await configKeyCache.get(cacheKey);
+    if (!cached) return undefined;
+
+    try {
+      const { success, data } = decryptString(cached);
+      if (!success || !data) {
+        await configKeyCache.delete(cacheKey);
+        return undefined;
+      }
+      const entry = JSON.parse(data) as ConfigKeyEntry;
+      if (
+        entry.passwordHash !== row.password_hash ||
+        entry.configSalt !== row.config_salt
+      ) {
+        return undefined;
+      }
+      return Buffer.from(entry.key, 'hex');
+    } catch {
+      await configKeyCache.delete(cacheKey);
+      return undefined;
+    }
   }
 
   static async verifyUser(
@@ -262,11 +366,12 @@ export class UserRepository {
       throw new APIError(constants.ErrorCode.PARENT_CONFIG_SELF_REFERENCE);
     }
     assertConfigAccessKey(config);
-    config.trusted =
-      appConfig.userLimits.trusted.uuids
-        ?.split(',')
-        .some((u) => new RegExp(u).test(uuid)) ?? false;
+    config.trusted = isTrustedUuid(uuid);
     config.ip = undefined;
+    config.activeVariants = undefined;
+    config.autoVariants = undefined;
+    config.healthResults = undefined;
+    config.variantSelectorLocation = undefined;
 
     const db = getDb();
     const current = await db.maybeOne<UserRow>(
@@ -439,6 +544,20 @@ export class UserRepository {
                   updated_at = CURRENT_TIMESTAMP
               WHERE uuid = ${uuid}`
         );
+        // Saved configurations hold the same blob as the install URL, so they
+        // break on the next password change unless rotated with it.
+        await ConfigProfileRepository.reencryptForUuid(
+          tx,
+          uuid,
+          newEncryptedPasswordToken
+        );
+        await LinkedAccountRepository.rewriteManifestUrlsForUuid(
+          tx,
+          uuid,
+          newEncryptedPasswordToken
+        );
+        // Not rotated like the above: a password change ends them everywhere.
+        await ConfigSessionRepository.deleteAllForUuid(uuid, tx);
       });
       logger.info(`Changed password for user ${uuid}`);
       return { encryptedPassword: newEncryptedPasswordToken };
@@ -477,6 +596,13 @@ export class UserRepository {
       `${password}:${appConfig.bootstrap.secretKey}`,
       salt
     );
+    return this.decryptConfigWithKey(encryptedConfig, key);
+  }
+
+  private static decryptConfigWithKey(
+    encryptedConfig: string,
+    key: Buffer
+  ): UserData {
     const { success, data: decryptedString } = decryptString(
       encryptedConfig,
       key

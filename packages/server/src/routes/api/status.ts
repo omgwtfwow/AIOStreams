@@ -9,7 +9,7 @@ import {
 } from '@aiostreams/core';
 import { StatusResponse } from '@aiostreams/core';
 import { encryptString } from '@aiostreams/core';
-import { RegexAccess, FeatureControl } from '@aiostreams/core';
+import { RegexAccess, FeatureControl, isOidcAvailable } from '@aiostreams/core';
 import { createResponse } from '../../utils/responses.js';
 import { getSeanimeExtensionVersion } from '../../utils/seanime.js';
 
@@ -43,7 +43,28 @@ const statusInfo = async (): Promise<StatusResponse> => {
           : undefined,
       alternateDesign: appConfig.branding.alternateDesign,
       protected: appConfig.api.authRequired,
-      tmdbApiAvailable: !!appConfig.metadata.tmdb.accessToken,
+      community: {
+        formatters: appConfig.community.formatters,
+        templates: appConfig.community.templates,
+        minAccountAge: appConfig.community.minAccountAge,
+      },
+      // Public endpoint: the button renders pre-auth, so nothing identifying
+      // the provider goes here.
+      oidc: {
+        enabled: isOidcAvailable(),
+        buttonLabel: appConfig.oidc.buttonLabel,
+        autoRedirect: appConfig.oidc.autoRedirect,
+        localLoginEnabled: appConfig.oidc.allowLocalLogin,
+      },
+      metadata: {
+        tmdb: {
+          accessToken: !!appConfig.metadata.tmdb.accessToken,
+          apiKey: !!appConfig.metadata.tmdb.apiKey,
+        },
+        tvdb: {
+          apiKey: !!appConfig.metadata.tvdb.apiKey,
+        },
+      },
       regexAccess: {
         level: appConfig.userLimits.regex.access,
         ...allowedRegexes,
@@ -52,13 +73,33 @@ const statusInfo = async (): Promise<StatusResponse> => {
         level: appConfig.userLimits.sel.access,
         trustedUrls: SelAccess.getAllowedUrls(),
       },
+      variants: {
+        access: appConfig.userLimits.variants.access,
+        max: appConfig.userLimits.variants.max,
+        maxScriptLength: appConfig.userLimits.variants.maxScriptLength,
+        maxInstructions: appConfig.userLimits.variants.maxInstructions,
+        maxActive: appConfig.userLimits.variants.maxActive,
+        maxValueDepth: appConfig.userLimits.variants.maxValueDepth,
+        maxPathSegments: appConfig.userLimits.variants.maxPathSegments,
+        maxPathMatches: appConfig.userLimits.variants.maxPathMatches,
+      },
+      healthChecks: {
+        access: appConfig.userLimits.healthChecks.access,
+        max: appConfig.userLimits.healthChecks.max,
+        minTtl: appConfig.userLimits.healthChecks.minTtl,
+        maxTimeout: appConfig.userLimits.healthChecks.maxTimeout,
+        maxBytes: appConfig.userLimits.healthChecks.maxBytes,
+        allowPrivateUrls: appConfig.userLimits.healthChecks.allowPrivateUrls,
+      },
       loggingSensitiveInfo: appConfig.logging.logSensitiveInfo,
       searchApiDisabled: !appConfig.api.enableSearchApi,
+      nabApiDisabled: !appConfig.api.enableNabApi,
       seanimeExtensionVersion: getSeanimeExtensionVersion(),
       analyticsEnabled: appConfig.analytics.enabled !== false,
       userAnalyticsEnabled:
         appConfig.analytics.enabled !== false &&
         appConfig.analytics.userAnalyticsEnabled === true,
+      configSessionsEnabled: appConfig.api.configSessionsEnabled !== false,
       forced: {
         proxy: {
           enabled: appConfig.proxy.force.enabled ?? null,
@@ -121,7 +162,8 @@ const statusInfo = async (): Promise<StatusResponse> => {
         maxStreamExpressionsTotalCharacters:
           appConfig.userLimits.sel.maxExpressionCharacters,
         maxAddons: appConfig.userLimits.maxAddons,
-        maxNzbFailoverCount: appConfig.userLimits.maxNzbFailoverCount,
+        maxFailoverAttempts: appConfig.userLimits.maxFailoverAttempts,
+        maxParallelAttempts: appConfig.userLimits.maxParallelAttempts,
         maxBackgroundPings: appConfig.userLimits.maxBackgroundPings,
       },
     },

@@ -59,7 +59,7 @@ export class SeaDexAddon extends BaseDebridAddon<SeaDexAddonConfig> {
     const animeDb = AnimeDatabase.getInstance();
     const season = parsedId.season ? Number(parsedId.season) : undefined;
     const episode = parsedId.episode ? Number(parsedId.episode) : undefined;
-    const animeEntry = animeDb.getEntryById(
+    const animeEntry = await animeDb.getEntryById(
       parsedId.type,
       parsedId.value,
       season,
@@ -109,10 +109,7 @@ export class SeaDexAddon extends BaseDebridAddon<SeaDexAddonConfig> {
           continue;
         }
 
-        const totalSize = torrent.files.reduce(
-          (sum, file) => sum + file.length,
-          0
-        );
+        const totalSize = torrent.size;
 
         const created = torrent.created ? new Date(torrent.created) : undefined;
         const age = created

@@ -5,6 +5,7 @@ import { Switch } from '../../../ui/switch';
 import { Select } from '../../../ui/select';
 import { Combobox } from '../../../ui/combobox';
 import { NumberInput } from '../../../ui/number-input/number-input';
+import { DurationInput } from '../../../ui/duration-input';
 import {
   ServiceId,
   BUILTIN_SUPPORTED_SERVICES,
@@ -133,61 +134,237 @@ export function BuiltinSettings() {
       </SettingsCard>
 
       <SettingsCard
-        title="NZB Failover"
-        id="nzbFailover"
-        description="When a Usenet stream fails to play, AIOStreams will automatically try the next best NZB URLs from your sorted results. Only applies to built-in Usenet addons."
+        title="Failover"
+        id="failover"
+        description="When a stream fails to play, AIOStreams automatically tries the next best result from your sorted list. Works with built-in Usenet and debrid results (those AIOStreams resolves itself)."
       >
+        {/* --- Enable --- */}
         <Switch
           label="Enable"
           side="right"
-          value={userData.nzbFailover?.enabled ?? false}
+          value={userData.failover?.enabled ?? false}
           onValueChange={(value) => {
             setUserData((prev) => ({
               ...prev,
-              nzbFailover: { ...prev.nzbFailover, enabled: value },
+              failover: { ...prev.failover, enabled: value },
+            }));
+          }}
+        />
+        {/* --- What can be a failover target (scope) --- */}
+        <Combobox
+          label="Failover Content Types"
+          help="Which kinds of result may be used as failover targets."
+          disabled={!userData.failover?.enabled}
+          options={[
+            { label: 'Usenet', value: 'usenet', textValue: 'Usenet' },
+            { label: 'Debrid', value: 'debrid', textValue: 'Debrid' },
+          ]}
+          multiple
+          emptyMessage="Select at least one content type"
+          value={userData.failover?.contentTypes ?? ['usenet']}
+          onValueChange={(value) => {
+            setUserData((prev) => ({
+              ...prev,
+              failover: {
+                ...prev.failover,
+                contentTypes: value as ('usenet' | 'debrid')[],
+              },
+            }));
+          }}
+        />
+        <Switch
+          label="Allow Cross-Type Failover"
+          side="right"
+          disabled={!userData.failover?.enabled}
+          help="Allow a click on one kind (e.g. Usenet) to fall through into a different kind (e.g. debrid) that is next in the ranked list. When off, failover stays within the clicked item's own kind."
+          value={userData.failover?.allowCrossType ?? false}
+          onValueChange={(value) => {
+            setUserData((prev) => ({
+              ...prev,
+              failover: { ...prev.failover, allowCrossType: value },
+            }));
+          }}
+        />
+        <Switch
+          label="Include External Addon Targets"
+          side="right"
+          disabled={!userData.failover?.enabled}
+          help="Also use non-owned debrid links from external addons (on the addon's own host) as failover targets. These are resolved by probing: a redirect to the addon's own host is treated as a dead link, a redirect to a CDN as success. A direct click on an external stream still won't fail over."
+          value={userData.failover?.includeExternalFailover ?? false}
+          onValueChange={(value) => {
+            setUserData((prev) => ({
+              ...prev,
+              failover: { ...prev.failover, includeExternalFailover: value },
+            }));
+          }}
+        />
+        {/* --- How many to try (budget) --- */}
+        <NumberInput
+          label="Max Failover Attempts"
+          help={
+            <>
+              How many unique fallback results to try before giving up. Maximum
+              is set by <code>MAX_FAILOVER_ATTEMPTS</code> (currently{' '}
+              {status?.settings?.limits?.maxFailoverAttempts ?? 5}).
+            </>
+          }
+          min={1}
+          max={status?.settings?.limits?.maxFailoverAttempts ?? 5}
+          defaultValue={3}
+          disabled={!userData.failover?.enabled}
+          value={userData.failover?.maxAttempts ?? 3}
+          onValueChange={(value) => {
+            const maxCount = status?.settings?.limits?.maxFailoverAttempts ?? 5;
+            setUserData((prev) => ({
+              ...prev,
+              failover: {
+                ...prev.failover,
+                maxAttempts: Math.min(
+                  maxCount,
+                  Math.max(1, Number(value || 3))
+                ),
+              },
             }));
           }}
         />
         <NumberInput
-          label="Fallback Count"
+          label="Same-Release Failover Attempts"
+          help="How many alternative sources of the SAME release (harvested by deduplicator merging) to try per release before moving to a different release. 0 disables same-release failover. Bounded by the overall Max Failover Attempts."
+          min={0}
+          max={status?.settings?.limits?.maxFailoverAttempts ?? 5}
+          defaultValue={2}
+          disabled={!userData.failover?.enabled}
+          value={userData.failover?.sameReleaseLimit ?? 2}
+          onValueChange={(value) => {
+            const maxCount = status?.settings?.limits?.maxFailoverAttempts ?? 5;
+            setUserData((prev) => ({
+              ...prev,
+              failover: {
+                ...prev.failover,
+                sameReleaseLimit: Math.min(
+                  maxCount,
+                  Math.max(0, Number(value ?? 2))
+                ),
+              },
+            }));
+          }}
+        />
+        {/* --- How to run them (concurrency + timing) --- */}
+        <NumberInput
+          label="Parallel Attempts"
           help={
             <>
-              How many fallback NZB URLs to try before giving up. Maximum is set
-              by <code>MAX_NZB_FAILOVER_COUNT</code> (currently{' '}
-              {status?.settings?.limits?.maxNzbFailoverCount ?? 5}).
+              How many attempts to run at once. 1 keeps the classic sequential
+              behaviour (try one, then the next). Higher values race several
+              attempts and take the first that proves healthy; the losing
+              attempts are cancelled and cleaned up (usenet probes are aborted;
+              debrid downloads added by a loser are removed, except private
+              torrents). Maximum is set by <code>MAX_PARALLEL_ATTEMPTS</code>{' '}
+              (currently {status?.settings?.limits?.maxParallelAttempts ?? 2}).
             </>
           }
           min={1}
-          max={status?.settings?.limits?.maxNzbFailoverCount ?? 5}
-          defaultValue={3}
-          disabled={!userData.nzbFailover?.enabled}
-          value={userData.nzbFailover?.count ?? 3}
+          max={status?.settings?.limits?.maxParallelAttempts ?? 2}
+          defaultValue={1}
+          disabled={!userData.failover?.enabled}
+          value={userData.failover?.parallel ?? 1}
           onValueChange={(value) => {
-            const maxCount = status?.settings?.limits?.maxNzbFailoverCount ?? 5;
+            const maxParallel =
+              status?.settings?.limits?.maxParallelAttempts ?? 2;
             setUserData((prev) => ({
               ...prev,
-              nzbFailover: {
-                ...prev.nzbFailover,
-                count: Math.min(maxCount, Math.max(1, Number(value || 3))),
+              failover: {
+                ...prev.failover,
+                parallel: Math.min(
+                  maxParallel,
+                  Math.max(1, Number(value || 1))
+                ),
               },
+            }));
+          }}
+        />
+        {(userData.failover?.parallel ?? 1) > 1 && (
+          <>
+            <DurationInput
+              label="Backup delay"
+              help="How long the clicked item runs alone before backups start in parallel. A head start that keeps provider load down. Accepts values like 1.5s or 500ms."
+              disabled={!userData.failover?.enabled}
+              value={userData.failover?.staggerMs ?? 1000}
+              onValueChange={(ms) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  failover: { ...prev.failover, staggerMs: ms },
+                }));
+              }}
+            />
+            <DurationInput
+              label="Same-release backup delay"
+              help="Like Backup delay, but between attempts for the SAME release (alternative sources of the clicked release, harvested by deduplicator merging). These are essentially the same release, so no head start is needed — defaults to 0."
+              disabled={!userData.failover?.enabled}
+              value={userData.failover?.duplicateStaggerMs ?? 0}
+              onValueChange={(ms) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  failover: { ...prev.failover, duplicateStaggerMs: ms },
+                }));
+              }}
+            />
+            <DurationInput
+              label="Preferred-item grace"
+              help="Once a backup is healthy, how long to wait for the item you actually clicked (or a higher-ranked one still in flight) to catch up before settling for the backup. 0 = take the first healthy result."
+              disabled={!userData.failover?.enabled}
+              value={userData.failover?.preferredGraceMs ?? 2000}
+              onValueChange={(ms) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  failover: { ...prev.failover, preferredGraceMs: ms },
+                }));
+              }}
+            />
+            <DurationInput
+              label="Max wait"
+              help="Overall deadline for the parallel chain before giving up and serving an error."
+              min={1000}
+              disabled={!userData.failover?.enabled}
+              value={userData.failover?.maxWaitMs ?? 30000}
+              onValueChange={(ms) => {
+                setUserData((prev) => ({
+                  ...prev,
+                  failover: { ...prev.failover, maxWaitMs: ms },
+                }));
+              }}
+            />
+          </>
+        )}
+        {/* --- Advanced --- */}
+        <Switch
+          label="During Pre-cache"
+          side="right"
+          disabled={!userData.failover?.enabled}
+          help="Also apply failover when pre-caching the next episode's streams in the background. When off, pre-cache requests skip failover entirely."
+          value={userData.failover?.precacheFailover ?? false}
+          onValueChange={(value) => {
+            setUserData((prev) => ({
+              ...prev,
+              failover: { ...prev.failover, precacheFailover: value },
             }));
           }}
         />
         <Select
           label="Failover Position"
-          disabled={!userData.nzbFailover?.enabled}
-          help="Where in the processing pipeline the fallback list is built. All positions are after sorting. Earlier positions draw from a larger pool of streams but may include streams that would later be removed by limits or SEL filters."
+          disabled={!userData.failover?.enabled}
+          help="Where in the processing pipeline the fallback chain is built. All positions are after sorting. Earlier positions draw from a larger pool of streams but may include streams that would later be removed by SEL filters or limits."
           options={[
-            { label: 'Before Limiting', value: 'beforeLimiting' },
             { label: 'Before SEL', value: 'beforeSEL' },
+            { label: 'Before Limiting', value: 'beforeLimiting' },
             { label: 'Last (default)', value: 'last' },
           ]}
-          value={userData.nzbFailover?.position ?? 'last'}
+          value={userData.failover?.position ?? 'last'}
           onValueChange={(value) => {
             setUserData((prev) => ({
               ...prev,
-              nzbFailover: {
-                ...prev.nzbFailover,
+              failover: {
+                ...prev.failover,
                 position: value as 'beforeLimiting' | 'beforeSEL' | 'last',
               },
             }));

@@ -3,30 +3,28 @@ import {
   APIError,
   constants,
   createLogger,
-  formatZodError,
+  createProxy,
   DebridError,
-  PlaybackInfoSchema,
-  getDebridService,
-  ServiceAuthSchema,
-  fromUrlSafeBase64,
-  Cache,
-  PlaybackInfo,
-  ServiceAuth,
-  decryptString,
-  metadataStore,
-  fileInfoStore,
-  TitleMetadata,
-  FileInfoSchema,
+  decodeFallbackKey,
+  decodeFileInfo,
+  describeChainItem,
+  getPlayChain,
+  parsePlaybackUrl,
+  resolvePlaybackTarget,
+  resolveExternalTarget,
+  runPlayChain,
   getSimpleTextHash,
-  FileInfo,
-  maskSensitiveInfo,
-  getNzbFallbacks,
-  isNzbRetryableError,
   DistributedLock,
-  type NzbFallback,
+  type FailoverAttempt,
+  type FailoverContentType,
+  type PlayChainItem,
+  maskSensitiveInfo,
 } from '@aiostreams/core';
 import { ZodError } from 'zod';
-import { StaticFiles } from '../../app.js';
+import {
+  StaticFiles,
+  mapDebridErrorToStaticFile,
+} from '../../utils/static-errors.js';
 import { corsMiddleware } from '../../middlewares/cors.js';
 const router: Router = Router();
 const logger = createLogger('server');
@@ -44,283 +42,227 @@ router.use((req: Request, res: Response, next: NextFunction) => {
 
 interface PlaybackParams {
   encryptedStoreAuth: string;
+  fallbackKey?: string;
   fileInfo: string;
   metadataId: string;
   filename: string;
 }
 
 router.get(
-  '/playback/:encryptedStoreAuth/:fileInfo/:metadataId/:filename',
+  [
+    '/playback/:encryptedStoreAuth/:fallbackKey/:fileInfo/:metadataId/:filename',
+    // Legacy
+    '/playback/:encryptedStoreAuth/:fileInfo/:metadataId/:filename',
+  ],
   async (req: Request<PlaybackParams>, res: Response, next: NextFunction) => {
     try {
       const {
         encryptedStoreAuth,
-        fileInfo: encodedFileInfo,
+        fallbackKey,
+        fileInfo: fileInfoRaw,
         metadataId,
         filename,
       } = req.params;
 
-      let fileInfo: FileInfo | undefined;
-
-      try {
-        fileInfo = FileInfoSchema.parse(
-          JSON.parse(fromUrlSafeBase64(encodedFileInfo))
+      // Validate the clicked item decodes (preserves the 400 contract) and tells
+      // us which kind it is for cross-type filtering.
+      const fileInfo = await decodeFileInfo(fileInfoRaw);
+      if (!fileInfo) {
+        next(
+          new APIError(
+            constants.ErrorCode.BAD_REQUEST,
+            undefined,
+            'Failed to parse file info and not found in store.'
+          )
         );
-      } catch (error: any) {
-        fileInfo = await fileInfoStore()?.get(encodedFileInfo);
-        if (!fileInfo) {
-          logger.warn(`Could not get file info`, {
-            fileInfo: encodedFileInfo,
-            error,
-            fileInfoStoreAvailable: fileInfoStore() ? true : false,
-          });
-          next(
-            new APIError(
-              constants.ErrorCode.BAD_REQUEST,
-              undefined,
-              'Failed to parse file info and not found in store.'
-            )
+        return;
+      }
+      const clickedType: FailoverContentType =
+        fileInfo.type === 'usenet' ? 'usenet' : 'debrid';
+
+      const decodedFbk = decodeFallbackKey(fallbackKey);
+      const chain = decodedFbk
+        ? await getPlayChain(decodedFbk, clickedType)
+        : undefined;
+      const fallbacks = chain?.fallbacks ?? [];
+      const hasFailover = fallbacks.length > 0;
+
+      if (!hasFailover && !decodedFbk) {
+        logger.debug(
+          { clickedType, hasFallbackKey: !!fallbackKey },
+          'clicked item has no failover chain reference'
+        );
+      }
+
+      const clientIp = req.userIp;
+
+      const arrivedViaOurProxy = !!req.query[constants.INTERNAL_PROXY_MARKER];
+      const proxyConfig = chain?.proxyConfig;
+
+      // Wrap a resolved (CDN) URL in a proxy URL when the source item should be
+      // proxied and we didn't arrive via our proxy. Fail-open to the raw URL.
+      const maybeProxy = async (
+        resolvedUrl: string | undefined,
+        itemProxied: boolean | undefined
+      ): Promise<string | undefined> => {
+        if (!resolvedUrl) return resolvedUrl; // still downloading
+        if (arrivedViaOurProxy || !itemProxied || !proxyConfig?.enabled) {
+          return resolvedUrl;
+        }
+        if (resolvedUrl.includes(constants.BUILTIN_PROXY_PATH_PREFIX)) {
+          return resolvedUrl;
+        }
+        try {
+          const out = await createProxy(proxyConfig).generateUrls([
+            { url: resolvedUrl, filename, type: 'stream' },
+          ]);
+          if (Array.isArray(out) && out[0]) return out[0];
+          logger.warn(
+            { err: out && 'error' in out ? out.error : 'no url returned' },
+            'failed to proxy failover-resolved url; serving raw url'
           );
-          return;
+        } catch (err: any) {
+          logger.warn(
+            { err: err?.message ?? String(err) },
+            'error proxying failover-resolved url; serving raw url'
+          );
         }
-      }
-
-      const decryptedStoreAuth = decryptString(encryptedStoreAuth);
-      if (!decryptedStoreAuth.success) {
-        throw new APIError(
-          constants.ErrorCode.BAD_REQUEST,
-          undefined,
-          'Failed to decrypt store auth'
-        );
-      }
-
-      let storeAuth: ServiceAuth;
-      try {
-        storeAuth = ServiceAuthSchema.parse(
-          JSON.parse(decryptedStoreAuth.data)
-        );
-      } catch (error: any) {
-        logger.warn(`Could not parse decrypted store auth`, {
-          decryptedStoreAuth: maskSensitiveInfo(decryptedStoreAuth.data),
-          error,
-        });
-        throw new APIError(
-          constants.ErrorCode.BAD_REQUEST,
-          undefined,
-          'Failed to parse store auth'
-        );
-      }
-
-      const metadata: TitleMetadata | undefined =
-        await metadataStore().get(metadataId);
-      if (!metadata && !fileInfo.serviceItemId) {
-        throw new APIError(
-          constants.ErrorCode.BAD_REQUEST,
-          undefined,
-          'Metadata not found'
-        );
-      }
-
-      logger.verbose(`Got metadata: ${JSON.stringify(metadata)}`);
-
-      const playbackInfo: PlaybackInfo =
-        fileInfo.type === 'torrent'
-          ? {
-              type: 'torrent',
-              metadata: metadata,
-              title: fileInfo.title,
-              downloadUrl: fileInfo.downloadUrl,
-              hash: fileInfo.hash,
-              private: fileInfo.private,
-              sources: fileInfo.sources,
-              index: fileInfo.index,
-              filename: filename,
-              fileIndex: fileInfo.fileIndex,
-              serviceItemId: fileInfo.serviceItemId,
-            }
-          : {
-              type: 'usenet',
-              metadata: metadata,
-              title: fileInfo.title,
-              hash: fileInfo.hash,
-              nzb: fileInfo.nzb,
-              easynewsUrl: fileInfo.easynewsUrl,
-              index: fileInfo.index,
-              filename: filename,
-              fileIndex: fileInfo.fileIndex,
-              serviceItemId: fileInfo.serviceItemId,
-            };
-
-      const debridInterface = getDebridService(
-        storeAuth.id,
-        storeAuth.credential,
-        req.userIp
-      );
-
-      const fbk = req.query.fbk as string | undefined;
-      const nzbFallbacks: NzbFallback[] = fbk ? await getNzbFallbacks(fbk) : [];
-
-      logger.debug(`Attempting debrid resolve`, {
-        storeAuthId: storeAuth.id,
-        fallbacks: nzbFallbacks.length,
-      });
-
-      const attempts: Array<NzbFallback | null> = [null, ...nzbFallbacks];
-      const isUsenetFailover =
-        fileInfo.type === 'usenet' && nzbFallbacks.length > 0;
-
-      const outerLockKey = `nzb-failover:${storeAuth.id}:${fileInfo.hash ?? metadataId}:${filename}:${req.userIp}:${getSimpleTextHash(storeAuth.credential)}`;
-
-      let encounteredRetryableFailure = false;
-
-      const runFailoverChain = async (): Promise<string | undefined> => {
-        for (let i = 0; i < attempts.length; i++) {
-          const attempt = attempts[i];
-          const isLastAttempt = i === attempts.length - 1;
-
-          const currentPlaybackInfo: PlaybackInfo =
-            attempt !== null
-              ? {
-                  ...(playbackInfo as PlaybackInfo & { type: 'usenet' }),
-                  nzb: attempt.nzbUrl,
-                  hash: attempt.hash,
-                  serviceItemId: undefined,
-                  fileIndex: undefined,
-                  ...(attempt.filename !== undefined && {
-                    filename: attempt.filename,
-                    title: attempt.filename,
-                  }),
-                }
-              : playbackInfo;
-
-          const currentFilename = attempt?.filename ?? filename;
-
-          try {
-            const url = await debridInterface.resolve(
-              currentPlaybackInfo,
-              currentFilename,
-              fileInfo.cacheAndPlay ?? false,
-              fileInfo.autoRemoveDownloads
-            );
-            if (attempt !== null) {
-              logger.info(
-                `[${storeAuth.id}] NZB failover succeeded with fallback NZB`,
-                {
-                  attemptIndex: i,
-                  fallbackNzb: attempt.nzbUrl.substring(0, 80),
-                }
-              );
-            }
-            return url;
-          } catch (error: any) {
-            const isRetryable = isNzbRetryableError(error);
-
-            if (!isRetryable || isLastAttempt) {
-              throw error;
-            }
-
-            encounteredRetryableFailure = true;
-            logger.warn(
-              `[${storeAuth.id}] NZB resolve failed, trying ${
-                attempt === null
-                  ? `first fallback (1 of ${nzbFallbacks.length})`
-                  : `next fallback (${i + 1} of ${nzbFallbacks.length})`
-              }`,
-              { code: error?.code, message: error.message }
-            );
-          }
-        }
-        return undefined;
+        return resolvedUrl; // fail-open
       };
 
-      let streamUrl: string | undefined;
-      let resolveError: Error | undefined;
-      try {
-        if (isUsenetFailover) {
-          const { result } = await DistributedLock.getInstance().withLock(
-            outerLockKey,
-            runFailoverChain,
-            { timeout: 180_000, ttl: 185_000 }
-          );
-          streamUrl = result;
-        } else {
-          streamUrl = await debridInterface.resolve(
-            playbackInfo,
-            filename,
-            fileInfo.cacheAndPlay ?? false,
-            fileInfo.autoRemoveDownloads
-          );
-        }
-      } catch (err: any) {
-        resolveError = err;
-      }
-
-      if (encounteredRetryableFailure) {
-        debridInterface.refreshLibraryCache?.(['nzb']).catch((err) => {
-          logger.warn(
-            `[${storeAuth.id}] Failed to refresh library cache after NZB failover failures`,
-            { error: err?.message }
-          );
-        });
-      }
-
-      if (resolveError) {
-        let staticFile: string = StaticFiles.INTERNAL_SERVER_ERROR;
-        if (resolveError instanceof DebridError) {
-          logger.error(
-            {
-              service: storeAuth.id,
-              err: resolveError,
-            },
-            `error during debrid resolve: ${resolveError.message}`
-          );
-          switch (resolveError.code) {
-            case 'UNAVAILABLE_FOR_LEGAL_REASONS':
-              staticFile = StaticFiles.UNAVAILABLE_FOR_LEGAL_REASONS;
-              break;
-            case 'STORE_LIMIT_EXCEEDED':
-              staticFile = StaticFiles.STORE_LIMIT_EXCEEDED;
-              break;
-            case 'PAYMENT_REQUIRED':
-              staticFile = StaticFiles.PAYMENT_REQUIRED;
-              break;
-            case 'TOO_MANY_REQUESTS':
-              staticFile = StaticFiles.TOO_MANY_REQUESTS;
-              break;
-            case 'FORBIDDEN':
-              staticFile = StaticFiles.FORBIDDEN;
-              break;
-            case 'UNAUTHORIZED':
-              staticFile = StaticFiles.UNAUTHORIZED;
-              break;
-            case 'UNPROCESSABLE_ENTITY':
-            case 'UNSUPPORTED_MEDIA_TYPE':
-            case 'STORE_MAGNET_INVALID':
-              staticFile = StaticFiles.DOWNLOAD_FAILED;
-              break;
-            case 'NO_MATCHING_FILE':
-              staticFile = StaticFiles.NO_MATCHING_FILE;
-              break;
-            default:
-              break;
+      // Resolve a chain item (or variant), branching on owned vs external, then
+      // proxying the result when configured.
+      const resolveTarget =
+        (item: PlayChainItem) =>
+        async (signal?: AbortSignal): Promise<string | undefined> => {
+          if (item.kind === 'external') {
+            return resolveExternalTarget(item.url, { clientIp }, signal).then(
+              (url) => maybeProxy(url, item.proxied)
+            );
           }
-        } else {
-          logger.error(
-            { service: storeAuth.id, err: resolveError },
-            `got unknown error during debrid resolve: ${resolveError.message}`
-          );
-        }
+          const target = parsePlaybackUrl(item.url);
+          return target
+            ? resolvePlaybackTarget(target, { clientIp }, signal).then((url) =>
+                maybeProxy(url, item.proxied)
+              )
+            : Promise.reject(new Error('unparseable fallback url'));
+        };
 
-        res.redirect(307, `/static/${staticFile}`);
+      const attempts: FailoverAttempt[] = [
+        {
+          label: chain?.clicked
+            ? describeChainItem(chain.clicked, 'clicked')
+            : describeChainItem({ type: clickedType, filename }, 'clicked'),
+          rank: 0,
+          resolve: (signal) =>
+            resolvePlaybackTarget(
+              { encryptedStoreAuth, fileInfoRaw, metadataId, filename },
+              { clientIp },
+              signal
+            ).then((url) => maybeProxy(url, chain?.clickedProxied)),
+        },
+        ...fallbacks.map(
+          (f): FailoverAttempt => ({
+            label: describeChainItem(f),
+            rank: f.rank,
+            resolve: resolveTarget(f),
+          })
+        ),
+      ];
+
+      const runCfg = {
+        parallel: chain?.parallel ?? 1,
+        staggerMs: chain?.staggerMs ?? 0,
+        preferredGraceMs: chain?.preferredGraceMs ?? 0,
+        maxWaitMs: chain?.maxWaitMs ?? 60_000,
+        duplicateStaggerMs: chain?.duplicateStaggerMs ?? 0,
+      };
+
+      if (hasFailover) {
+        logger.info(
+          {
+            attempts: attempts.length,
+            parallel: runCfg.parallel,
+            clickedType,
+            chain: attempts.map((a, i) => {
+              const label = a.label ?? 'unknown';
+              // Index 0 is the clicked item, the fallbacks follow in order.
+              // Variants are indented under the release they belong to.
+              return i > 0 && fallbacks[i - 1]?.isVariant
+                ? `  ↳ ${label}`
+                : label;
+            }),
+          },
+          'resolving failover chain'
+        );
+      } else {
+        logger.debug(
+          { clickedType, attempt: attempts[0].label },
+          'no failover targets; resolving the clicked item only'
+        );
+      }
+
+      const run = () => runPlayChain(attempts, runCfg);
+
+      // Share one running chain across concurrent requests for the same click.
+      const result = hasFailover
+        ? (
+            await DistributedLock.getInstance().withLock(
+              `failover:${getSimpleTextHash(
+                encryptedStoreAuth + metadataId + filename + fallbackKey
+              )}:${clientIp ?? '-'}`,
+              run,
+              {
+                timeout: Math.max(runCfg.maxWaitMs, 180_000),
+                ttl: Math.max(runCfg.maxWaitMs, 185_000),
+              }
+            )
+          ).result
+        : await run();
+
+      if (result.error) {
+        const err = result.error;
+        if (err instanceof DebridError) {
+          // A malformed clicked item with no chain to fall back to is a 400,
+          // not a static video.
+          if (err.code === 'BAD_REQUEST' && !hasFailover) {
+            next(
+              new APIError(
+                constants.ErrorCode.BAD_REQUEST,
+                undefined,
+                err.message
+              )
+            );
+            return;
+          }
+          logger.error({ err }, `error during debrid resolve: ${err.message}`);
+          res.redirect(307, `/static/${mapDebridErrorToStaticFile(err.code)}`);
+          return;
+        }
+        logger.error(
+          { err },
+          `got unknown error during debrid resolve: ${err.message}`
+        );
+        res.redirect(307, `/static/${StaticFiles.INTERNAL_SERVER_ERROR}`);
         return;
       }
 
-      if (!streamUrl) {
+      if (!result.url) {
         res.redirect(307, `/static/${StaticFiles.DOWNLOADING}`);
         return;
       }
 
-      res.redirect(307, streamUrl);
+      logger.debug(
+        {
+          url: maskSensitiveInfo(result.url),
+          label: result.label,
+          failedOver: result.failedOver,
+        },
+        'Debrid resolve succeeded, redirecting'
+      );
+
+      res.setHeader('Cache-Control', 'no-store');
+      res.redirect(307, result.url);
     } catch (error: any) {
       if (error instanceof APIError || error instanceof ZodError) {
         next(error);

@@ -125,7 +125,11 @@ export class StremthruTorzPreset extends StremThruPreset {
       return [this.generateAddon(userData, options, [])];
     }
 
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     let serviceIds: (ServiceId | 'p2p')[] =
       usableServices?.map((s) => s.id) || [];
 
@@ -253,6 +257,10 @@ export class StremthruTorzPreset extends StremThruPreset {
 
     if (serviceId === constants.PIKPAK_SERVICE) {
       return { code: 'pp', shortName: 'PKP' };
+    }
+
+    if (serviceId === constants.TORRIN_SERVICE) {
+      return { code: 'ti', shortName: 'TR' };
     }
 
     return {

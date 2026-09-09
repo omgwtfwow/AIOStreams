@@ -22,9 +22,9 @@ const TorBoxApiSuccessResponseSchema = <T>(dataSchema: z.ZodSchema<T>) =>
 
 export const TorBoxApiResponseSchema = <T>(dataSchema: z.ZodSchema<T>) =>
   z.union([
-    TorBoxRateLimitErrorResponseSchema,
     TorBoxApiErrorResponseSchema,
     TorBoxApiSuccessResponseSchema(dataSchema),
+    TorBoxRateLimitErrorResponseSchema,
   ]);
 
 const TorBoxSearchApiMetadataSchema = z.object({

@@ -2,6 +2,7 @@
 import { Cache, appConfig, formatZodError, ParsedId } from '../utils/index.js';
 import { Metadata, MetadataTitle } from './utils.js';
 import { iso6392ToIso6391 } from '../utils/languages.js';
+import { normaliseCountryCode } from '../utils/countries.js';
 import { makeRequest } from '../utils/http.js';
 import { z, ZodError } from 'zod';
 
@@ -114,7 +115,7 @@ const TVDBSeriesSchema = z.object({
   defaultSeasonType: z.number().optional(),
   isOrderRandomized: z.boolean().optional(),
   lastUpdated: z.string(),
-  averageRuntime: z.number().optional(),
+  averageRuntime: z.number().nullable().optional(),
   episodes: z.unknown().nullable().optional(),
   overview: z.string().optional(),
   year: z.string(),
@@ -138,6 +139,64 @@ export const RemoteIdSearchResponseSchema = z.discriminatedUnion('status', [
 
 export const SeriesResponseSchema = z.discriminatedUnion('status', [
   TVDBSuccessSchema(TVDBSeriesRecordSchema),
+  TVDBErrorSchema,
+]);
+
+const TVDBSeasonEpisodeSchema = z.looseObject({
+  number: z.number().optional(),
+  seasonNumber: z.number().optional(),
+  aired: z.string().nullable().optional(),
+  name: z.string().nullable().optional(),
+});
+
+export interface TVDBSeasonEpisode {
+  number: number;
+  seasonNumber: number;
+  aired: string | null;
+  /** Episode name in the series' default language (original for anime). */
+  name?: string;
+}
+
+const SeriesEpisodesResponseSchema = z.discriminatedUnion('status', [
+  z.object({
+    status: z.literal('success'),
+    data: z.looseObject({
+      episodes: z.array(TVDBSeasonEpisodeSchema).nullable().optional(),
+    }),
+    links: z
+      .looseObject({ next: z.string().nullable().optional() })
+      .nullable()
+      .optional(),
+  }),
+  TVDBErrorSchema,
+]);
+
+const SearchResultSchema = z.looseObject({
+  tvdb_id: z.string().optional(),
+  name: z.string().optional(),
+  year: z.string().nullable().optional(),
+  country: z.string().nullable().optional(),
+});
+
+const SearchResponseSchema = z.discriminatedUnion('status', [
+  TVDBSuccessSchema(z.array(SearchResultSchema)),
+  TVDBErrorSchema,
+]);
+
+export interface TVDBSeriesSearchResult {
+  tvdbId: number;
+  name: string;
+  year?: number;
+  country?: string;
+}
+
+const SeriesTranslationResponseSchema = z.discriminatedUnion('status', [
+  z.object({
+    status: z.literal('success'),
+    data: z.looseObject({
+      name: z.string().nullable().optional(),
+    }),
+  }),
   TVDBErrorSchema,
 ]);
 
@@ -168,8 +227,67 @@ export class TVDBMetadata {
     await this.api.ensureToken();
   }
 
+  /**
+   * Builds the series title/alias set, preferring the English translation over
+   * TVDB's original-language `name` for non-English shows (keeping the original
+   * as a searchable alias). English shows skip the extra translation fetch.
+   */
+  private async buildSeriesTitles(
+    seriesId: number,
+    rawName: string,
+    aliases: MetadataTitle[],
+    originalLanguage?: string
+  ): Promise<{ title: string; titles: MetadataTitle[] }> {
+    if (originalLanguage && originalLanguage !== 'eng') {
+      try {
+        const engName = await this.api.getSeriesTranslation(seriesId, 'eng');
+        if (engName && engName !== rawName) {
+          return {
+            title: engName,
+            titles: [{ title: rawName }, ...aliases],
+          };
+        }
+      } catch {
+        // fall through to the raw name
+      }
+    }
+    return { title: rawName, titles: aliases };
+  }
+
   public async validateApiKey() {
     await this.ensureToken();
+  }
+
+  public async getSeasonEpisodes(
+    tvdbId: number,
+    seasonNumber: number
+  ): Promise<TVDBSeasonEpisode[] | undefined> {
+    try {
+      await this.ensureToken();
+      return await this.api.getSeriesEpisodes(tvdbId, seasonNumber);
+    } catch (error) {
+      logger.warn(
+        `Failed to fetch TVDB episodes for series ${tvdbId} season ${seasonNumber}: ${error instanceof Error ? error.message : error}`
+      );
+      return undefined;
+    }
+  }
+
+  public async searchSeries(query: string): Promise<TVDBSeriesSearchResult[]> {
+    await this.ensureToken();
+    const results = await this.api.search(query, 'series');
+    return results
+      .filter((r) => r.tvdb_id && r.name)
+      .map((r) => {
+        const year = r.year ? parseInt(r.year) : undefined;
+        return {
+          tvdbId: parseInt(r.tvdb_id!),
+          name: r.name!,
+          year: year && !Number.isNaN(year) ? year : undefined,
+          country: normaliseCountryCode(r.country),
+        };
+      })
+      .filter((r) => !Number.isNaN(r.tvdbId));
   }
 
   public async getMetadata(id: ParsedId): Promise<Metadata> {
@@ -227,12 +345,18 @@ export class TVDBMetadata {
           series.id.toString(),
           TVDBMetadata.ID_CACHE_TTL
         );
-        return {
-          title: series.name,
-          titles: series.aliases.map((a) => ({
+        const { title, titles } = await this.buildSeriesTitles(
+          series.id,
+          series.name,
+          series.aliases.map((a) => ({
             title: a.name,
             language: iso6392ToIso6391(a.language) || undefined,
           })),
+          series.originalLanguage
+        );
+        return {
+          title,
+          titles,
           year: parseInt(series.year),
           yearEnd: series.lastAired
             ? new Date(series.lastAired).getFullYear()
@@ -243,6 +367,10 @@ export class TVDBMetadata {
           nextAirDate: series.nextAired ?? undefined,
           firstAiredDate: series.firstAired ?? undefined,
           lastAiredDate: series.lastAired ?? undefined,
+          originalLanguage: series.originalLanguage
+            ? iso6392ToIso6391(series.originalLanguage) || undefined
+            : undefined,
+          country: normaliseCountryCode(series.originalCountry),
         };
       } else {
         throw new Error(`Could not find metadata for ${id.value}`);
@@ -271,12 +399,18 @@ export class TVDBMetadata {
           throw new Error(`No series found for TVDB ID ${tvdbId}`);
         }
         const series = response.data;
-        return {
-          title: series.name,
-          titles: series.aliases.map((a) => ({
+        const { title, titles } = await this.buildSeriesTitles(
+          series.id,
+          series.name,
+          series.aliases.map((a) => ({
             title: a.name,
             language: iso6392ToIso6391(a.language) || undefined,
           })),
+          series.originalLanguage
+        );
+        return {
+          title,
+          titles,
           year: parseInt(series.year),
           yearEnd: series.lastAired
             ? new Date(series.lastAired).getFullYear()
@@ -285,6 +419,12 @@ export class TVDBMetadata {
           tmdbId: null,
           runtime: series.averageRuntime ?? undefined,
           nextAirDate: series.nextAired ?? undefined,
+          firstAiredDate: series.firstAired ?? undefined,
+          lastAiredDate: series.lastAired ?? undefined,
+          originalLanguage: series.originalLanguage
+            ? iso6392ToIso6391(series.originalLanguage) || undefined
+            : undefined,
+          country: normaliseCountryCode(series.originalCountry),
         };
       }
     }
@@ -306,6 +446,13 @@ class TVDBApi {
     ),
     // prettier-ignore
     remoteId: Cache.getInstance<string, z.infer<typeof RemoteIdSearchResponseSchema>>('tvdb:remoteId'),
+    // prettier-ignore
+    search: Cache.getInstance<string, z.infer<typeof SearchResultSchema>[]>('tvdb:search'),
+    // prettier-ignore
+    seriesEpisodes: Cache.getInstance<string, TVDBSeasonEpisode[]>('tvdb:seriesEpisodes'),
+    seriesTranslation: Cache.getInstance<string, string | null>(
+      'tvdb:seriesTranslation'
+    ),
   };
 
   constructor(apiKey: string) {
@@ -370,6 +517,26 @@ class TVDBApi {
     );
   }
 
+  public async search(
+    query: string,
+    type: 'series' | 'movie'
+  ): Promise<z.infer<typeof SearchResultSchema>[]> {
+    return this.cache.search.wrap(
+      async () => {
+        logger.debug(`Searching TVDB: ${query} (${type})`);
+        const response = await this.request<
+          z.infer<typeof SearchResponseSchema>
+        >(`/search?query=${encodeURIComponent(query)}&type=${type}`, {
+          schema: SearchResponseSchema,
+          timeout: 5000,
+        });
+        return response.status === 'success' ? response.data : [];
+      },
+      `${type}:${query.toLowerCase()}`,
+      7 * 24 * 60 * 60 // 7 days
+    );
+  }
+
   public async getSeries(
     id: number
   ): Promise<z.infer<typeof SeriesResponseSchema>> {
@@ -385,6 +552,74 @@ class TVDBApi {
         );
       },
       id,
+      7 * 24 * 60 * 60 // 7 days
+    );
+  }
+
+  public async getSeriesEpisodes(
+    id: number,
+    seasonNumber: number
+  ): Promise<TVDBSeasonEpisode[]> {
+    return this.cache.seriesEpisodes.wrap(
+      async () => {
+        logger.debug(
+          `Getting episodes for series ${id} season ${seasonNumber}`
+        );
+        const episodes: TVDBSeasonEpisode[] = [];
+        // links.next signals more pages (page size 500); daily-show seasons fit one page
+        for (let page = 0; page < 10; page++) {
+          const response = await this.request<
+            z.infer<typeof SeriesEpisodesResponseSchema>
+          >(
+            `/series/${id}/episodes/default?season=${seasonNumber}&page=${page}`,
+            {
+              schema: SeriesEpisodesResponseSchema,
+              timeout: 5000,
+            }
+          );
+          if (response.status !== 'success') break;
+          for (const ep of response.data.episodes ?? []) {
+            if (ep.number === undefined || ep.seasonNumber === undefined) {
+              continue;
+            }
+            episodes.push({
+              number: ep.number,
+              seasonNumber: ep.seasonNumber,
+              aired: ep.aired ?? null,
+              name: ep.name ?? undefined,
+            });
+          }
+          if (!response.links?.next) break;
+        }
+        return episodes;
+      },
+      `${id}:${seasonNumber}`,
+      24 * 60 * 60 // 1 day: ongoing daily shows gain an episode per day
+    );
+  }
+
+  /**
+   * The English-translation name for a series. TVDB's default `name` is the
+   * original-language title (e.g. native script for East Asian dramas); the
+   * English title that scene groups use only lives in the translation.
+   */
+  public async getSeriesTranslation(
+    id: number,
+    lang: string = 'eng'
+  ): Promise<string | null> {
+    return this.cache.seriesTranslation.wrap(
+      async () => {
+        const response = await this.request<
+          z.infer<typeof SeriesTranslationResponseSchema>
+        >(`/series/${id}/translations/${lang}`, {
+          schema: SeriesTranslationResponseSchema,
+          timeout: 5000,
+        });
+        return response.status === 'success'
+          ? (response.data.name ?? null)
+          : null;
+      },
+      `${id}:${lang}`,
       7 * 24 * 60 * 60 // 7 days
     );
   }

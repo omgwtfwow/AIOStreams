@@ -1,4 +1,4 @@
-FROM node:24-slim AS base
+FROM node:24.18.1-slim AS base
 
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
@@ -7,6 +7,15 @@ RUN corepack enable
 FROM base AS builder
 
 WORKDIR /build
+
+# Build toolchain for native addons that lack prebuilt binaries on this platform
+# (e.g. yencode, used by the native usenet engine, has no linux/arm64 prebuild and
+# must be compiled with node-gyp → needs Python + a C/C++ toolchain). These tools
+# live only in the builder/runtime stages; the final distroless image just copies
+# the already-compiled .node binaries, so it stays clean.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 make g++ \
+  && rm -rf /var/lib/apt/lists/*
 
 # Copy LICENSE file.
 COPY LICENSE ./
@@ -17,6 +26,7 @@ COPY packages/server/package*.json ./packages/server/
 COPY packages/core/package*.json ./packages/core/
 COPY packages/frontend/package*.json ./packages/frontend/
 COPY packages/seanime-extensions/package*.json ./packages/seanime-extensions/
+COPY packages/crypto/package*.json ./packages/crypto/
 COPY pnpm-workspace.yaml ./pnpm-workspace.yaml
 COPY pnpm-lock.yaml ./pnpm-lock.yaml
 COPY patches ./patches
@@ -31,6 +41,7 @@ COPY packages/server ./packages/server
 COPY packages/core ./packages/core
 COPY packages/frontend ./packages/frontend
 COPY packages/seanime-extensions ./packages/seanime-extensions
+COPY packages/crypto ./packages/crypto
 COPY scripts ./scripts
 COPY resources ./resources
 
@@ -61,6 +72,9 @@ COPY --from=builder /build/patches ./patches
 COPY --from=builder /build/packages/core/package.*json ./packages/core/
 COPY --from=builder /build/packages/server/package.*json ./packages/server/
 
+# Loader + built binary; core's node_modules symlink into packages/ resolves it.
+COPY --from=builder /build/packages/crypto ./packages/crypto
+
 COPY --from=builder /build/packages/core/dist ./packages/core/dist
 COPY --from=builder /build/packages/frontend/dist ./packages/frontend/dist
 COPY --from=builder /build/packages/server/dist ./packages/server/dist
@@ -74,6 +88,13 @@ COPY --from=builder /build/node_modules ./node_modules
 COPY --from=builder /build/packages/core/node_modules ./packages/core/node_modules
 COPY --from=builder /build/packages/server/node_modules ./packages/server/node_modules
 
+
+FROM debian:12-slim AS mimalloc
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends libmimalloc2.0 \
+  && rm -rf /var/lib/apt/lists/* \
+  && cp /usr/lib/*/libmimalloc.so.2 /usr/local/lib/libmimalloc.so.2
+
 FROM gcr.io/distroless/nodejs24-debian12 AS production
 
 ARG OCI_SOURCE="https://github.com/Viren070/AIOStreams"
@@ -81,12 +102,15 @@ ARG OCI_SOURCE="https://github.com/Viren070/AIOStreams"
 LABEL org.opencontainers.image.title="AIOStreams"
 LABEL org.opencontainers.image.source="${OCI_SOURCE}"
 LABEL org.opencontainers.image.description="AIOStreams consolidates multiple Stremio addons and debrid services - including its own suite of built-in addons - into a single, highly customisable super-addon."
-LABEL org.opencontainers.image.licenses="GPL-3.0"
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 
 WORKDIR /app
 
 COPY --from=busybox:1.36.0-uclibc /bin/wget /bin/wget
 COPY --from=busybox:1.36.0-uclibc /bin/sh /bin/sh
+COPY --from=mimalloc /usr/local/lib/libmimalloc.so.2 /usr/local/lib/libmimalloc.so.2
+ENV LD_PRELOAD=/usr/local/lib/libmimalloc.so.2
+ENV NODE_OPTIONS="--max-semi-space-size=8 --expose-gc"
 COPY --from=runtime /runtime /app
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

@@ -31,6 +31,7 @@ import { TbFilterCode } from 'react-icons/tb';
 import { Select } from '../../ui/select';
 import { Combobox } from '../../ui/combobox';
 import { SettingsCard } from '../../shared/settings-card';
+import { Card } from '../../ui/card';
 import {
   RESOLUTIONS,
   QUALITIES,
@@ -42,6 +43,7 @@ import {
   TYPES,
   DEDUPLICATOR_KEYS,
   DEDUPLICATOR_TIEBREAKERS,
+  DEDUPLICATOR_MERGE_FIELDS,
   SMART_DETECT_ATTRIBUTES,
   DEFAULT_SMART_DETECT_ATTRIBUTES,
   AUDIO_CHANNELS,
@@ -101,6 +103,7 @@ import {
   tabsTriggerClass,
   tabsListClass,
   tabsContentClass,
+  tabsGroupClass,
   formatAgeDisplay,
   HeadingWithPageControls,
   deduplicatorMultiGroupBehaviourHelp,
@@ -302,6 +305,7 @@ function Content() {
       <Tabs
         value={tab}
         onValueChange={handleTabChange}
+        variant="pill"
         className={tabsRootClass}
         triggerClass={tabsTriggerClass}
         listClass={tabsListClass}
@@ -309,142 +313,134 @@ function Content() {
       >
         <TabsList className="flex-wrap max-w-full lg:space-y-2">
           <SettingsNavCard>
-            <div className="flex flex-col gap-4 md:flex-row justify-between items-center">
-              <div className="space-y-1 my-2 px-2">
-                <div className="flex items-center gap-2 justify-center md:justify-start">
-                  <h4>Filters</h4>
-                  {hasParent && isInherited('filters') && (
-                    <InheritedBadge section="filters" />
-                  )}
-                </div>
+            <div className="w-full my-2">
+              <div className="flex items-center gap-2 justify-center">
+                <h4>Filters</h4>
+                {hasParent && isInherited('filters') && (
+                  <InheritedBadge section="filters" />
+                )}
               </div>
-              <div></div>
             </div>
 
-            <div className="overflow-x-none overflow-y-scroll lg:overflow-y-hidden h-40 lg:h-auto rounded-[--radius-md] border lg:border-none [--webkit-overflow-scrolling:touch]">
-              <TabsTrigger value="cache">
-                <FaBolt className="text-lg mr-3" />
-                Cache
-              </TabsTrigger>
-
-              <>
+            <div className="overflow-x-none overflow-y-scroll lg:overflow-y-hidden h-40 lg:h-auto rounded-[--radius-md] border lg:border-none lg:space-y-3 [--webkit-overflow-scrolling:touch]">
+              <Card className={tabsGroupClass}>
+                <TabsTrigger value="cache">
+                  <FaBolt className="text-lg mr-3" />
+                  Cache
+                </TabsTrigger>
+                {mode === 'pro' && (
+                  <TabsTrigger value="stream-type">
+                    <MdVideoLibrary className="text-lg mr-3" />
+                    Stream Type
+                  </TabsTrigger>
+                )}
+                <TabsTrigger value="seeders">
+                  <MdPerson className="text-lg mr-3" />
+                  Seeders
+                </TabsTrigger>
+                <TabsTrigger value="age">
+                  <FaClock className="text-lg mr-3" />
+                  Age
+                </TabsTrigger>
+              </Card>
+              <Card className={tabsGroupClass}>
                 <TabsTrigger value="resolution">
                   <BiSolidCameraMovie className="text-lg mr-3" />
                   Resolution
                 </TabsTrigger>
-              </>
-
-              {mode == 'pro' && (
-                <>
-                  <TabsTrigger value="quality">
-                    <MdMovieFilter className="text-lg mr-3" />
-                    Quality
-                  </TabsTrigger>
-                </>
-              )}
-              {mode === 'pro' && (
-                <>
-                  <TabsTrigger value="encode">
-                    <FaFilm className="text-lg mr-3" />
-                    Encode
-                  </TabsTrigger>
-                </>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="stream-type">
-                  <MdVideoLibrary className="text-lg mr-3" />
-                  Stream Type
+                {mode === 'pro' && (
+                  <>
+                    <TabsTrigger value="quality">
+                      <MdMovieFilter className="text-lg mr-3" />
+                      Quality
+                    </TabsTrigger>
+                    <TabsTrigger value="encode">
+                      <FaFilm className="text-lg mr-3" />
+                      Encode
+                    </TabsTrigger>
+                    <TabsTrigger value="visual-tag">
+                      <MdHdrOn className="text-lg mr-3" />
+                      Visual Tag
+                    </TabsTrigger>
+                    <TabsTrigger value="audio-tag">
+                      <BsSpeakerFill className="text-lg mr-3" />
+                      Audio Tag
+                    </TabsTrigger>
+                    <TabsTrigger value="audio-channel">
+                      <MdSurroundSound className="text-lg mr-3" />
+                      Audio Channel
+                    </TabsTrigger>
+                  </>
+                )}
+              </Card>
+              <Card className={tabsGroupClass}>
+                <TabsTrigger value="language">
+                  <FaLanguage className="text-lg mr-3" />
+                  Language
                 </TabsTrigger>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="visual-tag">
-                  <MdHdrOn className="text-lg mr-3" />
-                  Visual Tag
+                <TabsTrigger value="subtitle">
+                  <MdSubtitles className="text-lg mr-3" />
+                  Subtitle
                 </TabsTrigger>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="audio-tag">
-                  <BsSpeakerFill className="text-lg mr-3" />
-                  Audio Tag
+              </Card>
+              <Card className={tabsGroupClass}>
+                <TabsTrigger value="size">
+                  <GoFileBinary className="text-lg mr-3" />
+                  Size
                 </TabsTrigger>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="audio-channel">
-                  <MdSurroundSound className="text-lg mr-3" />
-                  Audio Channel
+                <TabsTrigger value="bitrate">
+                  <FaTachometerAlt className="text-lg mr-3" />
+                  Bitrate
                 </TabsTrigger>
-              )}
-              <TabsTrigger value="language">
-                <FaLanguage className="text-lg mr-3" />
-                Language
-              </TabsTrigger>
-              <TabsTrigger value="subtitle">
-                <MdSubtitles className="text-lg mr-3" />
-                Subtitle
-              </TabsTrigger>
-              <TabsTrigger value="seeders">
-                <MdPerson className="text-lg mr-3" />
-                Seeders
-              </TabsTrigger>
-              <TabsTrigger value="age">
-                <FaClock className="text-lg mr-3" />
-                Age
-              </TabsTrigger>
+              </Card>
               {mode === 'pro' && (
-                <>
+                <Card className={tabsGroupClass}>
                   <TabsTrigger value="matching">
                     <FaEquals className="text-lg mr-3" />
                     Matching
                   </TabsTrigger>
-                </>
+                </Card>
               )}
               {mode === 'pro' && (
-                <TabsTrigger value="keyword">
-                  <MdTextFields className="text-lg mr-3" />
-                  Keyword
-                </TabsTrigger>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="release-group">
-                  <FaTextSlash className="text-lg mr-3" />
-                  Release Group
-                </TabsTrigger>
-              )}
-              {mode === 'pro' && (
-                <TabsTrigger value="stream-expression">
-                  <TbFilterCode className="text-lg mr-3" />
-                  Stream Expression
-                </TabsTrigger>
-              )}
-              {(status?.settings.regexAccess.level !== 'none' ||
-                (status?.settings.regexAccess.patterns?.length ?? 0) > 0 ||
-                (status?.settings.regexAccess.urls?.length ?? 0) > 0) &&
-                mode === 'pro' && (
-                  <TabsTrigger value="regex">
-                    <BsRegex className="text-lg mr-3" />
-                    Regex
+                <Card className={tabsGroupClass}>
+                  <TabsTrigger value="keyword">
+                    <MdTextFields className="text-lg mr-3" />
+                    Keyword
                   </TabsTrigger>
-                )}
-              <TabsTrigger value="size">
-                <GoFileBinary className="text-lg mr-3" />
-                Size
-              </TabsTrigger>
-              <TabsTrigger value="bitrate">
-                <FaTachometerAlt className="text-lg mr-3" />
-                Bitrate
-              </TabsTrigger>
-              <TabsTrigger value="limit">
-                <GoContainer className="text-lg mr-3" />
-                Result Limits
-              </TabsTrigger>
-              <TabsTrigger value="deduplicator">
-                <MdCleaningServices className="text-lg mr-3" />
-                Deduplicator
-              </TabsTrigger>
-              <TabsTrigger value="miscellaneous">
-                <MdMiscellaneousServices className="text-lg mr-3" />
-                Miscellaneous
-              </TabsTrigger>
+                  <TabsTrigger value="release-group">
+                    <FaTextSlash className="text-lg mr-3" />
+                    Release Group
+                  </TabsTrigger>
+                  <TabsTrigger value="stream-expression">
+                    <TbFilterCode className="text-lg mr-3" />
+                    Stream Expression
+                  </TabsTrigger>
+                  {(status?.settings.regexAccess.level !== 'none' ||
+                    (status?.settings.regexAccess.patterns?.length ?? 0) > 0 ||
+                    (status?.settings.regexAccess.urls?.length ?? 0) > 0) && (
+                    <TabsTrigger value="regex">
+                      <BsRegex className="text-lg mr-3" />
+                      Regex
+                    </TabsTrigger>
+                  )}
+                </Card>
+              )}
+              <Card className={tabsGroupClass}>
+                <TabsTrigger value="limit">
+                  <GoContainer className="text-lg mr-3" />
+                  Result Limits
+                </TabsTrigger>
+                <TabsTrigger value="deduplicator">
+                  <MdCleaningServices className="text-lg mr-3" />
+                  Deduplicator
+                </TabsTrigger>
+              </Card>
+              <Card className={tabsGroupClass}>
+                <TabsTrigger value="miscellaneous">
+                  <MdMiscellaneousServices className="text-lg mr-3" />
+                  Miscellaneous
+                </TabsTrigger>
+              </Card>
             </div>
           </SettingsNavCard>
         </TabsList>
@@ -1797,6 +1793,30 @@ function Content() {
                     }}
                   />
 
+                  <Select
+                    disabled={!userData.titleMatching?.enabled}
+                    label="Ambiguous Results"
+                    options={[
+                      { label: 'keep', value: 'keep' },
+                      { label: 'discard', value: 'discard' },
+                    ]}
+                    defaultValue="keep"
+                    value={userData.titleMatching?.ambiguousResults}
+                    help="What to do with results that can't be told apart from a same-name series (reboots and country variants, e.g. The Office UK vs US). 'discard' keeps only results whose year, country tag or episode title confirms the requested series."
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        titleMatching: {
+                          ...prev.titleMatching,
+                          ambiguousResults: value as
+                            | 'keep'
+                            | 'discard'
+                            | undefined,
+                        },
+                      }));
+                    }}
+                  />
+
                   <div className="flex gap-4">
                     <div className="flex-1">
                       <Slider
@@ -1924,6 +1944,31 @@ function Content() {
                       setUserData((prev) => ({
                         ...prev,
                         yearMatching: { ...prev.yearMatching, strict: value },
+                      }));
+                    }}
+                  />
+                  <Combobox
+                    multiple
+                    disabled={
+                      !userData.yearMatching?.enabled ||
+                      userData.yearMatching?.strict === false
+                    }
+                    label="Strict Request Types"
+                    emptyMessage="There aren't any request types to choose from..."
+                    help="Request types where streams without a year are filtered out. Defaults to movie only, as series results usually don't include a year."
+                    options={TYPES.map((type) => ({
+                      label: type,
+                      value: type,
+                      textValue: type,
+                    }))}
+                    value={userData.yearMatching?.strictTypes ?? ['movie']}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        yearMatching: {
+                          ...prev.yearMatching,
+                          strictTypes: value,
+                        },
                       }));
                     }}
                   />
@@ -2097,6 +2142,177 @@ function Content() {
                       />
                     </div>
                   </div>
+                </SettingsCard>
+
+                <SettingsCard
+                  id="episodeTitleMatching"
+                  title="Episode Title Matching"
+                  description="Any streams whose release name carries an episode title that doesn't match the requested episode's title will be filtered out. Streams without an episode title are unaffected. Helps tell apart same-name series (e.g. The Office UK vs US) whose episode titles differ. You can optionally choose to only apply it to specific request types and addons."
+                >
+                  <Switch
+                    label="Enabled"
+                    side="right"
+                    value={userData.episodeTitleMatching?.enabled ?? false}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        episodeTitleMatching: {
+                          ...(prev.episodeTitleMatching || {}),
+                          enabled: value,
+                        },
+                      }));
+                    }}
+                  />
+
+                  <div className="flex gap-4">
+                    <div className="flex-1">
+                      <Slider
+                        label="Similarity Threshold"
+                        help="The minimum similarity threshold required for an episode title to be considered a match. Lower values allow more leniency whereas higher values are more strict."
+                        disabled={!userData.episodeTitleMatching?.enabled}
+                        value={[
+                          userData.episodeTitleMatching?.similarityThreshold ??
+                            0.8,
+                        ]}
+                        min={0}
+                        max={1}
+                        step={0.01}
+                        defaultValue={[0.8]}
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            episodeTitleMatching: {
+                              ...prev.episodeTitleMatching,
+                              similarityThreshold: value[0],
+                            },
+                          }));
+                        }}
+                      />
+                    </div>
+                    <div className="w-24">
+                      <NumberInput
+                        label="Value"
+                        step={0.01}
+                        value={
+                          userData.episodeTitleMatching?.similarityThreshold ??
+                          0.8
+                        }
+                        min={0}
+                        max={1}
+                        disabled={!userData.episodeTitleMatching?.enabled}
+                        onValueChange={(newValue) => {
+                          if (newValue !== undefined) {
+                            setUserData((prev) => ({
+                              ...prev,
+                              episodeTitleMatching: {
+                                ...prev.episodeTitleMatching,
+                                similarityThreshold: newValue,
+                              },
+                            }));
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <Combobox
+                        multiple
+                        disabled={!userData.episodeTitleMatching?.enabled}
+                        label="Request Types"
+                        help="Request types that will use episode title matching. Leave blank to apply to all request types."
+                        emptyMessage="There aren't any request types to choose from..."
+                        options={TYPES.map((type) => ({
+                          label: type,
+                          value: type,
+                          textValue: type,
+                        }))}
+                        value={userData.episodeTitleMatching?.requestTypes}
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            episodeTitleMatching: {
+                              ...prev.episodeTitleMatching,
+                              requestTypes: value,
+                            },
+                          }));
+                        }}
+                      />
+                      <Combobox
+                        multiple
+                        disabled={!userData.episodeTitleMatching?.enabled}
+                        label="Addons"
+                        help="Addons that will use episode title matching. Leave blank to apply to all addons."
+                        emptyMessage="You haven't installed any addons yet..."
+                        options={userData.presets.map((preset) => ({
+                          label: preset.options.name || preset.type,
+                          textValue: preset.options.name || preset.type,
+                          value: preset.instanceId,
+                        }))}
+                        value={userData.episodeTitleMatching?.addons || []}
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            episodeTitleMatching: {
+                              ...prev.episodeTitleMatching,
+                              addons: value,
+                            },
+                          }));
+                        }}
+                      />
+                    </div>
+                  </div>
+                </SettingsCard>
+
+                <SettingsCard
+                  id="languageInference"
+                  title="Language Inference"
+                  description="When a stream declares no language of its own, the language of the metadata title it matched is added to it. A source only contributes while its own filter is running, so Title needs Title Matching enabled and Episode Title needs Episode Title Matching enabled. Inference also happens after the language filters, so an inferred language reaches the formatter, sorting and stream expressions, but cannot be filtered on in the same request."
+                >
+                  <Switch
+                    label="Enabled"
+                    side="right"
+                    value={userData.languageInference?.enabled ?? true}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        languageInference: {
+                          ...(prev.languageInference || {}),
+                          enabled: value,
+                        },
+                      }));
+                    }}
+                  />
+                  <Combobox
+                    multiple
+                    disabled={userData.languageInference?.enabled === false}
+                    label="Sources"
+                    emptyMessage="There aren't any sources to choose from..."
+                    help="Which matched title may contribute a language, on top of that title's own filter being enabled. Leave blank to allow both. Episode titles are the stronger signal, as a series title is often identical across languages."
+                    options={[
+                      {
+                        label: 'Title',
+                        value: 'title',
+                        textValue: 'Title',
+                      },
+                      {
+                        label: 'Episode Title',
+                        value: 'episodeTitle',
+                        textValue: 'Episode Title',
+                      },
+                    ]}
+                    value={userData.languageInference?.sources || []}
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        languageInference: {
+                          ...prev.languageInference,
+                          sources: value as ('title' | 'episodeTitle')[],
+                        },
+                      }));
+                    }}
+                  />
                 </SettingsCard>
               </div>
             </>
@@ -3726,6 +3942,82 @@ function Content() {
                           />
                         );
                       })}
+                    </SettingsCard>
+                    <SettingsCard
+                      title="Merge Duplicates"
+                      description="Instead of just discarding duplicates, fold their info into the surviving result: extra same-release failover targets and richer metadata from other addons."
+                    >
+                      <Switch
+                        label="Enable Merging"
+                        side="right"
+                        disabled={!userData.deduplicator?.enabled}
+                        value={userData.deduplicator?.merge?.enabled ?? false}
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            deduplicator: {
+                              ...prev.deduplicator,
+                              merge: {
+                                ...prev.deduplicator?.merge,
+                                enabled: value,
+                              },
+                            },
+                          }));
+                        }}
+                      />
+                      <Switch
+                        label="Harvest Failover Variants"
+                        side="right"
+                        help="Collect discarded duplicates' playback URLs as same-release failover targets, so failover can try another copy of the SAME release (e.g. a different indexer's NZB) before moving to a different release. Follows your Failover content-type settings."
+                        disabled={
+                          !userData.deduplicator?.enabled ||
+                          !userData.deduplicator?.merge?.enabled
+                        }
+                        value={
+                          userData.deduplicator?.merge?.failoverVariants ??
+                          false
+                        }
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            deduplicator: {
+                              ...prev.deduplicator,
+                              merge: {
+                                ...prev.deduplicator?.merge,
+                                failoverVariants: value,
+                              },
+                            },
+                          }));
+                        }}
+                      />
+                      <Combobox
+                        label="Merged Metadata Fields"
+                        multiple
+                        help="Which metadata to merge from discarded duplicates into the kept result. Languages/subtitles are merged accuracy-aware: an addon's accurate audio/subtitle split is never overwritten by inaccurate filename-parsed guesses."
+                        disabled={
+                          !userData.deduplicator?.enabled ||
+                          !userData.deduplicator?.merge?.enabled
+                        }
+                        value={userData.deduplicator?.merge?.fields ?? []}
+                        emptyMessage="No fields available"
+                        onValueChange={(value) => {
+                          setUserData((prev) => ({
+                            ...prev,
+                            deduplicator: {
+                              ...prev.deduplicator,
+                              merge: {
+                                ...prev.deduplicator?.merge,
+                                fields:
+                                  value as (typeof DEDUPLICATOR_MERGE_FIELDS)[number][],
+                              },
+                            },
+                          }));
+                        }}
+                        options={DEDUPLICATOR_MERGE_FIELDS.map((field) => ({
+                          label: field,
+                          value: field,
+                        }))}
+                      />
                     </SettingsCard>
                   </>
                 )}

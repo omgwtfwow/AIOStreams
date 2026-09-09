@@ -97,7 +97,7 @@ The Docker image includes a built-in health check; removing your custom one is t
 
 | v1 Variable                                     | v2 Variable                                   | Notes                                                                            |
 | ----------------------------------------------- | --------------------------------------------- | -------------------------------------------------------------------------------- |
-| `API_KEY`                                       | `ADDON_PASSWORD`                              | Renamed                                                                          |
+| `API_KEY`                                       | _(removed)_                                   | Current installs use `AIOSTREAMS_AUTH` and `CONFIG_ACCESS_KEY`                   |
 | `BRANDING`                                      | `CUSTOM_HTML`                                 | Now a runtime variable (was build-time in v1)                                    |
 | `DETERMINISTIC_ADDON_ID`                        | _(removed)_                                   | v2 always uses deterministic IDs                                                 |
 | `SECRET_KEY`                                    | `SECRET_KEY`                                  | **Now requires a 64-character hex string**. Generate with `openssl rand -hex 32` |

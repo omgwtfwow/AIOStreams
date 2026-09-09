@@ -1,4 +1,4 @@
-﻿import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
+import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
 import { appConfig, ServiceId, constants } from '../utils/index.js';
 import { BuiltinAddonPreset, BuiltinStreamParser } from './builtin.js';
 
@@ -37,6 +37,7 @@ export class EasynewsSearchPreset extends BuiltinAddonPreset {
       constants.STREMIO_NNTP_SERVICE,
       constants.EASYNEWS_SERVICE,
       constants.STREMTHRU_NEWZ_SERVICE,
+      constants.AIOSTREAMS_SERVICE,
     ] as ServiceId[];
 
     const options: Option[] = [
@@ -102,11 +103,22 @@ export class EasynewsSearchPreset extends BuiltinAddonPreset {
         id: 'aiostreamsAuth',
         name: 'AIOStreams Auth',
         description:
-          appConfig.nzbProxy.easynewsEnabled === false
-            ? 'You must provide a valid `username:password` from `AIOSTREAMS_AUTH` to use Easynews Search with all services except Easynews.'
-            : 'Optionally provide a valid `username:password` `from AIOSTREAMS_AUTH` to bypass NZB limits when using Easynews Search with non-Easynews services.',
+          'You must provide a valid `username:password` from `AIOSTREAMS_AUTH` to use Easynews Search with all services except Easynews.',
         type: 'password',
         required: false,
+      },
+      {
+        id: 'apiVersion',
+        name: 'Easynews API Version',
+        description:
+          'Which Easynews search API to use. Both return the same results, the same rich metadata (audio/subtitle languages, resolution, codecs), and both support direct Easynews playback. V3 returns a fixed 100 results per page but Easynews does not rate limit it, so pages are fetched in parallel. V2 returns up to 250 results per page, but Easynews only serves two of its requests at a time, making paginated searches much slower. If unsure, leave this as V3.',
+        type: 'select',
+        default: '3.0',
+        showInSimpleMode: false,
+        options: [
+          { label: 'V3 (recommended)', value: '3.0' },
+          { label: 'V2 (legacy)', value: '2.0' },
+        ],
       },
       {
         id: 'paginate',
@@ -153,7 +165,24 @@ export class EasynewsSearchPreset extends BuiltinAddonPreset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const easynewsService = userData.services?.find(
+      (s) => s.id === constants.EASYNEWS_SERVICE
+    );
+    if (
+      !easynewsService ||
+      !easynewsService.credentials?.username ||
+      !easynewsService.credentials?.password
+    ) {
+      throw new Error(
+        `${this.METADATA.NAME} requires the Easynews service to be configured with a valid username and password. Please enter your Easynews username and password under Services.`
+      );
+    }
+
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     if (!usableServices || usableServices.length === 0) {
       throw new Error(
         `${this.METADATA.NAME} requires at least one usable service, but none were found. Please enable at least one of the following services: ${this.METADATA.SUPPORTED_SERVICES.join(
@@ -163,10 +192,7 @@ export class EasynewsSearchPreset extends BuiltinAddonPreset {
     }
 
     if (usableServices.some((s) => s.id !== constants.EASYNEWS_SERVICE))
-      if (
-        !options.aiostreamsAuth &&
-        appConfig.nzbProxy.easynewsEnabled === false
-      ) {
+      if (!options.aiostreamsAuth) {
         throw new Error(
           `${this.METADATA.NAME} requires the AIOStreams Auth option on this instance in order to use it with the following services: ${usableServices
             .filter((s) => s.id !== constants.EASYNEWS_SERVICE)
@@ -242,6 +268,7 @@ export class EasynewsSearchPreset extends BuiltinAddonPreset {
       ...this.getBaseConfig(userData, services),
       authentication: easynewsCreds,
       paginate: options.paginate ?? false,
+      apiVersion: options.apiVersion ?? '3.0',
       aiostreamsAuth: options.aiostreamsAuth || undefined,
     };
 

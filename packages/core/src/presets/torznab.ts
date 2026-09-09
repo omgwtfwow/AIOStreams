@@ -17,28 +17,30 @@ export class TorznabPreset extends BuiltinAddonPreset {
         default: 'Torznab',
       },
       {
-        id: 'torznabUrl',
-        name: 'Torznab URL',
-        description: 'Provide the URL to the Torznab endpoint ',
-        type: 'url',
+        id: 'api',
+        name: 'Torznab Endpoint',
+        description: '',
+        type: 'nab-endpoint',
+        nab: { namespace: 'torznab', preset: 'torznab' },
         required: true,
-      },
-      {
-        id: 'apiKey',
-        name: 'API Key',
-        description:
-          'The password for the Torznab API. This is used to authenticate with the Torznab endpoint.',
-        type: 'password',
-        required: false,
-      },
-      {
-        id: 'apiPath',
-        name: 'API Path',
-        description: 'The path to the Torznab API. Usually /api.',
-        type: 'string',
-        required: false,
-        showInSimpleMode: false,
-        default: '/api',
+        subOptions: [
+          {
+            id: 'url',
+            name: 'Torznab URL',
+            description:
+              'The full URL of the Torznab API endpoint, including the path (usually `/api`).',
+            type: 'url',
+            required: true,
+          },
+          {
+            id: 'apiKey',
+            name: 'API Key',
+            description:
+              'The password for the Torznab API. This is used to authenticate with the Torznab endpoint.',
+            type: 'password',
+            required: false,
+          },
+        ],
       },
       {
         id: 'timeout',
@@ -103,7 +105,7 @@ export class TorznabPreset extends BuiltinAddonPreset {
         id: 'searchMode',
         name: 'Search Mode',
         description:
-          'The search mode to use when querying the Torznab endpoint. **Note**: `Both` will result in two addons being created, one for each search mode.',
+          '`Auto` searches by ID (TVDB/IMDb/TMDB + season/episode) when the indexer supports it; `Forced Query` always searches by title text instead. **Note**: `Both` creates two separate addons, one per mode.',
         type: 'select',
         required: false,
         showInSimpleMode: false,
@@ -112,6 +114,25 @@ export class TorznabPreset extends BuiltinAddonPreset {
           { label: 'Auto', value: 'auto' },
           { label: 'Forced Query', value: 'query' },
           { label: 'Both', value: 'both' },
+        ],
+      },
+      {
+        id: 'seasonEpisodeStrategy',
+        name: 'Season/Episode Search Strategy',
+        description:
+          "Controls whether series searches in `Auto` mode query at the episode level, the season level, or both - useful for private trackers where season packs replace individual episodes. A season-level search may return season packs, individual episodes, or both, depending on the indexer. `Dynamic` decides based on whether the season is still airing. Pair with `Season/Episode Matching` in Filters to filter out results that don't match.",
+        type: 'select',
+        required: false,
+        showInSimpleMode: false,
+        default: 'episode',
+        options: [
+          { label: 'Episode', value: 'episode' },
+          { label: 'Season', value: 'season' },
+          { label: 'Dynamic (Season Preferred)', value: 'dynamic' },
+          {
+            label: 'Episode First, Season Fallback',
+            value: 'episodeFirst',
+          },
         ],
       },
       {
@@ -169,7 +190,11 @@ export class TorznabPreset extends BuiltinAddonPreset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     if (!usableServices || usableServices.length === 0) {
       throw new Error(
         `${this.METADATA.NAME} requires at least one usable service, but none were found. Please enable at least one of the following services: ${this.METADATA.SUPPORTED_SERVICES.join(
@@ -242,12 +267,14 @@ export class TorznabPreset extends BuiltinAddonPreset {
   ) {
     const config = {
       ...this.getBaseConfig(userData, services),
-      url: options.torznabUrl,
-      apiPath: options.apiPath,
-      apiKey: options.apiKey,
+      url: options.api?.url,
+      // the url already carries the api path
+      apiPath: '',
+      apiKey: options.api?.apiKey,
       forceQuerySearch: options.forceQuerySearch ?? false,
       forceInitialLimit: options.initialLimit,
       paginate: options.paginate ?? false,
+      seasonEpisodeStrategy: options.seasonEpisodeStrategy ?? 'episode',
     };
 
     const configString = this.base64EncodeJSON(config, 'urlSafe');

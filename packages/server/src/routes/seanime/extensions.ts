@@ -7,7 +7,14 @@ import {
   decryptString,
   Env,
   getSimpleTextHash,
+  isConfigUuid,
+  resolveConfigAlias,
   UserRepository,
+  resolveVariantSelector,
+  withVariantSelector,
+  VARIANT_QUERY_PARAM,
+  VARIANT_PATH_PARAM,
+  VARIANT_PATH_ROUTE,
 } from '@aiostreams/core';
 import {
   applySeanimeManifestRuntimeConfig,
@@ -130,15 +137,19 @@ interface AuthenticatedExtensionManifestRequestParams {
   uuid: string;
   encryptedPassword: string;
   extensionId: string;
+  variantSelector?: string;
 }
 
 /**
- * GET /seanime/:uuid/:encryptedPassword/extensions/:extensionId
+ * GET /seanime/:uuid/:encryptedPassword[/v/:variantSelector]/extensions/:extensionId
  * Serves the extension manifest with the manifestUrl field default pre-populated
  * with the user's own Stremio manifest URL.
  */
 router.get(
-  '/:uuid/:encryptedPassword/extensions/:extensionId.json',
+  [
+    '/:uuid/:encryptedPassword/extensions/:extensionId.json',
+    `/:uuid/:encryptedPassword${VARIANT_PATH_ROUTE}/extensions/:extensionId.json`,
+  ],
   async (
     req: Request<AuthenticatedExtensionManifestRequestParams>,
     res: Response,
@@ -152,11 +163,9 @@ router.get(
     }
 
     // Validate UUID
-    const uuidRegex =
-      /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
     let uuid: string;
-    if (!uuidRegex.test(uuidOrAlias)) {
-      const alias = appConfig.api.aliasedConfigurations[uuidOrAlias];
+    if (!isConfigUuid(uuidOrAlias)) {
+      const alias = await resolveConfigAlias(uuidOrAlias);
       if (alias) {
         uuid = alias.uuid;
       } else {
@@ -193,10 +202,24 @@ router.get(
     }
 
     // Pre-populate the manifestUrl field default with the user's Stremio manifest URL
-    const stremioManifestUrl = `${appConfig.bootstrap.baseUrl}/stremio/${uuid}/${encryptedPassword}/manifest.json`;
+    const { ids: variants, location } = resolveVariantSelector(
+      req.params[VARIANT_PATH_PARAM],
+      req.query[VARIANT_QUERY_PARAM]
+    );
+    const stremioManifestUrl = withVariantSelector(
+      `${appConfig.bootstrap.baseUrl}/stremio/${uuid}/${encryptedPassword}`,
+      '/manifest.json',
+      variants,
+      location
+    );
     applySeanimeManifestRuntimeConfig(manifest, {
-      manifestURI: `${appConfig.bootstrap.baseUrl}/seanime/${uuid}/${encryptedPassword}/extensions/${extensionId}.json`,
-      website: stremioManifestUrl.replace('/manifest.json', '/configure'),
+      manifestURI: withVariantSelector(
+        `${appConfig.bootstrap.baseUrl}/seanime/${uuid}/${encryptedPassword}`,
+        `/extensions/${extensionId}.json`,
+        variants,
+        location
+      ),
+      website: `${appConfig.bootstrap.baseUrl}/stremio/${uuid}/${encryptedPassword}/configure`,
       baseUrl: appConfig.bootstrap.baseUrl,
       stremioManifestUrl,
     });

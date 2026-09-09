@@ -7,7 +7,7 @@ export enum ErrorCode {
   USER_INVALID_CONFIG = 'USER_INVALID_CONFIG',
   USER_NEW_PASSWORD_TOO_SHORT = 'USER_NEW_PASSWORD_TOO_SHORT',
   USER_NEW_PASSWORD_TOO_SIMPLE = 'USER_NEW_PASSWORD_TOO_SIMPLE',
-  ADDON_PASSWORD_INVALID = 'ADDON_PASSWORD_INVALID',
+  CONFIG_ACCESS_KEY_INVALID = 'CONFIG_ACCESS_KEY_INVALID',
   PARENT_CONFIG_SELF_REFERENCE = 'PARENT_CONFIG_SELF_REFERENCE',
   PARENT_CONFIG_UNAVAILABLE = 'PARENT_CONFIG_UNAVAILABLE',
   // Database
@@ -26,6 +26,26 @@ export enum ErrorCode {
   BAD_REQUEST = 'BAD_REQUEST',
   UNAUTHORIZED = 'UNAUTHORIZED',
   FORBIDDEN = 'FORBIDDEN',
+  // Kept distinct rather than collapsed into UNAUTHORIZED: each has its own
+  // operator remediation, surfaced as a `?error=` code on the login page.
+  OIDC_DISABLED = 'OIDC_DISABLED',
+  OIDC_NOT_CONFIGURED = 'OIDC_NOT_CONFIGURED',
+  OIDC_DISCOVERY_FAILED = 'OIDC_DISCOVERY_FAILED',
+  OIDC_STATE_INVALID = 'OIDC_STATE_INVALID',
+  OIDC_DENIED = 'OIDC_DENIED',
+  OIDC_EXCHANGE_FAILED = 'OIDC_EXCHANGE_FAILED',
+  OIDC_CLAIMS_INVALID = 'OIDC_CLAIMS_INVALID',
+  OIDC_USERNAME_CONFLICT = 'OIDC_USERNAME_CONFLICT',
+  OIDC_NO_PERMISSIONS = 'OIDC_NO_PERMISSIONS',
+  // Community sharing
+  COMMUNITY_DISABLED = 'COMMUNITY_DISABLED',
+  COMMUNITY_BLOCKED = 'COMMUNITY_BLOCKED',
+  COMMUNITY_ACCOUNT_TOO_NEW = 'COMMUNITY_ACCOUNT_TOO_NEW',
+  COMMUNITY_SUBMISSION_LIMIT = 'COMMUNITY_SUBMISSION_LIMIT',
+  COMMUNITY_INVALID_ITEM = 'COMMUNITY_INVALID_ITEM',
+  COMMUNITY_NOT_FOUND = 'COMMUNITY_NOT_FOUND',
+  COMMUNITY_ALREADY_LIKED = 'COMMUNITY_ALREADY_LIKED',
+  COMMUNITY_VERSION_NOT_NEWER = 'COMMUNITY_VERSION_NOT_NEWER',
 }
 
 interface ErrorDetails {
@@ -58,9 +78,9 @@ export const ErrorMap: Record<ErrorCode, ErrorDetails> = {
     statusCode: 400,
     message: 'New password is too simple',
   },
-  [ErrorCode.ADDON_PASSWORD_INVALID]: {
+  [ErrorCode.CONFIG_ACCESS_KEY_INVALID]: {
     statusCode: 401,
-    message: 'Invalid addon password',
+    message: 'Invalid config access key',
   },
   [ErrorCode.PARENT_CONFIG_SELF_REFERENCE]: {
     statusCode: 400,
@@ -114,6 +134,74 @@ export const ErrorMap: Record<ErrorCode, ErrorDetails> = {
     statusCode: 403,
     message: 'Forbidden',
   },
+  [ErrorCode.OIDC_DISABLED]: {
+    statusCode: 404,
+    message: 'SSO login is not enabled on this instance',
+  },
+  [ErrorCode.OIDC_NOT_CONFIGURED]: {
+    statusCode: 503,
+    message: 'SSO login is enabled but not fully configured',
+  },
+  [ErrorCode.OIDC_DISCOVERY_FAILED]: {
+    statusCode: 502,
+    message: 'Could not reach the SSO provider',
+  },
+  [ErrorCode.OIDC_STATE_INVALID]: {
+    statusCode: 400,
+    message: 'The login attempt expired or could not be verified',
+  },
+  [ErrorCode.OIDC_DENIED]: {
+    statusCode: 403,
+    message: 'The SSO provider denied the login request',
+  },
+  [ErrorCode.OIDC_EXCHANGE_FAILED]: {
+    statusCode: 502,
+    message: 'The SSO provider rejected the login',
+  },
+  [ErrorCode.OIDC_CLAIMS_INVALID]: {
+    statusCode: 502,
+    message: 'The SSO provider did not return the expected user details',
+  },
+  [ErrorCode.OIDC_USERNAME_CONFLICT]: {
+    statusCode: 409,
+    message: 'This SSO username collides with a local user',
+  },
+  [ErrorCode.OIDC_NO_PERMISSIONS]: {
+    statusCode: 403,
+    message: 'Your account is not mapped to any AIOStreams permissions',
+  },
+  [ErrorCode.COMMUNITY_DISABLED]: {
+    statusCode: 403,
+    message: 'Community sharing is disabled on this instance',
+  },
+  [ErrorCode.COMMUNITY_BLOCKED]: {
+    statusCode: 403,
+    message: 'You have been blocked from community sharing on this instance',
+  },
+  [ErrorCode.COMMUNITY_ACCOUNT_TOO_NEW]: {
+    statusCode: 403,
+    message: 'This configuration is too new to take part in community sharing',
+  },
+  [ErrorCode.COMMUNITY_SUBMISSION_LIMIT]: {
+    statusCode: 429,
+    message: 'You have reached the daily submission limit',
+  },
+  [ErrorCode.COMMUNITY_INVALID_ITEM]: {
+    statusCode: 400,
+    message: 'The submitted item is invalid',
+  },
+  [ErrorCode.COMMUNITY_NOT_FOUND]: {
+    statusCode: 404,
+    message: 'That community item does not exist',
+  },
+  [ErrorCode.COMMUNITY_ALREADY_LIKED]: {
+    statusCode: 409,
+    message: 'This item has already been liked from your network',
+  },
+  [ErrorCode.COMMUNITY_VERSION_NOT_NEWER]: {
+    statusCode: 400,
+    message: 'The version must be higher than the published one',
+  },
 };
 
 export class APIError extends Error {
@@ -134,14 +222,13 @@ const HEADERS_FOR_IP_FORWARDING = [
   'True-Client-IP',
   'X-Forwarded',
   'Forwarded-For',
+  'X-AIOStreams-User-IP',
 ];
 
 export const INTERNAL_SECRET_HEADER = Buffer.from(
   'WC1BSU9TdHJlYW1zLUludGVybmFsLVNlY3JldA==',
   'base64'
 ).toString('utf8');
-
-export const PUBLIC_NZB_PROXY_USERNAME = 'public_nzb_proxy_user';
 
 const API_VERSION = 1;
 
@@ -151,6 +238,45 @@ export const DEFAULT_PRECACHE_SELECTOR =
   'count(cached(streams)) == 0 ? uncached(streams) : []';
 
 export const DEFAULT_PRELOAD_SELECTOR = 'slice(streams, 0, 2)';
+
+/** Failover defaults shared by the schema, orchestrator and config UI. */
+export const DEFAULT_FAILOVER_CONTENT_TYPES = ['usenet'] as const;
+export const DEFAULT_FAILOVER_MAX_ATTEMPTS = 3;
+export const DEFAULT_FAILOVER_PARALLEL = 1; // 1 = sequential (current behaviour)
+export const DEFAULT_FAILOVER_STAGGER_MS = 1000;
+export const DEFAULT_FAILOVER_MAX_WAIT_MS = 30000;
+// How long a ready lower-priority result waits for the clicked / higher-ranked
+// item to catch up before it's accepted (parallel mode only). 0 = first-ready wins.
+export const DEFAULT_FAILOVER_PREFERRED_GRACE_MS = 2000;
+
+/**
+ * Query-param marker appended to an owned-playback inner URL when it is wrapped by
+ * a proxy.
+ */
+export const INTERNAL_PROXY_MARKER = 'from_proxy';
+
+/**
+ * Path prefix of an AIOStreams builtin-proxy URL.
+ */
+export const BUILTIN_PROXY_PATH_PREFIX = '/api/v1/proxy/';
+
+/** Whether external addon debrid URLs may be used as failover targets. */
+export const DEFAULT_FAILOVER_INCLUDE_EXTERNAL = false;
+
+/** Max same-release variant attempts tried per release before moving on (0 = off). */
+export const DEFAULT_FAILOVER_SAME_RELEASE_LIMIT = 2;
+/** Delay between launching same-release variant attempts (ms). 0 = no delay. */
+export const DEFAULT_FAILOVER_DUPLICATE_STAGGER_MS = 0;
+
+/** Metadata fields the deduplicator can merge from discarded duplicates into the winner. */
+export const DEDUPLICATOR_MERGE_FIELDS = [
+  'languages',
+  'subtitles',
+  'library',
+  'seadex',
+  'sizes',
+  'idMatched',
+] as const;
 
 export const GDRIVE_FORMATTER = 'gdrive';
 export const LIGHT_GDRIVE_FORMATTER = 'lightgdrive';
@@ -241,6 +367,8 @@ const NZBDAV_SERVICE = 'nzbdav';
 const ALTMOUNT_SERVICE = 'altmount';
 const STREMIO_NNTP_SERVICE = 'stremio_nntp';
 const STREMTHRU_NEWZ_SERVICE = 'stremthru_newz';
+const AIOSTREAMS_SERVICE = 'aiostreams';
+const TORRIN_SERVICE = 'torrin';
 
 const SERVICES = [
   REALDEBRID_SERVICE,
@@ -259,6 +387,8 @@ const SERVICES = [
   ALTMOUNT_SERVICE,
   STREMIO_NNTP_SERVICE,
   STREMTHRU_NEWZ_SERVICE,
+  AIOSTREAMS_SERVICE,
+  TORRIN_SERVICE,
 ] as const;
 
 export const BUILTIN_SUPPORTED_SERVICES = [
@@ -276,6 +406,8 @@ export const BUILTIN_SUPPORTED_SERVICES = [
   STREMIO_NNTP_SERVICE,
   EASYNEWS_SERVICE,
   STREMTHRU_NEWZ_SERVICE,
+  AIOSTREAMS_SERVICE,
+  TORRIN_SERVICE,
 ] as const;
 
 export type ServiceId = (typeof SERVICES)[number];
@@ -461,7 +593,7 @@ const SERVICE_DETAILS: Record<
       {
         id: 'note',
         name: 'Configuration Help',
-        description: `**URL:** Use internal URL for local setups (e.g., http://nzbdav:3000), otherwise use a public URL.\n\n**Public URL:** Only needed if URL is local but streams need to be publicly accessible. Leave blank if URL is public or using a proxy.\n\n**Security Note:** WebDAV credentials are exposed in stream URLs unless proxied. To proxy, provide the Auth Token below (built-in proxy only).\n\nFor detailed setup instructions, see the [Usenet Wiki](https://github.com/Viren070/AIOStreams/wiki/Usenet#configuring-the-service-in-aiostreams).`,
+        description: `**URL:** Use internal URL for local setups (e.g., http://nzbdav:3000), otherwise use a public URL.\n\n**Public URL:** Only needed if URL is local but streams need to be publicly accessible. Leave blank if URL is public or using a proxy.\n\n**Security Note:** WebDAV credentials are exposed in stream URLs unless proxied. To proxy, provide the Auth Token below (built-in proxy only).\n\nFor detailed setup instructions, see the [Usenet guide](https://docs.aiostreams.viren070.me/guides/usenet#nzbdav-altmount-and-stremthru-newz).`,
         type: 'alert',
         intent: 'info',
         required: false,
@@ -516,6 +648,32 @@ const SERVICE_DETAILS: Record<
       },
     ],
   },
+  [AIOSTREAMS_SERVICE]: {
+    id: AIOSTREAMS_SERVICE,
+    name: 'AIOStreams',
+    shortName: 'AIO',
+    knownNames: ['AIO', 'AIO Usenet', 'NZB', 'Usenet', 'Native Usenet'],
+    signUpText:
+      'Stream directly from your own NNTP providers via the built-in usenet engine. Providers are configured globally by the administrator.',
+    credentials: [
+      {
+        id: 'note',
+        name: 'Configuration Help',
+        description: `NNTP providers for this engine are configured **globally by the administrator** (Settings → Usenet), not here.\n\nTo authorise streaming through the built-in engine, provide an AIOStreams Auth Token below: a \`username:password\` pair defined in the \`AIOSTREAMS_AUTH\` environment variable.`,
+        type: 'alert',
+        intent: 'info',
+        required: false,
+      },
+      {
+        id: 'aiostreamsAuth',
+        name: 'AIOStreams Auth Token',
+        description:
+          'A `username:password` pair for your AIOStreams instance, defined in the `AIOSTREAMS_AUTH` environment variable. Required to authorise streaming through the built-in usenet engine.',
+        type: 'password',
+        required: true,
+      },
+    ],
+  },
   [ALTMOUNT_SERVICE]: {
     id: ALTMOUNT_SERVICE,
     name: 'AltMount',
@@ -526,7 +684,7 @@ const SERVICE_DETAILS: Record<
       {
         id: 'note',
         name: 'Configuration Help',
-        description: `**URL:** Use internal URL for local setups (e.g., http://altmount:8000), otherwise use a public URL.\n\n**Public URL:** Only needed if URL is local but streams need to be publicly accessible. Leave blank if URL is public or using a proxy.\n\n**Security Note:** WebDAV credentials are exposed in stream URLs unless proxied. To proxy, provide the Auth Token below (built-in proxy only).\n\nFor detailed setup instructions, see the [Usenet Wiki](https://github.com/Viren070/AIOStreams/wiki/Usenet#configuring-the-service-in-aiostreams).`,
+        description: `**URL:** Use internal URL for local setups (e.g., http://altmount:8000), otherwise use a public URL.\n\n**Public URL:** Only needed if URL is local but streams need to be publicly accessible. Leave blank if URL is public or using a proxy.\n\n**Security Note:** WebDAV credentials are exposed in stream URLs unless proxied. To proxy, provide the Auth Token below (built-in proxy only).\n\nFor detailed setup instructions, see the [Usenet guide](https://docs.aiostreams.viren070.me/guides/usenet#nzbdav-altmount-and-stremthru-newz).`,
         type: 'alert',
         intent: 'info',
         required: false,
@@ -776,6 +934,24 @@ const SERVICE_DETAILS: Record<
       },
     ],
   },
+  [TORRIN_SERVICE]: {
+    id: TORRIN_SERVICE,
+    name: 'Torrin',
+    shortName: 'TR',
+    knownNames: ['TR', 'TI', 'TRN', 'Torrin'],
+    signUpText:
+      "Don't have an account? [Sign up here](https://torrin.app). Torrin is an open-source debrid service.",
+    credentials: [
+      {
+        id: 'apiKey',
+        name: 'API Key',
+        description:
+          'Your Torrin API key (begins with `tr_`). Obtain it from [torrin.app/app/settings](https://torrin.app/app/settings).',
+        type: 'password',
+        required: true,
+      },
+    ],
+  },
 };
 
 const TOP_LEVEL_OPTION_DETAILS: Record<
@@ -785,7 +961,10 @@ const TOP_LEVEL_OPTION_DETAILS: Record<
   | 'tvdbApiKey'
   | 'topPosterApiKey'
   | 'aioratingsApiKey'
-  | 'aioratingsProfileId',
+  | 'aioratingsProfileId'
+  | 'openposterdbApiKey'
+  | 'openposterdbUrl'
+  | 'openposterdbParameters',
   {
     name: string;
     description: string;
@@ -826,6 +1005,21 @@ const TOP_LEVEL_OPTION_DETAILS: Record<
     description:
       'Use "default" for the default profile, or enter a custom profile UUID from your AIOratings dashboard.',
   },
+  openposterdbApiKey: {
+    name: 'OpenPosterDB API Key',
+    description:
+      'Get your API key from [here](https://openposterdb.com) for posters with ratings. Use `t0-free-rpdb` for the free public instance.',
+  },
+  openposterdbUrl: {
+    name: 'OpenPosterDB URL',
+    description:
+      'Custom base URL for a self-hosted OpenPosterDB instance. Leave empty to use the default public instance.',
+  },
+  openposterdbParameters: {
+    name: 'OpenPosterDB Custom Parameters',
+    description:
+      'Optional query string (without the leading `?`) appended to every poster to customise it, e.g. `ratings_limit=2&badge_size=l&position=br`.',
+  },
 };
 
 export const DEDUPLICATOR_KEYS = [
@@ -860,6 +1054,9 @@ export const SMART_DETECT_ATTRIBUTES = [
   'audioTags',
   'audioChannels',
   'languages',
+  'repack',
+  'proper',
+  'country',
 ] as const;
 
 export type SmartDetectAttribute = (typeof SMART_DETECT_ATTRIBUTES)[number];
@@ -876,6 +1073,7 @@ export const DEFAULT_SMART_DETECT_ATTRIBUTES: SmartDetectAttribute[] = [
   'edition',
   'network',
   'remastered',
+  'releaseGroup',
 ];
 
 export const AUTO_PLAY_ATTRIBUTES = [
@@ -946,6 +1144,7 @@ const QUALITIES = [
   'WEBRip',
   'HDRip',
   'HC HD-Rip',
+  'DVD REMUX',
   'DVDRip',
   'HDTV',
   'CAM',
@@ -969,6 +1168,7 @@ const VISUAL_TAGS = [
   '3D',
   'IMAX',
   'AI',
+  'Upscaled',
   'SDR',
   'H-OU',
   'H-SBS',
@@ -985,6 +1185,7 @@ const AUDIO_TAGS = [
   'DTS-ES',
   'DTS',
   'TrueHD',
+  'PCM',
   'OPUS',
   'FLAC',
   'AAC',
@@ -1015,6 +1216,7 @@ const ENCODES = [
   'VC-1',
   'XviD',
   'DivX',
+  'MPEG-4',
   // 'H-OU',
   // 'H-SBS',
   'Unknown',
@@ -1434,33 +1636,111 @@ const LANGUAGES = [
 
 export const SNIPPETS = [
   {
-    name: 'Year + Season + Episode',
-    description:
-      'Outputs a nicely formatted year along with the season and episode number',
-    value:
-      '{stream.year::exists["({stream.year}) "||""]}{stream.seasonEpisode::exists["{stream.seasonEpisode::join(\' • \')}"||""]}',
+    name: 'Resolution',
+    description: 'The resolution, falling back to "Unknown" when unavailable.',
+    value: "{stream.resolution::default('Unknown')}",
+  },
+  {
+    name: 'Title & Year',
+    description: 'Title in Title Case, with the year in brackets when known.',
+    value: '{stream.title::title}{? ({stream.year})?}',
+  },
+  {
+    name: 'Season & Episode',
+    description: 'Season and episode (S01 E05). Hidden for movies.',
+    value: "{?{stream.seasonEpisode::join(' ')}?}",
+  },
+  {
+    name: 'Quality',
+    description: 'Source quality (BluRay, WEB-DL, …). Hidden when unknown.',
+    value: '{?🎥 {stream.quality}?}',
   },
   {
     name: 'File Size',
-    description: 'Outputs the file size of the stream',
-    value: '{stream.size::>0["{stream.size::bytes}"||""]}',
+    description: 'File size, with the folder size appended when present.',
+    value: '{?📦 {stream.size::sbytes}?}{? / {stream.folderSize::sbytes}?}',
+  },
+  {
+    name: 'Bitrate',
+    description: 'Bitrate. Hidden when unavailable.',
+    value: '{?📊 {stream.bitrate::sbitrate}?}',
   },
   {
     name: 'Duration',
-    description: 'Outputs the duration of the stream',
-    value: '{stream.duration::>0["{stream.duration::time}"||""]}',
+    description: 'Runtime.',
+    value: '{?⏱️ {stream.duration::time}?}',
   },
   {
-    name: 'P2P marker',
-    description: 'Displays a [P2P] marker if the stream is a P2P stream',
-    value: '{stream.type::=p2p["[P2P]"||""]}',
+    name: 'Seeders',
+    description: 'Seeder count. Hidden for non-torrents.',
+    value: '{?👤 {stream.seeders}?}',
+  },
+  {
+    name: 'Age',
+    description: 'How long ago the release was posted.',
+    value: '{?📅 {stream.age}?}',
+  },
+  {
+    name: 'HDR / Visual Tags',
+    description: 'Visual tags such as HDR, DV and IMAX.',
+    value: "{?📺 {stream.visualTags::join(' | ')}?}",
+  },
+  {
+    name: 'Audio',
+    description: 'Audio codecs and channel layouts.',
+    value:
+      "{?🔊 {stream.audioTags::join(' | ')}?}{?🎚️ {stream.audioChannels::join(' | ')}?}",
   },
   {
     name: 'Languages',
     description:
-      'Outputs the languages of the stream. Tip: use stream.languageEmojis if you prefer the flags',
-    value:
-      '{stream.languages::exists["{stream.languages::join(\' • \')}"||""]}',
+      'Language flags. Tip: use stream.languageCodes for text codes instead.',
+    value: "{?🌐 {stream.languageEmojis::join(' / ')}?}",
+  },
+  {
+    name: 'Subtitles',
+    description: 'Subtitle language flags.',
+    value: "{?📝 {stream.subtitleEmojis::join(' / ')}?}",
+  },
+  {
+    name: 'Encode / Codec',
+    description: 'Video codec (x265, AV1, …).',
+    value: '{?🎞️ {stream.encode}?}',
+  },
+  {
+    name: 'Release Group',
+    description: 'The release group.',
+    value: '{?🏷️ {stream.releaseGroup}?}',
+  },
+  {
+    name: 'Episode Title',
+    description: 'The episode title parsed from the release name.',
+    value: '{?📺 {stream.episodeTitle}?}',
+  },
+  {
+    name: 'Indexer',
+    description: 'The indexer or tracker the result came from.',
+    value: '{?⚙️ {stream.indexer}?}',
+  },
+  {
+    name: 'Service & Cached',
+    description: 'Debrid service, with a cached (⚡) / uncached (⏳) badge.',
+    value: '{?[{service.shortName}]?}{service.cached[" ⚡"||" ⏳"||""]}',
+  },
+  {
+    name: 'P2P Marker',
+    description: 'Adds a [P2P] marker for torrent streams.',
+    value: '{stream.type::=p2p["[P2P] "||""]}',
+  },
+  {
+    name: 'Message',
+    description: 'Any status message on the stream.',
+    value: '{?ℹ️ {stream.message}?}',
+  },
+  {
+    name: 'New Line',
+    description: 'Forces a line break. Useful inside modifier arguments.',
+    value: '{tools.newLine}',
   },
 ];
 
@@ -1489,6 +1769,7 @@ export {
   ALLDEBRID_SERVICE,
   DEBRIDLINK_SERVICE,
   TORBOX_SERVICE,
+  TORRIN_SERVICE,
   EASYDEBRID_SERVICE,
   DEBRIDER_SERVICE,
   PUTIO_SERVICE,
@@ -1500,6 +1781,7 @@ export {
   STREMIO_NNTP_SERVICE,
   EASYNEWS_SERVICE,
   STREMTHRU_NEWZ_SERVICE,
+  AIOSTREAMS_SERVICE,
   SERVICE_DETAILS,
   TOP_LEVEL_OPTION_DETAILS,
   HEADERS_FOR_IP_FORWARDING,

@@ -14,11 +14,17 @@ import {
   SearchApiResponseData,
   SearchApiResultField,
   StremioTransformer,
+  activateVariants,
+  logVariantNotes,
+  parseVariantSelector,
+  recordClientAgent,
+  VARIANT_QUERY_PARAM,
 } from '@aiostreams/core';
 import { streamApiRateLimiter } from '../../middlewares/ratelimit.js';
 import { ApiResponse, createResponse } from '../../utils/responses.js';
 import { syncUserDataUrls } from '../../utils/syncUserData.js';
 import { parseBasicAuthHeader } from '../../utils/basic-auth.js';
+import { buildVariantRequestContext } from '../../utils/variant-context.js';
 import { z, ZodError } from 'zod';
 const router: Router = Router();
 
@@ -115,6 +121,31 @@ router.get(
         throw new APIError(constants.ErrorCode.USER_INVALID_DETAILS);
       }
       userData.ip = req.userIp;
+      try {
+        const selected = parseVariantSelector(req.query[VARIANT_QUERY_PARAM]);
+        const context = buildVariantRequestContext(req, 'search', { type, id });
+        void recordClientAgent(userData.uuid, context.userAgent, 'search');
+        const activation = await activateVariants(userData, selected, context);
+        userData = activation.userData;
+        if (activation.applied.length) {
+          logger.info(
+            {
+              uuid: userData.uuid,
+              resource: 'search',
+              variants: userData.activeVariants,
+              auto: activation.auto,
+            },
+            'serving request with config variants'
+          );
+          logVariantNotes(userData.uuid, activation);
+        }
+      } catch (error: any) {
+        throw new APIError(
+          constants.ErrorCode.USER_INVALID_CONFIG,
+          undefined,
+          error.message
+        );
+      }
       userData = await syncUserDataUrls(userData);
       try {
         userData = await validateConfig(userData, {

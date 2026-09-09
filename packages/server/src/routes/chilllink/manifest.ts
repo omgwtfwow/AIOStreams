@@ -6,15 +6,13 @@ import {
   constants,
   Env,
   UserData,
+  userScopeIdSuffix,
 } from '@aiostreams/core';
 import { Manifest } from '@aiostreams/core';
 import { createLogger } from '@aiostreams/core';
-import { stremioManifestRateLimiter } from '../../middlewares/ratelimit.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
-
-router.use(stremioManifestRateLimiter);
 
 interface ChillLinkManifest {
   id: string;
@@ -30,7 +28,7 @@ interface ChillLinkManifest {
 const manifest = async (config?: UserData): Promise<ChillLinkManifest> => {
   let addonId = appConfig.branding.addonId;
   if (config) {
-    addonId += `.${config.uuid?.substring(0, 12)}`;
+    addonId += `.${userScopeIdSuffix(config)}`;
   }
   let resources: Manifest['resources'] = [];
   if (config) {
@@ -68,7 +66,7 @@ router.get(
     res: Response<ChillLinkManifest>,
     next: NextFunction
   ) => {
-    logger.debug('Manifest request received', { userData: req.userData });
+    logger.debug('Manifest request received', { uuid: req.userData?.uuid });
     try {
       res.status(200).json(await manifest(req.userData));
     } catch (error) {

@@ -5,13 +5,11 @@ import {
   createLogger,
   StremioTransformer,
 } from '@aiostreams/core';
-import { stremioCatalogRateLimiter } from '../../middlewares/ratelimit.js';
 import { trackResource } from '../../middlewares/analytics.js';
 
 const logger = createLogger('server');
 const router: Router = Router();
 
-router.use(stremioCatalogRateLimiter);
 router.use(trackResource('catalog'));
 
 interface CatalogParams {
@@ -23,17 +21,15 @@ interface CatalogParams {
 router.get(
   '/:type/:id{/:extras}.json',
   async (req: Request<CatalogParams>, res: Response<CatalogResponse>, next) => {
-    const transformer = new StremioTransformer(req.userData);
     if (!req.userData) {
       res.status(200).json(
-        transformer.transformCatalog({
-          success: false,
-          data: [],
-          errors: [{ description: 'Please configure the addon first' }],
+        StremioTransformer.createDynamicError('catalog', {
+          errorDescription: 'Please configure the addon first',
         })
       );
       return;
     }
+    const transformer = new StremioTransformer(req.userData);
 
     try {
       const { type, id, extras } = req.params;

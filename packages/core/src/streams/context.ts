@@ -12,8 +12,12 @@ import {
   enrichParsedIdWithAnimeEntry,
 } from '../utils/index.js';
 import { SeaDexResult } from '../utils/seadex.js';
-import { calculateAbsoluteEpisode } from '../builtins/utils/general.js';
+import {
+  calculateAbsoluteEpisode,
+  isNonAnimeAbsoluteEligible,
+} from '../builtins/utils/general.js';
 import { iso6391ToLanguage } from '../utils/languages.js';
+import { config as appConfig } from '../config/index.js';
 
 const logger = createLogger('stream-context');
 
@@ -54,6 +58,8 @@ export interface ExpressionContext {
   malId?: number;
   // SeaDex availability
   hasSeaDex?: boolean;
+  /** Health check results for this request, backing `health('<id>')`. */
+  health?: Record<string, boolean>;
 }
 /**
  * StreamContext encapsulates all request-specific data that can be shared
@@ -120,30 +126,28 @@ export class StreamContext {
 
   /**
    * Create a StreamContext for a request.
-   * This performs initial synchronous lookups from the AnimeDatabase.
+   * This performs the initial AnimeDatabase lookup for the request.
    */
-  public static create(
+  public static async create(
     type: string,
     id: string,
     userData: UserData
-  ): StreamContext {
+  ): Promise<StreamContext> {
     const start = Date.now();
     const parsedId = IdParser.parse(id, type);
     let isAnime = id.startsWith('kitsu');
 
     const animeDb = AnimeDatabase.getInstance();
-    if (animeDb.isAnime(id)) {
-      isAnime = true;
-    }
 
     let animeEntry: AnimeEntry | null = null;
     if (parsedId) {
-      animeEntry = animeDb.getEntryById(
+      animeEntry = await animeDb.getEntryById(
         parsedId.type,
         parsedId.value,
         parsedId.season ? Number(parsedId.season) : undefined,
         parsedId.episode ? Number(parsedId.episode) : undefined
       );
+      if (animeEntry) isAnime = true;
 
       // Enrich parsedId with anime entry data if available and no season specified
       if (animeEntry && !parsedId.season) {
@@ -195,9 +199,35 @@ export class StreamContext {
           this.type as any
         );
 
-        // Calculate absolute episode for anime
+        // Calculate absolute episode for anime and eligible non-anime titles
         let absoluteEpisode: number | undefined;
         let relativeAbsoluteEpisode: number | undefined;
+        const nonAnimeAbsolute =
+          !this.isAnime && isNonAnimeAbsoluteEligible(metadata);
+        if (
+          nonAnimeAbsolute &&
+          this.parsedId!.episode &&
+          (metadata.resolvedSeasonFirstEpisode ?? 1) > 1
+        ) {
+          // episodes are already numbered continuously across seasons
+          absoluteEpisode = Number(this.parsedId!.episode);
+        } else if (
+          nonAnimeAbsolute &&
+          this.parsedId!.season &&
+          this.parsedId!.episode &&
+          metadata.seasons
+        ) {
+          absoluteEpisode = Number(
+            calculateAbsoluteEpisode(
+              this.parsedId!.season,
+              this.parsedId!.episode,
+              metadata.seasons.map(({ season_number, episode_count }) => ({
+                number: season_number.toString(),
+                episodes: episode_count,
+              }))
+            )
+          );
+        }
         if (
           this.isAnime &&
           this.parsedId!.season &&
@@ -221,8 +251,8 @@ export class StreamContext {
           // Calculate relative absolute episode (within current AniDB entry)
           const startingSeason =
             this.animeEntry?.imdb?.seasonNumber ??
-            this.animeEntry?.trakt?.seasonNumber ??
             this.animeEntry?.tvdb?.seasonNumber ??
+            this.animeEntry?.trakt?.seasonNumber ??
             this.animeEntry?.tmdb?.seasonNumber;
 
           if (startingSeason) {
@@ -607,7 +637,7 @@ export class StreamContext {
 
   /**
    * Convert context to FormatterContext for formatter initialization.
-   * Requires streams to calculate maxRseScore and maxRegexScore.
+   * Requires streams to calculate maxSeScore and maxRegexScore.
    */
   public toFormatterContext(
     streams?: ParsedStream[]
@@ -631,6 +661,8 @@ export class StreamContext {
 
     return {
       userData: this.userData,
+      addonName: appConfig.branding.addonName,
+      onWarning: (message) => logger.warn(message),
       type: this.type,
       isAnime: this.isAnime,
       queryType: this.queryType,
@@ -650,6 +682,8 @@ export class StreamContext {
       originalLanguage: iso6391ToLanguage(
         this._metadata?.originalLanguage || ''
       ),
+      country: this._metadata?.country,
+      episodeTitles: this._metadata?.episodeTitles?.map((t) => t.title),
       daysSinceRelease: this.computeAgeInDays(),
       hasNextEpisode: !!this._metadata?.nextAirDate,
       daysUntilNextEpisode: this.computeDaysUntilNextEpisode(),
@@ -660,7 +694,9 @@ export class StreamContext {
         : undefined,
       anilistId: this.animeEntry?.mappings?.anilistId,
       malId: this.animeEntry?.mappings?.malId,
-      hasSeaDex: !!this._seadex?.allHashes?.size,
+      hasSeaDex: !!(
+        this._seadex?.allHashes?.size || this._seadex?.allGroups?.size
+      ),
       maxSeScore,
       maxRegexScore,
     };
@@ -703,7 +739,10 @@ export class StreamContext {
       anilistId: this.animeEntry?.mappings?.anilistId,
       malId: this.animeEntry?.mappings?.malId,
       // SeaDex availability
-      hasSeaDex: !!this._seadex?.allHashes?.size,
+      hasSeaDex: !!(
+        this._seadex?.allHashes?.size || this._seadex?.allGroups?.size
+      ),
+      health: this.userData.healthResults,
     };
   }
 }

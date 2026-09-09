@@ -1,26 +1,28 @@
 import { ReactNode, useCallback, useRef } from 'react';
 import { useDisclosure } from '@/hooks/disclosure';
 import { toast } from 'sonner';
-import { arrayMove } from '@dnd-kit/sortable';
 import { IconButton } from '../../../ui/button';
 import { TextInput } from '../../../ui/text-input';
 import { NumberInput } from '../../../ui/number-input';
 import { Tooltip } from '../../../ui/tooltip';
 import { Checkbox } from '../../../ui/checkbox';
-import { cn } from '../../../ui/core/styling';
 import { SettingsCard } from '../../../shared/settings-card';
 import { ImportModal } from '../../../shared/import-modal';
-import { SyncedUrlInputs, type SyncConfig } from './synced-patterns';
 import {
-  FaPlus,
-  FaRegTrashAlt,
-  FaFileExport,
-  FaFileImport,
-  FaArrowUp,
-  FaArrowDown,
-  FaLink,
-} from 'react-icons/fa';
+  ItemActions,
+  SortableList,
+  SortableRow,
+  rowActionsClass,
+  rowControlsClass,
+  rowLeadControlClass,
+  useSortableRows,
+  type SortableRows,
+} from '../../../shared/sortable-rows';
+import { SyncedUrlInputs, type SyncConfig } from './synced-patterns';
+import { FaPlus, FaFileExport, FaFileImport, FaLink } from 'react-icons/fa';
 import { UserData } from '@aiostreams/core';
+
+const scoreFieldClass = 'md:flex-1 md:min-w-[100px]';
 
 /** Parse a `<SYNCED: url>` placeholder, returning the URL or null. */
 function parseSyncedUrl(value: string): string | null {
@@ -49,17 +51,31 @@ function downloadJson(data: unknown, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-/** Read-only label for an inline synced-URL placeholder. */
-function PlaceholderRow<T>({
-  items,
+/** Derive a filename from a label, e.g. "Required Keywords" → "required-keywords-2026-02-08.14-56".json */
+function labelToFilename(label: string) {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  const hh = String(now.getHours()).padStart(2, '0');
+  const min = String(now.getMinutes()).padStart(2, '0');
+  const dateStr = `${yyyy}-${mm}-${dd}.${hh}-${min}`;
+  return `${label.toLowerCase().replace(/\s+/g, '-')}-${dateStr}.json`;
+}
+
+/**
+ * Read-only cells for an inline synced-URL placeholder. Synced rows have no
+ * checkbox, so on lists that have one the link icon takes that column to keep
+ * the fields lined up; elsewhere it sits inside the field.
+ */
+function PlaceholderRow({
+  rows,
   index,
-  onItemsChange,
   url,
   iconPosition,
 }: {
-  items: T[];
+  rows: SortableRows;
   index: number;
-  onItemsChange: (items: T[]) => void;
   url: string;
   iconPosition?: 'inside' | 'outside';
 }) {
@@ -69,7 +85,7 @@ function PlaceholderRow<T>({
         '[data-settings-card]'
       );
       const row = (container ?? document).querySelector(
-        `[data-synced-url="${CSS.escape(url)}"]`
+        `[data-synced-url="${window.CSS.escape(url)}"]`
       );
       if (!row) return;
       row.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -104,75 +120,54 @@ function PlaceholderRow<T>({
   );
 
   return (
-    <div
-      className={cn(
-        'grid gap-2 items-end w-full',
-        iconPosition !== 'inside'
-          ? 'grid-cols-[auto_minmax(0,1fr)_auto]'
-          : 'grid-cols-[minmax(0,1fr)_auto]'
-      )}
-    >
-      {iconPosition !== 'inside' && (
-        <div className="flex items-center pb-2">{linkButton}</div>
-      )}
-      <div className="relative space-y-1 min-w-0">
-        <label className="text-base w-fit font-semibold self-start">
-          Synced URL
-        </label>
-        <div className="flex items-center gap-2 w-full rounded-[--radius] bg-[--paper] border border-[--border] shadow-sm h-10 px-3 opacity-75 overflow-hidden">
-          {iconPosition === 'inside' && linkButton}
-          <span className="text-sm text-[--muted] font-mono truncate min-w-0 flex-1">
-            {url}
-          </span>
+    <>
+      <div className={rowControlsClass}>
+        {iconPosition !== 'inside' && (
+          <div className={rowLeadControlClass}>{linkButton}</div>
+        )}
+        <div className={rowActionsClass}>
+          <ItemActions rows={rows} index={index} />
         </div>
       </div>
-      <div className="flex gap-1 items-end pb-1">
-        <ItemActions
-          items={items}
-          index={index}
-          onItemsChange={onItemsChange}
-        />
+      <div className="md:flex-1 min-w-0 flex items-center gap-2 rounded-[--radius] bg-[--paper] border border-[--border] shadow-sm h-10 px-3 opacity-75 overflow-hidden">
+        {iconPosition === 'inside' && linkButton}
+        <span className="text-sm text-[--muted] font-mono truncate min-w-0 flex-1">
+          {url}
+        </span>
       </div>
-    </div>
+    </>
   );
 }
 
-/** Map items, rendering PlaceholderRow for synced-URL entries and a custom render for normal items. */
-function renderItemsWithPlaceholders<T>(
+/**
+ * Map items into draggable cards, substituting a read-only body for
+ * synced-URL entries.
+ */
+function renderRows<T>(
+  rows: SortableRows,
   items: T[],
   getField: (item: T) => string,
-  onItemsChange: (items: T[]) => void,
-  renderItem: (item: T, index: number) => React.ReactNode,
+  renderItem: (item: T, index: number) => ReactNode,
   options?: { syncEnabled?: boolean; iconPosition?: 'inside' | 'outside' }
-): React.ReactNode[] {
+): ReactNode[] {
   return items.map((item, index) => {
+    const key = rows.keyAt(index);
     const url = options?.syncEnabled ? parseSyncedUrl(getField(item)) : null;
-    if (url) {
-      return (
-        <PlaceholderRow
-          key={index}
-          items={items}
-          index={index}
-          onItemsChange={onItemsChange}
-          url={url}
-          iconPosition={options?.iconPosition}
-        />
-      );
-    }
-    return renderItem(item, index);
+    return (
+      <SortableRow key={key} id={key}>
+        {url ? (
+          <PlaceholderRow
+            rows={rows}
+            index={index}
+            url={url}
+            iconPosition={options?.iconPosition}
+          />
+        ) : (
+          renderItem(item, index)
+        )}
+      </SortableRow>
+    );
   });
-}
-
-/** Derive a filename from a label, e.g. "Required Keywords" → "required-keywords-2026-02-08.14-56".json */
-function labelToFilename(label: string) {
-  const now = new Date();
-  const yyyy = now.getFullYear();
-  const mm = String(now.getMonth() + 1).padStart(2, '0');
-  const dd = String(now.getDate()).padStart(2, '0');
-  const hh = String(now.getHours()).padStart(2, '0');
-  const min = String(now.getMinutes()).padStart(2, '0');
-  const dateStr = `${yyyy}-${mm}-${dd}.${hh}-${min}`;
-  return `${label.toLowerCase().replace(/\s+/g, '-')}-${dateStr}.json`;
 }
 
 /**
@@ -200,47 +195,6 @@ function useImportExport<T>(
   }, [getExportData, label]);
 
   return { modal, handleImport, handleExport } as const;
-}
-
-// Reusable item-list action buttons
-
-interface ItemActionsProps<T> {
-  items: T[];
-  index: number;
-  onItemsChange: (items: T[]) => void;
-}
-
-/** Move-up / Move-down / Delete buttons shared by every list item. */
-function ItemActions<T>({ items, index, onItemsChange }: ItemActionsProps<T>) {
-  return (
-    <>
-      <IconButton
-        size="sm"
-        rounded
-        icon={<FaArrowUp />}
-        intent="primary-subtle"
-        disabled={index === 0}
-        onClick={() => onItemsChange(arrayMove(items, index, index - 1))}
-      />
-      <IconButton
-        size="sm"
-        rounded
-        icon={<FaArrowDown />}
-        intent="primary-subtle"
-        disabled={index === items.length - 1}
-        onClick={() => onItemsChange(arrayMove(items, index, index + 1))}
-      />
-      <IconButton
-        size="sm"
-        rounded
-        icon={<FaRegTrashAlt />}
-        intent="alert-subtle"
-        onClick={() =>
-          onItemsChange([...items.slice(0, index), ...items.slice(index + 1)])
-        }
-      />
-    </>
-  );
 }
 
 // Reusable list footer (Add + Import/Export)
@@ -328,6 +282,8 @@ export function TextInputs({
   const valuesRef = useRef(values);
   valuesRef.current = values;
 
+  const rows = useSortableRows(values, onValuesChange);
+
   const getExportData = useCallback(() => ({ values: valuesRef.current }), []);
   const handleImportData = useCallback(
     (data: any) => {
@@ -364,31 +320,31 @@ export function TextInputs({
       description={help}
       key={label}
     >
-      {renderItemsWithPlaceholders(
-        values,
-        (v) => v,
-        onValuesChange,
-        (value, index) => (
-          <div key={index} className="flex gap-2">
-            <div className="flex-1">
-              <TextInput
-                value={value}
-                label={itemName}
-                placeholder={placeholder}
-                onValueChange={(newValue) => handleValueChange(newValue, index)}
-              />
-            </div>
-            <div className="flex gap-1 items-end pb-1">
-              <ItemActions
-                items={values}
-                index={index}
-                onItemsChange={onValuesChange}
-              />
-            </div>
-          </div>
-        ),
-        { syncEnabled: !!syncConfig, iconPosition: 'inside' }
-      )}
+      <SortableList rows={rows}>
+        {renderRows(
+          rows,
+          values,
+          (v) => v,
+          (value, index) => (
+            <>
+              <div className={rowActionsClass}>
+                <ItemActions rows={rows} index={index} />
+              </div>
+              <div className="md:flex-1">
+                <TextInput
+                  value={value}
+                  aria-label={itemName}
+                  placeholder={placeholder ?? itemName}
+                  onValueChange={(newValue) =>
+                    handleValueChange(newValue, index)
+                  }
+                />
+              </div>
+            </>
+          ),
+          { syncEnabled: !!syncConfig, iconPosition: 'inside' }
+        )}
+      </SortableList>
       <ListFooter
         onAdd={() => onValuesChange([...values, ''])}
         onImportClick={modal.open}
@@ -433,6 +389,8 @@ export function ToggleableTextInputs({
 }: ToggleableTextInputProps) {
   const valuesRef = useRef(values);
   valuesRef.current = values;
+
+  const rows = useSortableRows(values, onValuesChange);
 
   const getExportData = useCallback(
     () =>
@@ -482,46 +440,47 @@ export function ToggleableTextInputs({
       title={title}
       description={description}
     >
-      {renderItemsWithPlaceholders(
-        values,
-        (v) => v.expression,
-        onValuesChange,
-        (value, index) => (
-          <div key={index} className="flex gap-2 items-end">
-            <div className="flex items-center pb-0.5">
-              <Checkbox
-                value={value.enabled ?? true}
-                defaultValue={true}
-                size="lg"
-                onValueChange={(v) => {
-                  if (onEnabledChange) {
-                    onEnabledChange(v === true, index);
+      <SortableList rows={rows}>
+        {renderRows(
+          rows,
+          values,
+          (v) => v.expression,
+          (value, index) => (
+            <>
+              <div className={rowControlsClass}>
+                <div className={rowLeadControlClass}>
+                  <Checkbox
+                    value={value.enabled ?? true}
+                    defaultValue={true}
+                    size="lg"
+                    aria-label="Enabled"
+                    onValueChange={(v) => {
+                      if (onEnabledChange) {
+                        onEnabledChange(v === true, index);
+                      }
+                    }}
+                  />
+                </div>
+                <div className={rowActionsClass}>
+                  <ItemActions rows={rows} index={index} />
+                </div>
+              </div>
+              <div className="md:flex-1">
+                <TextInput
+                  value={value.expression}
+                  aria-label="Expression"
+                  placeholder={placeholder}
+                  disabled={value.enabled === false}
+                  onValueChange={(newValue) =>
+                    onExpressionChange(newValue, index)
                   }
-                }}
-              />
-            </div>
-            <div className="flex-1">
-              <TextInput
-                value={value.expression}
-                label="Expression"
-                placeholder={placeholder}
-                disabled={value.enabled === false}
-                onValueChange={(newValue) =>
-                  onExpressionChange(newValue, index)
-                }
-              />
-            </div>
-            <div className="flex gap-1 items-end pb-1">
-              <ItemActions
-                items={values}
-                index={index}
-                onItemsChange={onValuesChange}
-              />
-            </div>
-          </div>
-        ),
-        { syncEnabled: !!syncConfig }
-      )}
+                />
+              </div>
+            </>
+          ),
+          { syncEnabled: !!syncConfig }
+        )}
+      </SortableList>
       <ListFooter
         onAdd={() =>
           onValuesChange([...values, { expression: '', enabled: true }])
@@ -579,6 +538,8 @@ export function TwoTextInputs({
   const valuesRef = useRef(values);
   valuesRef.current = values;
 
+  const rows = useSortableRows(values, onValuesChange);
+
   const getExportData = useCallback(
     () =>
       valuesRef.current.map((v) => ({ [keyId]: v.name, [valueId]: v.value })),
@@ -613,39 +574,37 @@ export function TwoTextInputs({
 
   return (
     <SettingsCard title={title} description={description}>
-      {renderItemsWithPlaceholders(
-        values,
-        (v) => v.value,
-        onValuesChange,
-        (value, index) => (
-          <div key={index} className="flex gap-2">
-            <div className="flex-1">
-              <TextInput
-                value={value.name}
-                label={keyName}
-                placeholder={keyPlaceholder}
-                onValueChange={(newValue) => onKeyChange(newValue, index)}
-              />
-            </div>
-            <div className="flex-1">
-              <TextInput
-                value={value.value}
-                label={valueName}
-                placeholder={valuePlaceholder}
-                onValueChange={(newValue) => onValueChange(newValue, index)}
-              />
-            </div>
-            <div className="flex gap-1 items-end pb-1">
-              <ItemActions
-                items={values}
-                index={index}
-                onItemsChange={onValuesChange}
-              />
-            </div>
-          </div>
-        ),
-        { syncEnabled: !!syncConfig, iconPosition: 'inside' }
-      )}
+      <SortableList rows={rows}>
+        {renderRows(
+          rows,
+          values,
+          (v) => v.value,
+          (value, index) => (
+            <>
+              <div className={rowActionsClass}>
+                <ItemActions rows={rows} index={index} />
+              </div>
+              <div className="md:flex-1">
+                <TextInput
+                  value={value.name}
+                  aria-label={keyName}
+                  placeholder={keyPlaceholder}
+                  onValueChange={(newValue) => onKeyChange(newValue, index)}
+                />
+              </div>
+              <div className="md:flex-1">
+                <TextInput
+                  value={value.value}
+                  aria-label={valueName}
+                  placeholder={valuePlaceholder}
+                  onValueChange={(newValue) => onValueChange(newValue, index)}
+                />
+              </div>
+            </>
+          ),
+          { syncEnabled: !!syncConfig, iconPosition: 'inside' }
+        )}
+      </SortableList>
       <ListFooter
         onAdd={() => onValuesChange([...values, { name: '', value: '' }])}
         onImportClick={modal.open}
@@ -693,6 +652,8 @@ export function RankedExpressionInputs({
   const valuesRef = useRef(values);
   valuesRef.current = values;
 
+  const rows = useSortableRows(values, onValuesChange);
+
   const getExportData = useCallback(
     () =>
       valuesRef.current.map((v) => ({
@@ -738,60 +699,61 @@ export function RankedExpressionInputs({
       title={title}
       description={description}
     >
-      {renderItemsWithPlaceholders(
-        values,
-        (v) => v.expression,
-        onValuesChange,
-        (value, index) => (
-          <div key={index} className="flex gap-2 items-end">
-            <div className="flex items-center pb-0.5">
-              <Checkbox
-                value={value.enabled ?? true}
-                defaultValue={true}
-                size="lg"
-                onValueChange={(v) => {
-                  if (onEnabledChange) {
-                    onEnabledChange(v === true, index);
+      <SortableList rows={rows}>
+        {renderRows(
+          rows,
+          values,
+          (v) => v.expression,
+          (value, index) => (
+            <>
+              <div className={rowControlsClass}>
+                <div className={rowLeadControlClass}>
+                  <Checkbox
+                    value={value.enabled ?? true}
+                    defaultValue={true}
+                    size="lg"
+                    aria-label="Enabled"
+                    onValueChange={(v) => {
+                      if (onEnabledChange) {
+                        onEnabledChange(v === true, index);
+                      }
+                    }}
+                  />
+                </div>
+                <div className={rowActionsClass}>
+                  <ItemActions rows={rows} index={index} />
+                </div>
+              </div>
+              <div className="md:flex-[3]">
+                <TextInput
+                  value={value.expression}
+                  aria-label="Expression"
+                  placeholder="addon(type(streams, 'debrid'), 'TorBox')"
+                  disabled={value.enabled === false}
+                  onValueChange={(newValue) =>
+                    onExpressionChange(newValue, index)
                   }
-                }}
-              />
-            </div>
-            <div className="flex-[3]">
-              <TextInput
-                value={value.expression}
-                label="Expression"
-                placeholder="addon(type(streams, 'debrid'), 'TorBox')"
-                disabled={value.enabled === false}
-                onValueChange={(newValue) =>
-                  onExpressionChange(newValue, index)
-                }
-              />
-            </div>
-            <div className="flex-1 min-w-[100px]">
-              <NumberInput
-                value={value.score || 0}
-                defaultValue={0}
-                label="Score"
-                disabled={value.enabled === false}
-                onValueChange={(newValue) =>
-                  onScoreChange(newValue || 0, index)
-                }
-                min={-1_000_000}
-                max={1_000_000}
-                step={50}
-              />
-            </div>
-            <div className="pb-1 gap-1 flex items-end">
-              <ItemActions
-                items={values}
-                index={index}
-                onItemsChange={onValuesChange}
-              />
-            </div>
-          </div>
-        ),
-        { syncEnabled: !!syncConfig }
-      )}
+                />
+              </div>
+              <div className={scoreFieldClass}>
+                <NumberInput
+                  value={value.score || 0}
+                  defaultValue={0}
+                  aria-label="Score"
+                  disabled={value.enabled === false}
+                  onValueChange={(newValue) =>
+                    onScoreChange(newValue || 0, index)
+                  }
+                  min={-1_000_000}
+                  max={1_000_000}
+                  step={50}
+                />
+              </div>
+            </>
+          ),
+          { syncEnabled: !!syncConfig }
+        )}
+      </SortableList>
       <ListFooter
         onAdd={() =>
           onValuesChange([
@@ -842,6 +804,8 @@ export function RankedRegexInputs({
   const valuesRef = useRef(values);
   valuesRef.current = values;
 
+  const rows = useSortableRows(values, onValuesChange);
+
   const getExportData = useCallback(
     () =>
       valuesRef.current.map((v) => ({
@@ -881,36 +845,36 @@ export function RankedRegexInputs({
 
   return (
     <SettingsCard title={title} description={description}>
-      {renderItemsWithPlaceholders(
-        values,
-        (v) => v.pattern,
-        onValuesChange,
-        (value, index) => (
-          <div
-            key={index}
-            className="flex flex-col gap-2 p-3 border rounded-md border-[--border]"
-          >
-            <div className="w-full">
-              <TextInput
-                value={value.pattern}
-                label="Pattern"
-                placeholder="Regex Pattern"
-                onValueChange={(newValue) => onPatternChange(newValue, index)}
-              />
-            </div>
-            <div className="flex gap-2 items-end">
-              <div className="flex-1">
+      <SortableList rows={rows}>
+        {renderRows(
+          rows,
+          values,
+          (v) => v.pattern,
+          (value, index) => (
+            <>
+              <div className={rowActionsClass}>
+                <ItemActions rows={rows} index={index} />
+              </div>
+              <div className="md:flex-[3]">
+                <TextInput
+                  value={value.pattern}
+                  aria-label="Pattern"
+                  placeholder="Regex Pattern"
+                  onValueChange={(newValue) => onPatternChange(newValue, index)}
+                />
+              </div>
+              <div className="md:flex-[2]">
                 <TextInput
                   value={value.name || ''}
-                  label="Name"
+                  aria-label="Name"
                   placeholder="Name (Optional)"
                   onValueChange={(newValue) => onNameChange(newValue, index)}
                 />
               </div>
-              <div className="w-[20%] min-w-[100px]">
+              <div className={scoreFieldClass}>
                 <NumberInput
                   value={value.score}
-                  label="Score"
+                  aria-label="Score"
                   onValueChange={(newValue) =>
                     onScoreChange(newValue ?? 0, index)
                   }
@@ -919,18 +883,11 @@ export function RankedRegexInputs({
                   step={50}
                 />
               </div>
-              <div className="flex gap-1 pb-1">
-                <ItemActions
-                  items={values}
-                  index={index}
-                  onItemsChange={onValuesChange}
-                />
-              </div>
-            </div>
-          </div>
-        ),
-        { syncEnabled: !!syncConfig, iconPosition: 'inside' }
-      )}
+            </>
+          ),
+          { syncEnabled: !!syncConfig, iconPosition: 'inside' }
+        )}
+      </SortableList>
       <ListFooter
         onAdd={() =>
           onValuesChange([...values, { pattern: '', name: '', score: 0 }])

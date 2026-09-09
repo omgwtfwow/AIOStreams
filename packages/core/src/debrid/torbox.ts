@@ -7,6 +7,7 @@ import {
   Cache,
   DistributedLock,
   getTimeTakenSincePoint,
+  makeUrlLogSafe,
   Time,
 } from '../utils/index.js';
 import { StremThruService } from './stremthru.js';
@@ -14,6 +15,7 @@ import {
   selectFileInTorrentOrNZB,
   hashNzbUrl,
   buildResolveKey,
+  removeDownloadOnAbort,
 } from './utils.js';
 import {
   DebridServiceConfig,
@@ -23,16 +25,51 @@ import {
   TorrentDebridService,
   UsenetDebridService,
   DebridFailureCache,
+  convertStatusCodeToError,
 } from './base.js';
-import { ParsedResult, parseTorrentTitle } from '@viren070/parse-torrent-title';
+import { ParsedResult } from '@viren070/parse-torrent-title';
+import { parseTorrentTitleCached } from '../parser/title.js';
 
 const logger = createLogger('debrid:torbox');
 
+/**
+ * TorBox reports the failure kind as a string enum in the `error` field of its
+ * JSON body. Codes missing from this table stay UNKNOWN and get logged so new
+ * ones surface rather than silently becoming a generic 500.
+ */
+const TORBOX_ERROR_CODES: Record<string, NonNullable<DebridError['code']>> = {
+  AUTH_ERROR: 'UNAUTHORIZED',
+  BAD_TOKEN: 'UNAUTHORIZED',
+  NO_AUTH: 'UNAUTHORIZED',
+  OAUTH_VERIFICATION_ERROR: 'UNAUTHORIZED',
+  NOT_ALLOWED: 'FORBIDDEN',
+  PLAN_RESTRICTED_FEATURE: 'PAYMENT_REQUIRED',
+  ACTIVE_LIMIT: 'STORE_LIMIT_EXCEEDED',
+  COOLDOWN_LIMIT: 'STORE_LIMIT_EXCEEDED',
+  DOWNLOAD_TOO_LARGE: 'STORE_LIMIT_EXCEEDED',
+  MONTHLY_LIMIT: 'STORE_LIMIT_EXCEEDED',
+  TOO_MUCH_DATA: 'STORE_LIMIT_EXCEEDED',
+  RATE_LIMIT_EXCEEDED: 'TOO_MANY_REQUESTS',
+  DOWNLOAD_SERVER_ERROR: 'BAD_GATEWAY',
+  BOZO_NZB: 'STORE_MAGNET_INVALID',
+  BOZO_TORRENT: 'STORE_MAGNET_INVALID',
+  LINK_OFFLINE: 'GONE',
+  ENDPOINT_NOT_FOUND: 'NOT_FOUND',
+  ITEM_NOT_FOUND: 'NOT_FOUND',
+  DUPLICATE_ITEM: 'CONFLICT',
+  INVALID_INPUT: 'BAD_REQUEST',
+  INVALID_OPTION: 'BAD_REQUEST',
+  NO_SERVERS_AVAILABLE_ERROR: 'SERVICE_UNAVAILABLE',
+  VENDOR_DISABLED: 'SERVICE_UNAVAILABLE',
+  DATABASE_ERROR: 'INTERNAL_SERVER_ERROR',
+  UNKNOWN_ERROR: 'INTERNAL_SERVER_ERROR',
+};
+
 function convertTorBoxError(error: any): DebridError {
   if (typeof error.message === 'string') {
-    // extract body JSON by looking for line in error.message starting with Body: and parsing the rest of the line as JSON
+    // The SDK folds the response body into its message as a `Body: {...}` line.
     const body = (() => {
-      const match = error.message.match(/Body:\s*({.*})/);
+      const match = error.message.match(/Body:\s*({[\s\S]*})/);
       if (match) {
         try {
           return JSON.parse(match[1]);
@@ -45,11 +82,11 @@ function convertTorBoxError(error: any): DebridError {
       }
       return undefined;
     })();
-    const errorCode =
-      (body?.error || error.message.match(/([A-Z_]{2,})/)?.[1]) ?? 'UNKNOWN';
-
-    let code: DebridError['code'] = 'UNKNOWN';
-    let message = body?.detail || error.message || 'Unknown error';
+    // Some responses (rate limits, gateway errors) carry only a `detail`, so the
+    // HTTP status is the only thing left to classify them by.
+    const apiCode: string | undefined =
+      typeof body?.error === 'string' ? body.error : undefined;
+    const detail = typeof body?.detail === 'string' ? body.detail : undefined;
     const statusCode =
       typeof error.metadata?.status === 'number'
         ? error.metadata.status
@@ -59,31 +96,33 @@ function convertTorBoxError(error: any): DebridError {
         ? error.metadata.statusText
         : undefined;
 
-    switch (errorCode) {
-      case 'ACTIVE_LIMIT':
-      case 'COOLDOWN_LIMIT':
-      case 'MONTHLY_LIMIT':
-      case 'DOWNLOAD_TOO_LARGE':
-        code = 'STORE_LIMIT_EXCEEDED';
-        break;
-      case 'NO_AUTH':
-      case 'BAD_TOKEN':
-      case 'AUTH_ERROR':
-        code = 'UNAUTHORIZED';
-        break;
-      case 'RATE_LIMIT_EXCEEDED':
-        code = 'TOO_MANY_REQUESTS';
-        break;
-    }
+    const mappedCode = apiCode ? TORBOX_ERROR_CODES[apiCode] : undefined;
+    let code: DebridError['code'] =
+      mappedCode ??
+      (statusCode !== undefined
+        ? convertStatusCodeToError(statusCode)
+        : 'UNKNOWN');
+    // Lead with whatever names the failure so it survives into the logs and the
+    // failure cache; the SDK's own message is a multi-line dump of the response.
+    let message =
+      (apiCode ?? statusText)
+        ? `${apiCode ?? statusText}${detail ? `: ${detail}` : ''}`
+        : detail || error.message || 'Unknown error';
+
     if (error.message.includes('rate limit')) {
       code = 'TOO_MANY_REQUESTS';
       message = 'Too many requests - rate limit exceeded';
     }
 
-    if (code === 'UNKNOWN') {
-      logger.warn(`Could not parse unknown error from Torbox API`, {
-        message: error.message,
-        error: JSON.stringify(error),
+    if (apiCode && !mappedCode) {
+      logger.warn(`Unmapped error code from Torbox API: ${apiCode}`, {
+        statusCode,
+        detail,
+      });
+    } else if (code === 'UNKNOWN') {
+      logger.warn(`Could not classify error response from Torbox API`, {
+        statusCode,
+        response: error.message,
       });
     }
 
@@ -424,7 +463,7 @@ export class TorboxDebridService
       return this._fetchNzbList(id);
     }
 
-    const cacheKey = `torbox:usenet:${this.config.token}`;
+    const cacheKey = `torbox:usenet:${getSimpleTextHash(this.config.token)}`;
     const limit = Math.min(
       Math.max(appConfig.builtins.debrid.libraryPageSize, 100),
       1000
@@ -578,7 +617,7 @@ export class TorboxDebridService
 
     // Refresh NZBs
     if (includeNzbs) {
-      const cacheKey = `torbox:usenet:${this.config.token}`;
+      const cacheKey = `torbox:usenet:${getSimpleTextHash(this.config.token)}`;
       const limit = Math.min(
         Math.max(appConfig.builtins.debrid.libraryPageSize, 100),
         1000
@@ -628,14 +667,16 @@ export class TorboxDebridService
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    signal?: AbortSignal
   ): Promise<string | undefined> {
     if (playbackInfo.type === 'torrent') {
       return this.stremthru.resolve(
         playbackInfo,
         filename,
         cacheAndPlay,
-        autoRemoveDownloads
+        autoRemoveDownloads,
+        signal
       );
     }
     const { result } = await DistributedLock.getInstance().withLock(
@@ -653,7 +694,8 @@ export class TorboxDebridService
           playbackInfo,
           filename,
           cacheAndPlay,
-          autoRemoveDownloads
+          autoRemoveDownloads,
+          signal
         ),
       {
         timeout: cacheAndPlay ? this.maxWaitTime + this.pollInterval : 30000,
@@ -669,7 +711,8 @@ export class TorboxDebridService
     playbackInfo: PlaybackInfo & { type: 'usenet' },
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    signal?: AbortSignal
   ): Promise<string | undefined> {
     const { nzb, metadata, hash } = playbackInfo;
     const cacheKey = buildResolveKey(
@@ -684,7 +727,7 @@ export class TorboxDebridService
       await TorboxDebridService.playbackLinkCache.get(cacheKey);
 
     if (cachedLink !== undefined) {
-      logger.debug(`Using cached link for ${nzb}`);
+      logger.debug(`Using cached link for ${nzb ? makeUrlLogSafe(nzb) : hash}`);
       if (cachedLink === null) {
         if (!cacheAndPlay) {
           return undefined;
@@ -741,16 +784,25 @@ export class TorboxDebridService
         name: usenetDownload.name,
       });
     } else {
-      logger.debug(`Adding usenet download for ${nzb}`, {
+      logger.debug(`Adding usenet download for ${makeUrlLogSafe(nzb)}`, {
         hash,
       });
 
       usenetDownload = await this.addNzb(nzb, filename);
 
-      logger.debug(`Usenet download added for ${nzb}`, {
+      logger.debug(`Usenet download added for ${makeUrlLogSafe(nzb)}`, {
         status: usenetDownload.status,
         id: usenetDownload.id,
       });
+
+      // If this attempt loses a parallel failover race, drop the usenet
+      // download we just added (library lookups above are left intact).
+      removeDownloadOnAbort(
+        signal,
+        { id: usenetDownload.id },
+        (id) => this.removeNzb(id),
+        (m) => logger.warn(m)
+      );
     }
 
     if (usenetDownload.status !== 'downloaded') {
@@ -762,6 +814,16 @@ export class TorboxDebridService
       // poll status when cacheAndPlay is true
       const maxPolls = Math.ceil(this.maxWaitTime / this.pollInterval);
       for (let i = 0; i < maxPolls; i++) {
+        if (signal?.aborted) {
+          throw new DebridError('resolve aborted (failover lost)', {
+            statusCode: 499,
+            statusText: 'Client Closed Request',
+            code: 'UNKNOWN',
+            headers: {},
+            body: null,
+            type: 'api_error',
+          });
+        }
         await new Promise((resolve) => setTimeout(resolve, this.pollInterval));
         const usenetList = await this._fetchNzbList(
           usenetDownload.id.toString()
@@ -770,12 +832,17 @@ export class TorboxDebridService
           (usenet) => usenet.hash === hash || usenet.id === usenetDownload.id
         );
         if (!usenetDownloadInList) {
-          logger.warn(`Failed to find ${nzb || hash} in list`);
+          logger.warn(
+            `Failed to find ${nzb ? makeUrlLogSafe(nzb) : hash} in list`
+          );
         } else {
-          logger.debug(`Polled status for ${nzb || hash}`, {
-            attempt: i + 1,
-            status: usenetDownloadInList.status,
-          });
+          logger.debug(
+            `Polled status for ${nzb ? makeUrlLogSafe(nzb) : hash}`,
+            {
+              attempt: i + 1,
+              status: usenetDownloadInList.status,
+            }
+          );
           if (usenetDownloadInList.status === 'downloaded') {
             usenetDownload = usenetDownloadInList;
             break;
@@ -788,7 +855,7 @@ export class TorboxDebridService
               {
                 statusCode: 400,
                 statusText: `Usenet download ${usenetDownloadInList.status}`,
-                code: 'UNKNOWN',
+                code: 'DOWNLOAD_FAILED',
                 headers: {},
                 body: usenetDownloadInList,
                 type: 'api_error',
@@ -811,7 +878,7 @@ export class TorboxDebridService
           {
             statusCode: 408,
             statusText: 'Timeout',
-            code: 'UNKNOWN',
+            code: 'TIMEOUT',
             headers: {},
             body: usenetDownload,
             type: 'api_error',
@@ -851,7 +918,7 @@ export class TorboxDebridService
       allStrings.push(...usenetDownload.files.map((file) => file.name ?? ''));
 
       const parseResults: ParsedResult[] = allStrings.map((string) =>
-        parseTorrentTitle(string)
+        parseTorrentTitleCached(string)
       );
       const parsedFiles = new Map<string, ParsedResult>();
       for (const [index, result] of parseResults.entries()) {

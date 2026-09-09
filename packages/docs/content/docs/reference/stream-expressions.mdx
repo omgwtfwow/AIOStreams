@@ -59,6 +59,20 @@ The constants available to you depend on where the expression is used.
 | `queryType`      | `string`         | Media type (e.g. `"movie"`, `"series"`, `"anime.series"`, `"anime.movie"`) |
 | `queriedAddons`  | `string[]`       | Addon names queried so far                                                 |
 
+### Variant Conditions
+
+Used by a [config variant](/reference/config-expressions) to activate itself from the incoming request. These conditions describe the request rather than the streams, so the stream helpers do not apply.
+
+| Constant    | Type     | Description                                                              |
+| ----------- | -------- | ------------------------------------------------------------------------ |
+| `userAgent` | `string` | The client's `User-Agent` header, or `''`                                |
+| `resource`  | `string` | `stream`, `manifest.json`, `catalog`, `meta`, `subtitles`, `search`, ... |
+| `type`      | `string` | Media type, where the request has one                                    |
+| `id`        | `string` | The requested id, e.g. `tt0111161:1:2`                                   |
+
+Along with the four [variant condition functions](#variant-condition-functions), which work
+nowhere else, and `health()`, which works everywhere.
+
 ### Stream Expression Filters & Precompute Selector
 
 | Constant               | Type             | Default | Description                                           |
@@ -118,6 +132,30 @@ Reference-only comment (not used as a name — start with `#`):
 ## Function Reference
 
 ### Utility Functions
+
+#### `health()`
+
+Whether a health check is currently passing. Available **everywhere**: filters, rankings, group conditions, exit conditions, the precache and preload selectors, and variant activation conditions.
+
+| Parameter | Type     | Description                                           |
+| --------- | -------- | ----------------------------------------------------- |
+| `id`      | `string` | Id of a health check, quoted. Must be one you defined |
+
+Define health checks in **Miscellaneous → Health Checks**; see [conditional activation](/reference/config-expressions#conditional-activation) for what they can test and how often they run. Every check is resolved once per request, so one request sees one answer everywhere.
+
+```
+# Skip a group entirely while your indexer is down
+health('prowlarr')
+```
+
+```
+# Drop a debrid service's results while its status page says it is degraded
+health('rd-up') ? streams : service(streams, 'realdebrid')
+```
+
+Referring to a check that does not exist is rejected when you save.
+
+---
 
 #### `negate()`
 
@@ -235,6 +273,63 @@ avg(values(streams, 'bitrate'))
 
 ---
 
+### Variant Condition Functions
+
+**These four work only in a [variant activation condition](/reference/config-expressions#conditional-activation).** They read the incoming request, which nothing else in this reference has access to, so a filter, ranking, group condition, exit condition or precache selector that calls one fails to evaluate. Everything else on this page is the other way round: unavailable in a variant condition, which has no streams to act on.
+
+`health()` is the exception in both directions, and works everywhere.
+
+---
+
+#### `query()`
+
+A query parameter from the request, or `''`.
+
+| Parameter | Type     | Description            |
+| --------- | -------- | ---------------------- |
+| `name`    | `string` | Parameter name, quoted |
+
+```
+query('profile') == 'tv'
+```
+
+---
+
+#### `header()`
+
+A request header, or `''`. Names are case-insensitive. Credentials and internal headers are not exposed.
+
+```
+includes(header('x-forwarded-for'), '10.0.0.')
+```
+
+---
+
+#### `includes()`
+
+Whether one string contains another, ignoring case.
+
+| Parameter  | Type     | Description        |
+| ---------- | -------- | ------------------ |
+| `haystack` | `string` | String to search   |
+| `needle`   | `string` | String to look for |
+
+```
+includes(userAgent, 'android')
+```
+
+---
+
+#### `matches()`
+
+Whether a regular expression matches a value. The pattern must be a quoted literal, and this instance's regex rules apply. Wrap it as `/pattern/flags` to pass flags, the same as every other regex field.
+
+```
+matches(userAgent, '/stremio.*(android|ios)/i')
+```
+
+---
+
 ### Filter Functions
 
 All filter functions follow the pattern: `fn(streams, ...values)` → `ParsedStream[]`
@@ -267,7 +362,7 @@ resolution(streams, '2160p', '1080p')
 
 Filter by quality tag.
 
-**Accepted values:** `'Bluray REMUX'` `'Bluray'` `'WEB-DL'` `'WEBRip'` `'HDRip'` `'HC HD-Rip'` `'DVDRip'` `'HDTV'` `'CAM'` `'TS'` `'TC'` `'SCR'` `'Unknown'`
+**Accepted values:** `'Bluray REMUX'` `'Bluray'` `'WEB-DL'` `'WEBRip'` `'HDRip'` `'HC HD-Rip'` `'DVD REMUX'` `'DVDRip'` `'HDTV'` `'CAM'` `'TS'` `'TC'` `'SCR'` `'Unknown'`
 
 ```
 quality(streams, 'Bluray', 'WEB-DL')
@@ -281,6 +376,18 @@ Filter by video encoding format (e.g. `'H.264'`, `'H.265'`, `'HEVC'`, `'x265'`).
 
 ```
 encode(streams, 'H.265', 'HEVC')
+```
+
+---
+
+#### `mediaInfoQuality()`
+
+Filter by how a stream's media info (languages, subtitles, audio, etc.) was determined. Streams with no confirmed media info match `'unknown'`.
+
+**Accepted values:** `'probe'` `'indexer'` `'addon'` `'unknown'`
+
+```
+mediaInfoQuality(streams, 'probe', 'indexer')
 ```
 
 ---
@@ -396,6 +503,22 @@ size(streams, '1GB', '10GB')
 
 ---
 
+#### `folderSize()`
+
+Filter by folder/torrent size. Accepts human-readable strings (`'1GB'`, `'500MB'`) or raw byte counts.
+
+| Parameter | Type                | Description         |
+| --------- | ------------------- | ------------------- |
+| `streams` | `ParsedStream[]`    | Stream list         |
+| `min`     | `number \| string?` | Minimum folder size |
+| `max`     | `number \| string?` | Maximum folder size |
+
+```
+folderSize(streams, '10GB')
+```
+
+---
+
 #### `bitrate()`
 
 Filter by bitrate. Accepts `'5Mbps'`, `'5000kbps'`, or raw bits-per-second.
@@ -416,7 +539,7 @@ bitrate(streams, '5Mbps')
 
 Filter by Debrid service.
 
-**Accepted values:** `'realdebrid'` `'debridlink'` `'alldebrid'` `'torbox'` `'pikpak'` `'seedr'` `'offcloud'` `'premiumize'` `'easynews'` `'nzbdav'` `'altmount'` `'stremio_nntp'` `'easydebrid'` `'debrider'`
+**Accepted values:** `'realdebrid'` `'debridlink'` `'premiumize'` `'alldebrid'` `'torbox'` `'easydebrid'` `'debrider'` `'putio'` `'pikpak'` `'offcloud'` `'seedr'` `'easynews'` `'nzbdav'` `'altmount'` `'stremio_nntp'` `'stremthru_newz'` `'aiostreams'` `'torrin'`
 
 ```
 service(streams, 'realdebrid', 'torbox')
@@ -490,6 +613,39 @@ library(streams)
 
 ---
 
+#### `idMatched()`
+
+Filter for streams whose source identified the release by **external ID** rather than by searching its
+title as text.
+
+This is the case when a built-in addon queries something like an `imdbid`/`tvdbid`/`tmdbid` against a
+database that is actually indexed by those IDs — most commonly ID search on your own Newznab/Torznab
+indexers. Such a result is already known to be the right release, so it is a good candidate to let
+skip AIOStreams' own filename-derived matching filters via [`passthrough()`](#passthrough).
+
+Streams are flagged by: **Newznab** and **Torznab** (when the search used an ID parameter rather than
+falling back to a `q=` text query), **EZTV**, **SeaDex**, and the **Library** addon.
+
+```
+passthrough(idMatched(streams), 'title', 'year', 'episode')
+```
+
+<Callout type="warn">
+  Meta-indexers accept an ID search but silently fall back to a title search for any underlying
+  indexer that doesn't support that ID — so results from an **NZBHydra2** endpoint entered as a
+  custom Newznab/Torznab URL for example, get flagged without having been
+  ID-matched. If you use one, scope the expression to the addons you trust:
+  `passthrough(idMatched(addon(streams, 'DrunkenSlug')), 'title', 'episode')`.
+</Callout>
+
+<Callout type="info">
+  The flag belongs to whichever copy of a release carried it, so it is lost if a duplicate from
+  another addon wins deduplication. To keep it, enable **Merge Duplicates** under **Filters →
+  Deduplicator** and add `idMatched` to **Merged Metadata Fields**.
+</Callout>
+
+---
+
 #### `message()`
 
 Filter by a stream's `message` property.
@@ -510,10 +666,13 @@ message(streams, 'includes', 'cached')
 
 Filter for [SeaDex](https://releases.moe)-listed streams (best anime releases).
 
-| Parameter | Type               | Description                                                                     |
-| --------- | ------------------ | ------------------------------------------------------------------------------- |
-| `streams` | `ParsedStream[]`   | Stream list                                                                     |
-| `type`    | `'best' \| 'all'?` | `'best'` for only SeaDex "Best" entries; omit or `'all'` for all SeaDex matches |
+Streams are matched against SeaDex in two ways: by **info hash** (exact, the stream is one of the listed torrents) or, when the hash doesn't match, by **release group** (heuristic, the stream comes from a group listed on the SeaDex entry).
+
+| Parameter | Type                        | Description                                                                                                              |
+| --------- | --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `streams` | `ParsedStream[]`            | Stream list                                                                                                              |
+| `type`    | `'best' \| 'alt' \| 'all'?` | `'best'` for only SeaDex "Best" entries; `'alt'` for listed-but-not-best entries; omit or `'all'` for all SeaDex matches |
+| `method`  | `'hash' \| 'group'?`        | Restrict to a match method; omit for both. Use `'hash'` if you only want exact matches                                   |
 
 <Callout type="info">
   Only active when SeaDex integration is enabled under **Filters →
@@ -522,6 +681,8 @@ Filter for [SeaDex](https://releases.moe)-listed streams (best anime releases).
 
 ```
 seadex(streams, 'best')
+seadex(streams, 'all', 'hash')
+seadex(streams, 'best', 'hash')
 ```
 
 ---
@@ -682,6 +843,9 @@ When used in an **Excluded Stream Expression**: flagged streams won't be removed
 ```
 passthrough(streams, 'language', 'limit')
 passthrough(streams)  // bypass all stages
+
+// let results your indexer matched by ID skip filename-based matching
+passthrough(idMatched(streams), 'title', 'year', 'episode')
 ```
 
 ---

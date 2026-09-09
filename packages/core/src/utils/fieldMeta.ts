@@ -66,12 +66,18 @@ export interface FieldMeta {
   keywords?: string[];
   /** Exclude from the parent config field-overrides UI. Field appears in the command palette but cannot be individually overridden in the parent config modal. */
   ignoreForParentConfig?: boolean;
+  /** Exclude from the command palette. For fields with no always-rendered card, e.g. options only settable by importing a JSON config. */
+  ignoreForCommandPalette?: boolean;
 }
 
 type IgnoredKeys =
   | 'uuid'
   | 'encryptedPassword'
   | 'trusted'
+  | 'activeVariants'
+  | 'autoVariants'
+  | 'healthResults'
+  | 'variantSelectorLocation'
   | 'addons'
   | 'proxies'
   | 'ip'
@@ -163,7 +169,7 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   syncedRankedStreamExpressionUrls: { label: 'Synced Ranked Expression URLs', group: 'filters', type: 'list', menu: 'filters', subTab: 'stream-expression' },
 
   enableSeadex: { label: 'SeaDex', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous', keywords: ['anime', 'releases.moe'] },
-  excludeSeasonPacks: { label: 'Exclude Season Packs', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous' },
+  excludeSeasonPacks: { label: 'Exclude Season Packs', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'miscellaneous', ignoreForCommandPalette: true },
 
   excludeCached: { label: 'Exclude Cached Streams', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'cache' },
   excludeCachedFromAddons: { label: 'Exclude Cached — From Addons', group: 'filters', type: 'list', menu: 'filters', subTab: 'cache', sectionId: 'excludeCached' },
@@ -193,6 +199,8 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   titleMatching: { label: 'Title Matching', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'matching' },
   yearMatching: { label: 'Year Matching', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'matching' },
   seasonEpisodeMatching: { label: 'Season/Episode Matching', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'matching' },
+  episodeTitleMatching: { label: 'Episode Title Matching', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'matching' },
+  languageInference: { label: 'Language Inference', group: 'filters', type: 'scalar', menu: 'filters', subTab: 'matching' },
 
   sortCriteria: { label: 'Sort Criteria', group: 'sorting', type: 'scalar', menu: 'sorting' },
   deduplicator: { label: 'Deduplicator', group: 'sorting', type: 'scalar', menu: 'filters', subTab: 'deduplicator' },
@@ -211,6 +219,7 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   aioratingsProfileId: { label: 'AIOratings Profile ID', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
   openposterdbApiKey: { label: 'OpenPosterDB API Key', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
   openposterdbUrl: { label: 'OpenPosterDB URL', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
+  openposterdbParameters: { label: 'OpenPosterDB Custom Parameters', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
   posterService: { label: 'Poster Service', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
   usePosterRedirectApi: { label: 'Use Poster Redirect API', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
   usePosterServiceForMeta: { label: 'Use Poster Service for Meta', group: 'metadata', type: 'scalar', menu: 'services', subTab: 'posters' },
@@ -230,7 +239,7 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   catalogModifications: { label: 'Catalog Modifications', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
   mergedCatalogs: { label: 'Merged Catalogs', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'catalogs' },
 
-  nzbFailover: { label: 'NZB Failover', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },
+  failover: { label: 'Failover', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },
   serviceWrap: { label: 'Service Wrap', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },
   cacheAndPlay: { label: 'Cache and Play', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },
   autoRemoveDownloads: { label: 'Auto Remove Downloads', group: 'misc', type: 'scalar', menu: 'services', subTab: 'builtin' },
@@ -238,6 +247,8 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
 
   accessKey: { label: 'Config Access Key', group: 'misc', type: 'scalar', menu: 'save-install' },
   showChanges: { label: 'Show Changes', group: 'misc', type: 'scalar', menu: 'save-install' },
+  manifestNotice: { label: 'Manifest Change Notices', group: 'misc', type: 'scalar', menu: 'save-install', keywords: ['reinstall', 'notice', 'diff'] },
+  linkedAccounts: { label: 'Linked Accounts', group: 'misc', type: 'scalar', menu: 'save-install', keywords: ['sync', 'stremio', 'aiomanager', 'push'] },
 
   addonName: { label: 'Addon Name', group: 'branding', type: 'scalar', menu: 'about', keywords: ['branding'] },
   addonLogo: { label: 'Addon Logo', group: 'branding', type: 'scalar', menu: 'about', keywords: ['branding'] },
@@ -248,5 +259,7 @@ export const FIELD_META: Omit<Record<keyof UserData, FieldMeta>, IgnoredKeys> = 
   presets: { label: 'Addons', group: 'misc', type: 'list', identityKey: 'instanceId', menu: 'addons', subTab: 'addons', keywords: ['addons', 'presets'], ignoreForParentConfig: true },
   services: { label: 'Services', group: 'misc', type: 'list', identityKey: 'id', menu: 'services', subTab: 'services', ignoreForParentConfig: true },
   parentConfig: { label: 'Parent Config', group: 'misc', type: 'scalar', menu: 'miscellaneous', subTab: 'parent', sectionId: 'parentConfig', keywords: ['inherit', 'link', 'parent'], ignoreForParentConfig: true },
+  variants: { label: 'Variants', group: 'misc', type: 'list', identityKey: 'id', menu: 'miscellaneous', subTab: 'variants', sectionId: 'variants', keywords: ['variant', 'sub-profile', 'cel', 'config expression', 'override'], ignoreForParentConfig: true },
   groups: { label: 'Groups', group: 'misc', type: 'scalar', menu: 'addons', subTab: 'addons', keywords: ['groupings'], ignoreForParentConfig: true, sectionId: 'fetchStrategy' },
+  healthChecks: { label: 'Health Checks', group: 'misc', type: 'list', identityKey: 'id', menu: 'miscellaneous', subTab: 'health-checks', sectionId: 'healthChecks', keywords: ['health', 'uptime', 'status', 'variant', 'conditional'], ignoreForParentConfig: true },
 };

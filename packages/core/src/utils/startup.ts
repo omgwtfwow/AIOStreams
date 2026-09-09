@@ -39,14 +39,14 @@ export const logStartupInfo = () => {
     : appConfig.bootstrap.databaseUri.replace(/:\/\/[^@]+@/, '://***@');
   logger.info(`  Database:      ${dbType}  ${dbDisplay}`);
   if (appConfig.bootstrap.redisUri) {
-    logger.info(`  Redis:         ${appConfig.bootstrap.redisUri}`);
+    logger.info(
+      `  Redis:         ${appConfig.bootstrap.redisUri.replace(/:\/\/[^@]+@/, '://***@')}`
+    );
   }
   logger.info('');
 
-  logger.info(`  Log Level:     ${appConfig.bootstrap.logLevel.toUpperCase()}`);
-  logger.info(
-    `  Log Format:    ${appConfig.bootstrap.logFormat.toUpperCase()}`
-  );
+  logger.info(`  Log Level:     ${appConfig.logging.logLevel.toUpperCase()}`);
+  logger.info(`  Log Format:    ${appConfig.logging.logFormat.toUpperCase()}`);
   if (appConfig.logging.logSensitiveInfo) {
     logger.warn(
       '  Sensitive Info logging is ENABLED =€” disable in production'

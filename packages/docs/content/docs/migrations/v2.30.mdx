@@ -107,21 +107,11 @@ FORCE_PROXY_PUBLIC_URL='https://proxy.example.com'
 
 ---
 
-## `ADDON_PASSWORD` migration
+## Config access key
 
-`ADDON_PASSWORD` is removed and replaced by session-based login and an
-automatically-managed config access key. Existing configurations are migrated
-automatically — no manual changes to stored configs are needed.
-
-**You must keep `ADDON_PASSWORD` in your environment for at least one startup
-after upgrading to v2.30** so the migration can run. After that, you can remove
-it. The config access key will be set to your old `ADDON_PASSWORD` value so
-existing configs continue to work.
-
-Since the old password-based protection is removed, make sure you have logins
-configured via `AIOSTREAMS_AUTH` — a comma-separated list of `user:password`
-pairs (e.g. `admin:admin123,user1:pass1`). These are the credentials you will
-be asked for when you next access the configuration page.
+Current installs use session-based login and a config access key. Configure
+logins with `AIOSTREAMS_AUTH` and set `CONFIG_ACCESS_KEY` only when you need to
+manage the key explicitly.
 
 <Callout type="info">
   Only admin users from `AIOSTREAMS_AUTH` can access the dashboard. By default,

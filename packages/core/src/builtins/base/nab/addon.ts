@@ -21,6 +21,7 @@ import {
 import {
   createQueryLimit,
   getTitleLanguagesForUrl,
+  titleContainsAirDate,
 } from '../../utils/general.js';
 
 /**
@@ -51,6 +52,7 @@ export function parseNabParsedFileInfo(args: {
   subtitleLanguages?: string | number | boolean;
 }): ParsedMediaInfo | undefined {
   return normaliseParsedMediaInfo({
+    mediaInfoQuality: 'indexer',
     languages: parseNabLanguages(args.audioLanguages),
     subtitles: parseNabLanguages(args.subtitleLanguages),
   });
@@ -63,6 +65,9 @@ export const NabAddonConfigSchema = BaseDebridConfigSchema.extend({
   forceQuerySearch: z.boolean().default(false),
   paginate: z.boolean().default(false),
   forceInitialLimit: z.number().min(1).max(10000).optional(),
+  seasonEpisodeStrategy: z
+    .enum(['episode', 'season', 'episodeFirst', 'dynamic'])
+    .default('episode'),
 });
 export type NabAddonConfig = z.infer<typeof NabAddonConfigSchema>;
 
@@ -170,6 +175,50 @@ export abstract class BaseNabAddon<
     )
       queryParams.year = metadata.year.toString();
 
+    // date-based shows: numeric season/ep params return nothing, the Sonarr
+    // daily convention (season=YYYY&ep=MM/DD) is what indexers understand
+    const isDailySearch =
+      parsedId.mediaType === 'series' &&
+      metadata.isDateBased &&
+      metadata.episodeAirDate &&
+      queryParams.season !== undefined &&
+      queryParams.ep !== undefined;
+    // preserve the numeric season/ep so we can fall back to them if the daily
+    // search misses
+    let numericFallbackParams: Record<string, string> | undefined;
+    if (isDailySearch) {
+      // queryParams still holds the numeric season/ep here
+      numericFallbackParams = { ...queryParams };
+      const [yyyy, mm, dd] = metadata.episodeAirDate!.split('-');
+      queryParams.season = yyyy;
+      queryParams.ep = `${mm}/${dd}`;
+    }
+
+    queryParams.extended = '1';
+
+    const canApplySeasonPackStrategy =
+      parsedId.mediaType === 'series' &&
+      !this.userData.forceQuerySearch &&
+      !isDailySearch &&
+      searchCapabilities.supportedParams.includes('season') &&
+      queryParams.season &&
+      queryParams.ep;
+
+    let primaryParams = queryParams;
+    let fallbackParams: Record<string, string> | undefined;
+    if (canApplySeasonPackStrategy) {
+      const { ep, ...seasonOnlyParams } = queryParams;
+      let strategy = this.userData.seasonEpisodeStrategy;
+      if (strategy === 'dynamic') {
+        strategy = metadata.ongoingSeason ? 'episode' : 'season';
+      }
+      if (strategy === 'season') {
+        primaryParams = seasonOnlyParams;
+      } else if (strategy === 'episodeFirst') {
+        fallbackParams = seasonOnlyParams;
+      }
+    }
+
     let queries: string[] = [];
     if (
       !queryParams.imdbid &&
@@ -192,19 +241,56 @@ export abstract class BaseNabAddon<
       });
       searchType = 'query';
     }
-    queryParams.extended = '1';
     let results: SearchResultItem<A['namespace']>[] = [];
     if (queries.length > 0) {
-      this.logger.debug('Performing queries', { queries });
-      const searchPromises = queries.map((q) =>
-        queryLimit(() =>
-          this.fetchResults(searchFunction, { ...queryParams, q })
-        )
-      );
-      const allResults = await Promise.all(searchPromises);
-      results = allResults.flat();
+      const runQueries = (params: Record<string, string>) => {
+        this.logger.debug('Performing queries', { queries });
+        return Promise.all(
+          queries.map((q) =>
+            queryLimit(() =>
+              this.fetchResults(searchFunction, { ...params, q })
+            )
+          )
+        ).then((allResults) => allResults.flat());
+      };
+
+      results = await runQueries(primaryParams);
+      if (results.length === 0 && fallbackParams) {
+        this.logger.debug(
+          'No results for initial queries, retrying with alternate season/episode params',
+          { season: queryParams.season, episode: queryParams.ep }
+        );
+        results = await runQueries(fallbackParams);
+      }
     } else {
-      results = await this.fetchResults(searchFunction, queryParams);
+      results = await this.fetchResults(searchFunction, primaryParams);
+      if (results.length === 0 && fallbackParams) {
+        this.logger.debug(
+          'No results for initial search, retrying with alternate season/episode params',
+          { season: queryParams.season, episode: queryParams.ep }
+        );
+        results = await this.fetchResults(searchFunction, fallbackParams);
+      }
+      if (
+        isDailySearch &&
+        numericFallbackParams &&
+        !results.some((r) =>
+          titleContainsAirDate(r.title, metadata.airDates ?? [])
+        )
+      ) {
+        this.logger.debug(
+          'No air-date match for daily search, retrying with numeric season/episode params',
+          {
+            airDate: metadata.episodeAirDate,
+            season: numericFallbackParams.season,
+            episode: numericFallbackParams.ep,
+          }
+        );
+        results = await this.fetchResults(
+          searchFunction,
+          numericFallbackParams
+        );
+      }
     }
     this.logger.info(
       `Completed search for ${capabilities.server.title} in ${getTimeTakenSincePoint(start)}`,
@@ -270,6 +356,9 @@ export abstract class BaseNabAddon<
       total: initialResponse.total,
     });
 
+    const identity = (r: SearchResultItem<A['namespace']>): string =>
+      r.guid ?? r.enclosure?.[0]?.url ?? r.link ?? r.title;
+
     // if both first and last items are duplicates, the page is likely a duplicate
     const areResultsDuplicate = (
       existing: SearchResultItem<A['namespace']>[],
@@ -277,11 +366,11 @@ export abstract class BaseNabAddon<
     ): boolean => {
       if (newResults.length === 0) return false;
 
-      const firstNew = newResults[0];
-      const lastNew = newResults[newResults.length - 1];
+      const firstNew = identity(newResults[0]);
+      const lastNew = identity(newResults[newResults.length - 1]);
 
-      const firstExists = existing.some((r) => r.guid === firstNew.guid);
-      const lastExists = existing.some((r) => r.guid === lastNew.guid);
+      const firstExists = existing.some((r) => identity(r) === firstNew);
+      const lastExists = existing.some((r) => identity(r) === lastNew);
 
       return firstExists && lastExists;
     };

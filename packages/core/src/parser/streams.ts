@@ -13,8 +13,14 @@ import {
   parseAgeString,
   parseDuration,
   extractInfoHashFromMagnet,
+  convertFlagToLanguage,
+  getRegexForTextAfterEmojis,
 } from './utils.js';
-import { mergeParsedFiles, arrayMerge } from './merge.js';
+import {
+  mergeParsedFiles,
+  arrayMerge,
+  applySeasonPackHeuristics,
+} from './merge.js';
 
 const logger = createLogger('parser');
 
@@ -55,21 +61,22 @@ class StreamParser {
   }
 
   protected get indexerRegex(): RegExp | undefined {
-    return this.getRegexForTextAfterEmojis(this.indexerEmojis);
+    return getRegexForTextAfterEmojis(this.indexerEmojis);
   }
 
   protected get ageRegex(): RegExp | undefined {
     return undefined;
   }
 
-  protected getRegexForTextAfterEmojis(emojis: string[]): RegExp {
-    return new RegExp(
-      `(?:${emojis.join('|')})\\s*([^\\p{Emoji_Presentation}\\n]*?)(?=\\p{Emoji_Presentation}|$|\\n)`,
-      'u'
-    );
+  constructor(protected readonly addon: Addon) {}
+
+  protected getReleaseKey(stream: Stream): string | undefined {
+    return undefined;
   }
 
-  constructor(protected readonly addon: Addon) {}
+  protected getIdMatched(stream: Stream): boolean | undefined {
+    return undefined;
+  }
 
   parse(stream: Stream): ParsedStream | { skip: true } {
     if (this.shouldSkip(stream)) {
@@ -88,6 +95,8 @@ class StreamParser {
       proxied: this.isProxied(stream),
       url: this.applyUrlModifications(stream.url ?? undefined),
       nzbUrl: stream.nzbUrl || undefined,
+      releaseKey: this.getReleaseKey(stream),
+      idMatched: this.getIdMatched(stream),
       tarUrls: stream.tarUrls ?? undefined,
       tgzUrls: stream.tgzUrls ?? undefined,
       '7zipUrls': stream['7zipUrls'] ?? undefined,
@@ -95,12 +104,14 @@ class StreamParser {
       servers: stream.servers ?? undefined,
       externalUrl: stream.externalUrl ?? undefined,
       ytId: stream.ytId ?? undefined,
+      subtitles: stream.subtitles ?? undefined,
       requestHeaders: stream.behaviorHints?.proxyHeaders?.request,
       responseHeaders: stream.behaviorHints?.proxyHeaders?.response,
       notWebReady: stream.behaviorHints?.notWebReady ?? undefined,
       videoHash: stream.behaviorHints?.videoHash ?? undefined,
       originalName: stream.name ?? undefined,
       originalDescription: (stream.description || stream.title) ?? undefined,
+      otherBehaviorHints: stream.behaviorHints ?? undefined,
     };
 
     this.raiseErrorIfNecessary(stream, parsedStream);
@@ -583,23 +594,10 @@ class StreamParser {
 
     if (!merged) return undefined;
 
-    // Detect season pack based on folder size being significantly larger than file size
-    if (
-      !merged.seasonPack &&
-      merged.episodes &&
-      merged.episodes.length > 0 &&
-      parsedStream.folderSize &&
-      parsedStream.size &&
-      parsedStream.folderSize > parsedStream.size * 2
-    ) {
-      merged.seasonPack = true;
-    }
-    // Detect season pack when more than 5 episodes are present
-    if (!merged.seasonPack && merged.episodes && merged.episodes.length > 5) {
-      merged.seasonPack = true;
-    }
-
-    return merged;
+    return applySeasonPackHeuristics(merged, {
+      size: parsedStream.size,
+      folderSize: parsedStream.folderSize,
+    });
   }
 
   /**
@@ -619,24 +617,9 @@ class StreamParser {
       ...(descriptionMatches ? [...new Set(descriptionMatches)] : []),
       ...(nameMatches ? [...new Set(nameMatches)] : []),
     ];
-    const languages = flags
-      .map((flag) => this.convertFlagToLanguage(flag))
+    return flags
+      .map((flag) => convertFlagToLanguage(flag))
       .filter((language) => language !== undefined);
-    return languages;
-  }
-
-  protected convertFlagToLanguage(flag: string): string | undefined {
-    const possibleLanguages = FULL_LANGUAGE_MAPPING.filter(
-      (language) => language.flag === flag
-    );
-
-    const language =
-      possibleLanguages.find((l) => l.flag_priority) || possibleLanguages[0];
-    if (!language) return undefined;
-    const languageName = getLanguageDisplayName(language);
-    return constants.LANGUAGES.includes(languageName as any)
-      ? languageName
-      : undefined;
   }
 
   protected convertISO6392ToLanguage(code: string): string | undefined {
@@ -691,7 +674,7 @@ class StreamParser {
   ): ParsedStream['service'] | undefined {
     const cleanString = string.replace(/web-?dl/i, '');
     const services = constants.SERVICE_DETAILS;
-    const cachedSymbols = ['+', '⚡', '🚀', 'cached', '🌩️', '📫'];
+    const cachedSymbols = ['⚡', '🚀', 'cached', '🌩️', '📫'];
     const uncachedSymbols = ['⏳', 'download', 'UNCACHED', '☁️'];
     let streamService: ParsedStream['service'] | undefined;
     Object.values(services).forEach((service) => {
@@ -701,14 +684,20 @@ class StreamParser {
         'im'
       );
       // check if the string contains the regex
-      if (regex.test(cleanString)) {
+      const match = cleanString.match(regex);
+      if (match) {
         let cached: boolean = false;
+        const followedByPlus =
+          cleanString[(match.index ?? 0) + match[0].length] === '+';
         // check if any of the uncachedSymbols are in the string
         if (uncachedSymbols.some((symbol) => string.includes(symbol))) {
           cached = false;
         }
         // check if any of the cachedSymbols are in the string
-        else if (cachedSymbols.some((symbol) => string.includes(symbol))) {
+        else if (
+          followedByPlus ||
+          cachedSymbols.some((symbol) => string.includes(symbol))
+        ) {
           cached = true;
         }
 

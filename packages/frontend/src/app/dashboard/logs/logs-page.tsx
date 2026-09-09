@@ -12,6 +12,7 @@ import {
   BiDownArrowAlt,
   BiDotsVerticalRounded,
   BiCopy,
+  BiTrash,
 } from 'react-icons/bi';
 import { toast } from 'sonner';
 import { TextInput } from '@/components/ui/text-input';
@@ -31,7 +32,13 @@ import { useDebounce } from '@/hooks/debounce';
 import { PageWrapper } from '@/components/shared/page-wrapper';
 import { Spinner } from '@/components/ui/loading-spinner';
 import { LuffyError } from '@/components/shared/luffy-error';
+import {
+  ConfirmationDialog,
+  useConfirmationDialog,
+} from '@/components/shared/confirmation-dialog';
 import { copyToClipboard } from '@/utils/clipboard';
+import { formatDateTime } from '@/lib/format';
+import { api } from '@/lib/api';
 
 const LEVELS = ['trace', 'debug', 'info', 'warn', 'error', 'fatal'] as const;
 
@@ -40,8 +47,8 @@ const LEVEL_STYLES: Record<string, string> = {
   debug: 'text-sky-500',
   info: 'text-emerald-500',
   warn: 'text-amber-500',
-  error: 'text-red-500',
-  fatal: 'text-red-600 font-bold',
+  error: 'text-red-400',
+  fatal: 'text-red-400 font-bold',
 };
 
 const LEVEL_DOT: Record<string, string> = {
@@ -49,24 +56,9 @@ const LEVEL_DOT: Record<string, string> = {
   debug: 'bg-sky-500',
   info: 'bg-emerald-500',
   warn: 'bg-amber-500',
-  error: 'bg-red-500',
-  fatal: 'bg-red-600',
+  error: 'bg-red-400',
+  fatal: 'bg-red-400',
 };
-
-function formatTime(iso: string): string {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true,
-  });
-}
 
 const ALL_MODULES = '__all__';
 const PREFS_KEY = 'aiostreams.logs.prefs';
@@ -104,7 +96,7 @@ function LogLine({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const time = formatTime(row.time);
+  const time = formatDateTime(row.time);
   const hasFields = Object.keys(row.obj).length > 0;
   const [hovered, setHovered] = useState(false);
 
@@ -198,6 +190,27 @@ export function LogsPage() {
   const debouncedSearch = useDebounce(search, 250);
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
 
+  const confirmClear = useConfirmationDialog({
+    title: 'Clear logs',
+    description:
+      'This permanently removes all retained logs. This cannot be undone.',
+    actionText: 'Clear',
+    actionIntent: 'alert-subtle',
+    onConfirm: async () => {
+      try {
+        await api<{ cleared: boolean }>('POST /dashboard/logs/clear', {
+          body: { confirm: true },
+        });
+        clear();
+        toast.success('Logs cleared');
+      } catch (err: any) {
+        toast.error(err?.message ?? 'Failed to clear logs');
+      }
+    },
+  });
+
+  const clearLogs = () => confirmClear.open();
+
   const regexError = useMemo(() => {
     if (!regex || !search) return null;
     try {
@@ -218,7 +231,8 @@ export function LogsPage() {
     [debouncedSearch, regex, regexError, levels, module]
   );
 
-  const { rows, loading, connected, error, retry } = useLogStream(filters);
+  const { rows, loading, connected, error, clear, retry } =
+    useLogStream(filters);
 
   // Defer rendering the heavy virtualizer until the page-entry animation settles (~400ms spring)
   const [ready, setReady] = useState(false);
@@ -347,7 +361,14 @@ export function LogsPage() {
               </span>
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 items-center">
+            <IconButton
+              size="sm"
+              intent="gray-outline"
+              icon={<BiTrash />}
+              aria-label="Clear logs"
+              onClick={clearLogs}
+            />
             <Button
               size="sm"
               intent="gray-outline"
@@ -380,7 +401,7 @@ export function LogsPage() {
                   onValueChange={setSearch}
                   className={cn(
                     'flex-1',
-                    regexError && 'border-red-500 focus-within:border-red-500'
+                    regexError && 'border-red-400 focus-within:border-red-400'
                   )}
                 />
                 <button
@@ -392,7 +413,7 @@ export function LogsPage() {
                     regex && !regexError
                       ? 'border-brand bg-brand/10 text-brand'
                       : regex && regexError
-                        ? 'border-red-500 bg-red-500/10 text-red-500'
+                        ? 'border-red-400 bg-red-500/10 text-red-400'
                         : 'border-[--border] text-[--muted] hover:text-[--foreground] hover:border-[--foreground]'
                   )}
                 >
@@ -400,7 +421,7 @@ export function LogsPage() {
                 </button>
               </div>
               {regexError && (
-                <p className="text-xs text-red-500 pl-1">{regexError}</p>
+                <p className="text-xs text-red-400 pl-1">{regexError}</p>
               )}
             </div>
             <div className="flex flex-1 md:flex-none items-center gap-2">
@@ -528,6 +549,8 @@ export function LogsPage() {
             </Button>
           )}
         </Card>
+
+        <ConfirmationDialog {...confirmClear} />
       </div>
     </PageWrapper>
   );

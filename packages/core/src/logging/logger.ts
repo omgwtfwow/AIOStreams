@@ -1,8 +1,8 @@
 import pino, { type DestinationStream, type Logger as PinoLogger } from 'pino';
 import { prettyFactory } from 'pino-pretty';
 import { Writable } from 'stream';
-import { bootstrap } from '../config/bootstrap.js';
-import { redactUrlParams } from './redact.js';
+import { formatMilliseconds } from '../utils/time.js';
+import { redactForLog, redactLogField } from './redact.js';
 import { logRingBuffer } from './ring-buffer.js';
 
 export interface Logger {
@@ -25,10 +25,29 @@ export type LogArg = unknown;
 type LogArgs = LogArg[];
 
 type Level = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+export type LogFormat = 'json' | 'text';
+
+/** The levels pino actually emits, and the only ones offered in the UI. */
+export const LOG_LEVELS = [
+  'trace',
+  'debug',
+  'info',
+  'warn',
+  'error',
+  'fatal',
+] as const;
+
+/** Winston-era aliases. Still accepted so existing deployments keep booting. */
+export const LEGACY_LOG_LEVELS = [
+  'verbose',
+  'silly',
+  'http',
+  'warning',
+] as const;
 
 // --- Pino root setup ------------------------------------------------------
 
-function normalizeLevel(raw: string | undefined): Level {
+export function normaliseLevel(raw: string | undefined): Level {
   if (!raw) return 'info';
   const v = raw.toLowerCase();
   switch (v) {
@@ -54,40 +73,52 @@ function normalizeLevel(raw: string | undefined): Level {
   return 'info';
 }
 
-function buildDestination(): DestinationStream | Writable {
-  const format = (bootstrap.logFormat || '').toLowerCase();
-  if (format !== 'text') {
-    return pino.destination({ dest: 1, sync: false });
-  }
-  // Text mode: pino emits NDJSON to this stream; we parse each line,
-  // redact URLs in msg, then re-emit via pino-pretty.
+export function normaliseFormat(raw: string | undefined): LogFormat {
+  return (raw || '').toLowerCase() === 'text' ? 'text' : 'json';
+}
+
+let currentFormat: LogFormat = normaliseFormat(process.env.LOG_FORMAT);
+
+/**
+ * Stream A: stdout. pino hands every stream the same NDJSON regardless of
+ * format, so json-vs-text is a per-line rendering decision rather than a
+ * property of the stream — which is what lets the format change at runtime
+ * without rebuilding the root logger. json is forwarded verbatim to SonicBoom;
+ * text is parsed and re-emitted through pino-pretty. Redaction happens
+ * upstream in the wrapper/serializers, so both renderings are equally safe.
+ *
+ * A bare `write` object rather than a `Writable`: multistream only calls
+ * `write`, and this sits on the hot path for every log line.
+ */
+function buildStdoutStream(): DestinationStream {
+  const json = pino.destination({ dest: 1, sync: false });
   const prettify = prettyFactory({ colorize: true, sync: true });
-  return new Writable({
-    write(chunk: Buffer | string, _enc, cb) {
-      const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
-      for (const line of text.split('\n')) {
+  return {
+    write(chunk: string) {
+      if (currentFormat !== 'text') {
+        json.write(chunk);
+        return;
+      }
+      for (const line of chunk.split('\n')) {
         if (!line) continue;
         try {
           const obj = JSON.parse(line) as Record<string, unknown>;
-          if (typeof obj.msg === 'string') {
-            obj.msg = redactUrlParams(obj.msg);
-          }
           process.stdout.write(prettify(obj));
         } catch {
           process.stdout.write(line + '\n');
         }
       }
-      cb();
     },
-  });
+  };
 }
 
 /**
  * Stream B for the multistream: tees every NDJSON line into the in-memory
  * ring buffer that backs the dashboard Logs page. Lines arrive already
- * redacted (pino applies `redact` before any stream sees the record), so the
- * dashboard can never leak secrets. Chunks are not guaranteed to be
- * line-aligned, so we buffer a partial trailing fragment.
+ * redacted (the wrapper redacts `msg` and the `err` serializer redacts error
+ * text before pino writes), so the dashboard sees exactly what stdout sees.
+ * Chunks are not guaranteed to be line-aligned, so we buffer a partial
+ * trailing fragment.
  */
 function buildRingStream(): Writable {
   let partial = '';
@@ -107,15 +138,10 @@ function buildRingStream(): Writable {
 
 const root: PinoLogger = pino(
   {
-    level: normalizeLevel(bootstrap.logLevel),
-    base: {
-      // Per `04-logging.md`, every record carries `instance` so the
-      // Logs dashboard can fan out across replicas. The ID is shared
-      // with the future replicas heartbeat table (see `06-dashboard.md`)
-      // so a log line and a heartbeat row referring to the same process
-      // carry the same `instance` value.
-      // instanceId: INSTANCE_ID,
-    },
+    // Boot seed only, read straight from env because the logger is constructed
+    // before the DB-backed config exists
+    level: normaliseLevel(process.env.LOG_LEVEL),
+    base: {},
     formatters: {
       // Emit `level` as the textual name, not pino's numeric code.
       level(label) {
@@ -124,11 +150,22 @@ const root: PinoLogger = pino(
     },
     timestamp: pino.stdTimeFunctions.isoTime,
     serializers: {
-      err: pino.stdSerializers.err,
+      err(e: unknown) {
+        const serialized = pino.stdSerializers.err(e as Error);
+        if (serialized && typeof serialized === 'object') {
+          if (typeof serialized.message === 'string') {
+            serialized.message = redactForLog(serialized.message);
+          }
+          if (typeof serialized.stack === 'string') {
+            serialized.stack = redactForLog(serialized.stack);
+          }
+        }
+        return serialized;
+      },
     },
   },
   pino.multistream([
-    { level: 'trace', stream: buildDestination() },
+    { level: 'trace', stream: buildStdoutStream() },
     { level: 'trace', stream: buildRingStream() },
   ])
 );
@@ -232,6 +269,17 @@ function deconflictReservedKeys(obj: Record<string, unknown>): void {
   }
 }
 
+/**
+ * When a record carries `latency` as a number of milliseconds, add a
+ * human-readable `latencyHuman` alongside it (e.g. `850ms`, `1m 5s`). This is
+ * the single convention for timing across the codebase: pass `latency` in ms.
+ */
+function deriveLatencyHuman(obj: Record<string, unknown>): void {
+  if (typeof obj.latency === 'number' && !('latencyHuman' in obj)) {
+    obj.latencyHuman = formatMilliseconds(obj.latency);
+  }
+}
+
 function wrap(pinoInstance: PinoLogger): Logger {
   const emit =
     (level: Level | keyof typeof legacyLevelMap) =>
@@ -242,11 +290,17 @@ function wrap(pinoInstance: PinoLogger): Logger {
           : (level as Level);
       const { obj, msg } = normalizeArgs(args);
       deconflictReservedKeys(obj);
+      deriveLatencyHuman(obj);
       if (msg === undefined && Object.keys(obj).length === 0) return;
+      for (const key of Object.keys(obj)) {
+        if (typeof obj[key] === 'string') {
+          obj[key] = redactLogField(key, obj[key] as string);
+        }
+      }
       if (msg === undefined) {
         pinoInstance[target](obj);
       } else {
-        pinoInstance[target](obj, msg);
+        pinoInstance[target](obj, redactForLog(msg));
       }
     };
 
@@ -277,4 +331,20 @@ export const logger: Logger = wrap(root);
  */
 export function createLogger(module: string): Logger {
   return wrap(root.child({ module }));
+}
+
+/**
+ * Change the log level of every logger.
+ */
+export function setLogLevel(level: string): void {
+  root.level = normaliseLevel(level);
+}
+
+/**
+ * Switch stdout rendering between NDJSON and pretty-printed text. Takes effect
+ * on the next line; lines already written keep their shape, so stdout carries
+ * both formats across the switch.
+ */
+export function setLogFormat(format: string): void {
+  currentFormat = normaliseFormat(format);
 }

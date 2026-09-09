@@ -30,6 +30,10 @@ const logger = createLogger('trakt');
 export async function getTraktAliases(
   parsedId: ParsedId
 ): Promise<MetadataTitle[] | null> {
+  // the API rejects unauthenticated requests
+  if (!appConfig.metadata.trakt.clientId) {
+    return null;
+  }
   const cacheKey = `${parsedId.type}:${parsedId.value}`;
   const cachedAliases = await traktAliasCache.get(cacheKey);
   if (cachedAliases) {
@@ -48,7 +52,7 @@ export async function getTraktAliases(
   let imdbId = parsedId.type === 'imdbId' ? parsedId.value : null;
   // try to get imdb ID from anime database
   if (!imdbId) {
-    const animeEntry = AnimeDatabase.getInstance().getEntryById(
+    const animeEntry = await AnimeDatabase.getInstance().getEntryById(
       parsedId.type,
       parsedId.value
     );
@@ -67,7 +71,7 @@ export async function getTraktAliases(
           'Content-Type': 'application/json',
           'User-Agent': appConfig.http.defaultUserAgent,
           'trakt-api-version': '2',
-          'trakt-api-key': appConfig.metadata.trakt.clientId ?? '',
+          'trakt-api-key': appConfig.metadata.trakt.clientId,
         },
       }
     );

@@ -1,6 +1,7 @@
 import React from 'react';
+import { useNavigate, useSearch } from '@tanstack/react-router';
 import { z } from 'zod';
-import type { UseFormReturn } from 'react-hook-form';
+import { useWatch, type UseFormReturn } from 'react-hook-form';
 import { toast } from 'sonner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Form } from '@/components/ui/form';
@@ -10,8 +11,23 @@ import { cn } from '@/components/ui/core/styling';
 import { PageWrapper } from '@/components/shared/page-wrapper';
 import { Spinner } from '@/components/ui/loading-spinner';
 import { LuffyError } from '@/components/shared/luffy-error';
-import { useSettings, useSaveSettings, type SettingsKey } from './queries';
-import { tabFor, humanise } from './tabs.config';
+import {
+  useSettings,
+  useSaveSettings,
+  type ManagedSettingsKey,
+  type SettingsKey,
+  type PatchResult,
+} from './queries';
+import {
+  cardPath,
+  foldRank,
+  humanise,
+  tabFor,
+  type Visibility,
+  type VisibilityRule,
+  tabIdForKey,
+  tabIdForSection,
+} from './tabs.config';
 import {
   SettingsCard,
   SettingsNavCard,
@@ -27,15 +43,24 @@ import {
   SECRET_CLEAR_SENTINEL,
 } from './_components/settings-field';
 import { SettingsActionsMenu } from './_components/settings-actions-menu';
+import {
+  editorFor,
+  editorsFor,
+  SETTINGS_FORM_WIDGETS,
+} from './_components/settings-editors';
+import {
+  SettingsPanelsProvider,
+  dirtyPanels,
+  savePanels,
+  type SettingsPanelSaver,
+} from './_components/settings-panels';
+import MarkdownLite from '@/components/shared/markdown-lite';
+import { useScrollToField } from '@/components/shared/command-palette/use-scroll-to-field';
 
-function readTabParam(): string | null {
-  return new URLSearchParams(window.location.search).get('tab');
-}
-function writeTabParam(tab: string) {
-  const url = new URL(window.location.href);
-  url.searchParams.set('tab', tab);
-  window.history.replaceState({}, '', url.toString());
-}
+/** One slot in a tab's body: a card of fields, or a bespoke editor. */
+type CardEntry =
+  | { title: string; note?: string; when?: VisibilityRule }
+  | { editor: string; when?: VisibilityRule };
 
 interface TabModel {
   section: string;
@@ -45,27 +70,168 @@ interface TabModel {
   icon: ReturnType<typeof tabFor>['icon'];
   /** subsection path (joined by '.') → keys; '' = section root */
   groups: Map<string, SettingsKey[]>;
+  /** Keys rendered by a bespoke editor instead of the schema renderer. */
+  editors?: string[];
+  /** Cards come from the tab manifest, so their titles are already final. */
+  curated?: boolean;
+  cards?: ReturnType<typeof tabFor>['cards'];
+  fieldVisibility?: ReturnType<typeof tabFor>['fieldVisibility'];
+  cardVisibility?: ReturnType<typeof tabFor>['cardVisibility'];
+}
+
+const toRules = (when?: VisibilityRule): Visibility[] =>
+  when ? (Array.isArray(when) ? when : [when]) : [];
+
+/**
+ * An unknown key fails open: hiding something whose gate sits on another tab
+ * would strand settings with no way to reach them.
+ */
+function passes(rules: Visibility[], valueOf: (key: string) => unknown) {
+  return rules.every((w) => {
+    const value = valueOf(w.key);
+    if (value === undefined) return true;
+    return w.not !== undefined ? value !== w.not : value === w.equals;
+  });
+}
+
+/** Watches the gating fields and returns a lookup over their current values. */
+function useGateValues(keys: string[]): (key: string) => unknown {
+  const values = useWatch({ name: keys.map(toName) }) as unknown[];
+  const byKey = new Map(keys.map((k, i) => [k, values[i]]));
+  return (key: string) => byKey.get(key);
+}
+
+/**
+ * Shows its children only while every gating condition holds. Gating lives in
+ * a component rather than in the tab render because that render is a form
+ * render-prop, and `useWatch` is a hook.
+ */
+function Gated({
+  when,
+  children,
+}: {
+  when: Visibility[];
+  children: React.ReactNode;
+}) {
+  const valueOf = useGateValues(when.map((w) => w.key));
+  return passes(when, valueOf) ? <>{children}</> : null;
+}
+
+/** Ungated content renders as-is; only gated content watches form state. */
+function Gate({
+  when,
+  children,
+}: {
+  when?: VisibilityRule;
+  children: React.ReactNode;
+}) {
+  const rules = toRules(when);
+  if (rules.length === 0) return <>{children}</>;
+  return <Gated when={rules}>{children}</Gated>;
+}
+
+function CardGated({
+  own,
+  fields,
+  children,
+}: {
+  own: Visibility[];
+  fields: Visibility[][];
+  children: React.ReactNode;
+}) {
+  const valueOf = useGateValues([
+    ...new Set([...own, ...fields.flat()].map((w) => w.key)),
+  ]);
+  const shown =
+    passes(own, valueOf) && fields.some((rules) => passes(rules, valueOf));
+  return shown ? <>{children}</> : null;
+}
+
+/**
+ * A card hides when its own gate fails, and also when every field inside it
+ * is gated away, which otherwise leaves a bare header behind. One ungated
+ * field is enough to keep the card, so only an entirely conditional card needs
+ * to watch its fields.
+ */
+function CardGate({
+  when,
+  fields,
+  children,
+}: {
+  when?: VisibilityRule;
+  fields: (VisibilityRule | undefined)[];
+  children: React.ReactNode;
+}) {
+  const own = toRules(when);
+  const each = fields.map(toRules);
+  if (own.length === 0 && each.some((rules) => rules.length === 0))
+    return <>{children}</>;
+  return (
+    <CardGated own={own} fields={each}>
+      {children}
+    </CardGated>
+  );
+}
+
+/**
+ * Cards a tab declares by hand, for a section that is a flat bag of keys the
+ * automatic subsection grouping would dump into one card. Unlisted keys fall
+ * into a trailing "Other" card so nothing new is silently dropped.
+ */
+function curatedGroups(
+  cards: NonNullable<ReturnType<typeof tabFor>['cards']>,
+  tabKeys: SettingsKey[]
+): Map<string, SettingsKey[]> {
+  const byKey = new Map(tabKeys.map((k) => [k.key, k]));
+  const used = new Set<string>();
+  const groups = new Map<string, SettingsKey[]>();
+  for (const card of cards) {
+    if ('editor' in card) continue;
+    const found = card.keys
+      .map((key) => {
+        const k = byKey.get(key);
+        if (k) used.add(key);
+        return k;
+      })
+      .filter((k): k is SettingsKey => !!k);
+    if (found.length) groups.set(card.title, found);
+  }
+  const leftover = tabKeys.filter((k) => !used.has(k.key));
+  if (leftover.length) groups.set('Other', leftover);
+  return groups;
 }
 
 function buildTabs(keys: SettingsKey[]): TabModel[] {
-  const bySection = new Map<string, SettingsKey[]>();
+  const byTab = new Map<string, SettingsKey[]>();
   for (const k of keys) {
-    const section = k.key.split('.')[0];
-    (bySection.get(section) ?? bySection.set(section, []).get(section)!).push(
-      k
-    );
+    const tabId = tabIdForKey(k.key);
+    (byTab.get(tabId) ?? byTab.set(tabId, []).get(tabId)!).push(k);
   }
   const tabs: TabModel[] = [];
-  for (const [section, sectionKeys] of bySection) {
-    const meta = tabFor(section);
+  for (const [tabId, tabKeys] of byTab) {
+    const meta = tabFor(tabId);
+    if (meta.cards) {
+      tabs.push({
+        section: tabId,
+        ...meta,
+        groups: curatedGroups(meta.cards, tabKeys),
+        curated: true,
+      });
+      continue;
+    }
+    // Cards render in Map insertion order, i.e. schema-walk order, which says
+    // nothing about how two folded sections should sit relative to each other.
+    const ordered = meta.sections
+      ? [...tabKeys].sort(
+          (a, b) => foldRank(tabId, a.key) - foldRank(tabId, b.key)
+        )
+      : tabKeys;
     const groups = new Map<string, SettingsKey[]>();
-    for (const k of sectionKeys) {
-      const parts = k.key.split('.');
-      // parts[0] = section, last = leaf; middle = subsection path
-      const sub = parts.slice(1, -1).join('.');
+    for (const k of ordered) {
+      const sub = cardPath(tabId, k.key);
       (groups.get(sub) ?? groups.set(sub, []).get(sub)!).push(k);
     }
-    tabs.push({ section, ...meta, groups });
+    tabs.push({ section: tabId, ...meta, groups });
   }
   return tabs.sort(
     (a, b) => a.order - b.order || a.label.localeCompare(b.label)
@@ -75,11 +241,23 @@ function buildTabs(keys: SettingsKey[]): TabModel[] {
 function TabForm({
   tab,
   allKeys: allSettingsKeys,
+  managed,
 }: {
   tab: TabModel;
   allKeys: SettingsKey[];
+  /** Editor-owned keys, for the reset menu; they render no field of their own. */
+  managed: ManagedSettingsKey[];
 }) {
   const { mutateAsync, isPending } = useSaveSettings();
+  // Bespoke panels on this tab (see `settings-panels`).
+  const panelsRef = React.useRef(new Map<string, SettingsPanelSaver>());
+  // Editors a card slots in itself are rendered there, not again at the end.
+  const Editors = React.useMemo(() => {
+    const placed = new Set(
+      (tab.cards ?? []).flatMap((c) => ('editor' in c ? [c.editor] : []))
+    );
+    return editorsFor((tab.editors ?? []).filter((k) => !placed.has(k)));
+  }, [tab.cards, tab.editors]);
   // Hold the RHF methods captured from the Form's children render-prop so
   // `onSubmit` can call `reset(values)` after a successful save — otherwise
   // `formState.isDirty` stays true even though the persisted state matches,
@@ -106,8 +284,16 @@ function TabForm({
       }
       byName.set(n, k);
     }
+    // Panel fields carry their own value into `onSubmit`; without a slot in
+    // the schema zod would strip them, and without one in `defaultValues`
+    // `reset()` could not revert them.
+    for (const key of tab.editors ?? []) {
+      const n = toName(key);
+      shape[n] = z.any();
+      defaults[n] = undefined;
+    }
     return { schema: z.object(shape), defaults, byName };
-  }, [allKeys]);
+  }, [allKeys, tab.editors]);
 
   return (
     <Form
@@ -132,7 +318,9 @@ function TabForm({
           if (JSON.stringify(normalised) !== JSON.stringify(k.value))
             patch[k.key] = normalised;
         }
-        if (Object.keys(patch).length === 0) {
+        const baseline = methodsRef.current?.formState.defaultValues;
+        const changedPanels = dirtyPanels(panelsRef.current, data, baseline);
+        if (Object.keys(patch).length === 0 && changedPanels.length === 0) {
           toast.info('No changes to save.');
           // Spurious dirtiness can come from env-locked / non-savable fields
           // (e.g. an env-set duration). Clear it so the "unsaved changes"
@@ -144,10 +332,21 @@ function TabForm({
           return;
         }
         try {
-          const res = await mutateAsync(patch);
-          toast.success(
-            `Saved ${res.updated.length} setting${res.updated.length === 1 ? '' : 's'}.`
-          );
+          const saved: string[] = [];
+          let res: PatchResult = { updated: [], requiresRestart: false };
+          if (Object.keys(patch).length > 0) {
+            res = await mutateAsync(patch);
+            saved.push(
+              `${res.updated.length} setting${res.updated.length === 1 ? '' : 's'}`
+            );
+          }
+          saved.push(...(await savePanels(changedPanels, data)));
+          for (const [panelName] of changedPanels) {
+            methodsRef.current?.setValue(panelName, data[panelName], {
+              shouldDirty: false,
+            });
+          }
+          toast.success(`Saved ${saved.join(' and ')}.`);
           // Treat the just-submitted values as the new baseline so RHF
           // immediately reports `isDirty=false` and the "unsaved changes"
           // alert disappears. We pass `data` (current form values) rather
@@ -173,47 +372,108 @@ function TabForm({
       {(methods) => {
         // Capture RHF instance so the submit handler can `reset` after save.
         methodsRef.current = methods;
+        const Widget = SETTINGS_FORM_WIDGETS[tab.section];
         // Render subsections in schema (walk) order — `tab.groups` is a Map
         // built in that order, so we only need to float the section root
         // (`''`) to the top. This lets the core schema control card order
         // (e.g. Proxy → Encryption first) without per-section UI config.
         const subKeys = [...tab.groups.keys()];
-        const subs = subKeys.includes('')
-          ? ['', ...subKeys.filter((s) => s !== '')]
-          : subKeys;
+        const subs =
+          !tab.curated && subKeys.includes('')
+            ? ['', ...subKeys.filter((s) => s !== '')]
+            : subKeys;
+        // A curated tab renders in manifest order, so an editor can sit
+        // between two cards; an auto-grouped one follows the schema walk.
+        const entries: CardEntry[] = tab.cards
+          ? [
+              ...tab.cards.map(
+                (c): CardEntry =>
+                  'editor' in c
+                    ? { editor: c.editor, when: c.visibleWhen }
+                    : { title: c.title, note: c.note, when: c.visibleWhen }
+              ),
+              ...(tab.groups.has('Other') ? [{ title: 'Other' }] : []),
+            ]
+          : subs.map((sub) => ({
+              title: sub,
+              when: tab.cardVisibility?.[sub],
+            }));
         return (
-          <>
+          <SettingsPanelsProvider panelsRef={panelsRef}>
+            {/* Drives cross-field state (e.g. the usenet performance profile). */}
+            {Widget && <Widget />}
             <div className="flex items-start justify-between gap-2">
               <SettingsPageHeader
                 title={tab.label}
-                description={`${humanise(tab.section)} configuration`}
+                description={`${tab.label} configuration`}
                 icon={tab.icon}
               />
               <div className="pt-1">
                 <SettingsActionsMenu
                   allKeys={allSettingsKeys}
+                  allManagedKeys={managed}
                   sectionKeys={allKeys}
+                  sectionManagedKeys={managed.filter((m) =>
+                    tab.editors?.includes(m.key)
+                  )}
                   sectionLabel={tab.label}
                 />
               </div>
             </div>
-            {subs.map((sub) => (
-              <SettingsCard
-                key={sub || '_root'}
-                title={
-                  sub ? sub.split('.').map(humanise).join(' › ') : undefined
-                }
-              >
-                {tab.groups.get(sub)!.map((k) => (
-                  <SettingsField key={k.key} k={k} />
-                ))}
-              </SettingsCard>
+            {entries.map((entry) => {
+              if ('editor' in entry) {
+                const Editor = editorFor(entry.editor);
+                return Editor ? (
+                  <Gate key={`editor:${entry.editor}`} when={entry.when}>
+                    <Editor />
+                  </Gate>
+                ) : null;
+              }
+              // A curated card whose every key is absent (hidden, deprecated,
+              // owned by another tab) has nothing to show.
+              const fields = tab.groups.get(entry.title);
+              if (!fields?.length) return null;
+              return (
+                <CardGate
+                  key={entry.title || '_root'}
+                  when={entry.when}
+                  fields={fields.map((k) => tab.fieldVisibility?.[k.key])}
+                >
+                  <SettingsCard
+                    title={
+                      tab.curated
+                        ? entry.title
+                        : entry.title
+                          ? entry.title.split('.').map(humanise).join(' › ')
+                          : undefined
+                    }
+                  >
+                    {tab.curated && entry.note && (
+                      <p className="text-sm text-[--muted] -mt-1">
+                        <MarkdownLite>{entry.note}</MarkdownLite>
+                      </p>
+                    )}
+                    {fields.map((k) => (
+                      <Gate key={k.key} when={tab.fieldVisibility?.[k.key]}>
+                        <div id={`setting-${k.key}`}>
+                          <SettingsField k={k} />
+                        </div>
+                      </Gate>
+                    ))}
+                  </SettingsCard>
+                </CardGate>
+              );
+            })}
+            {/* Their values are form fields, so they save with everything
+                else and share the dirty alert. */}
+            {Editors.map((Editor, i) => (
+              <Editor key={i} />
             ))}
             <div className="flex justify-end pt-2">
               <SettingsSubmitButton isPending={isPending} />
             </div>
             <SettingsIsDirty isPending={isPending} />
-          </>
+          </SettingsPanelsProvider>
         );
       }}
     </Form>
@@ -223,18 +483,46 @@ function TabForm({
 export function SettingsPage() {
   const { data, isLoading, error, refetch } = useSettings();
   const tabs = React.useMemo(() => (data ? buildTabs(data.keys) : []), [data]);
+  // Only keys a tab actually surfaces an editor for: a managed key with no
+  // editor on any tab (usenet.providers, which lives on its own page) has no
+  // business in a reset dialog the user reached from here.
+  const managed = React.useMemo(() => {
+    const owned = new Set(tabs.flatMap((t) => t.editors ?? []));
+    return (data?.managed ?? []).filter((m) => owned.has(m.key));
+  }, [data, tabs]);
+  const search = useSearch({ from: '/dashboard/settings' });
+  const navigate = useNavigate({ from: '/dashboard/settings' });
 
   const [tab, setTab] = React.useState<string>('');
   React.useEffect(() => {
     if (!tabs.length) return;
-    const fromUrl = readTabParam();
-    if (fromUrl && tabs.some((t) => t.section === fromUrl)) setTab(fromUrl);
+    // Older links carry a config section rather than a tab id.
+    const requested = search.tab ? tabIdForSection(search.tab) : undefined;
+    if (requested && tabs.some((t) => t.section === requested))
+      setTab(requested);
     else if (!tab) setTab(tabs[0].section);
-  }, [tabs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabs, search.tab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const clearField = React.useCallback(() => {
+    navigate({
+      to: '.',
+      search: (prev) => ({ ...prev, field: undefined }),
+      replace: true,
+      resetScroll: false,
+    });
+  }, [navigate]);
+
+  // A field only exists in the DOM once its tab is the active one.
+  useScrollToField(search.field, Boolean(tab) && tabs.length > 0, clearField);
 
   const onTabChange = (v: string) => {
     setTab(v);
-    writeTabParam(v);
+    navigate({
+      to: '.',
+      search: (prev) => ({ ...prev, tab: v }),
+      replace: true,
+      resetScroll: false,
+    });
   };
 
   if (isLoading)
@@ -262,6 +550,7 @@ export function SettingsPage() {
       <Tabs
         value={tab}
         onValueChange={onTabChange}
+        variant="pill"
         className={cn(
           'w-full grid grid-cols-1 lg:grid lg:grid-cols-[280px,1fr] gap-4'
         )}
@@ -310,7 +599,9 @@ export function SettingsPage() {
               value={t.section}
               className="space-y-4 animate-in fade-in-0 slide-in-from-bottom-2 duration-300"
             >
-              {tab === t.section && <TabForm tab={t} allKeys={data.keys} />}
+              {tab === t.section && (
+                <TabForm tab={t} allKeys={data.keys} managed={managed} />
+              )}
             </TabsContent>
           ))}
         </div>

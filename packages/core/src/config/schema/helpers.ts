@@ -1,14 +1,14 @@
 import { z } from 'zod';
+import { createRequire } from 'module';
+import type UserAgentType from 'user-agents';
 import { parseTime } from '../../utils/time.js';
 import { Env } from '../../utils/env.js';
-import UserAgent from 'user-agents';
 
-/**
- * Replace `{version}` / `{random}` placeholders in user-agent strings.
- */
-export const applyUserAgentTemplate = (value: string): string => {
-  const trimmed = value.toLowerCase().trim();
-  if (['false', 'none', ''].includes(trimmed)) return 'false';
+const requireCjs = createRequire(import.meta.url);
+let UserAgent: typeof UserAgentType | undefined;
+
+const randomUserAgent = (): string => {
+  UserAgent ??= requireCjs('user-agents') as typeof UserAgentType;
   const filters =
     typeof process.env.RANDOM_USER_AGENT_FILTERS === 'string'
       ? (() => {
@@ -19,9 +19,18 @@ export const applyUserAgentTemplate = (value: string): string => {
           }
         })()
       : undefined;
+  return new UserAgent(filters).toString();
+};
+
+/**
+ * Replace `{version}` / `{random}` placeholders in user-agent strings.
+ */
+export const applyUserAgentTemplate = (value: string): string => {
+  const trimmed = value.toLowerCase().trim();
+  if (['false', 'none', ''].includes(trimmed)) return 'false';
   return value
     .replace(/{version}/g, Env.VERSION || 'unknown')
-    .replace(/{random}/g, new UserAgent(filters).toString());
+    .replace(/{random}/g, () => randomUserAgent());
 };
 
 /** Resolve function for nullable user-agent strings. */
@@ -276,28 +285,32 @@ export const serviceTimeMap = z.union([
 ]);
 
 /**
- * Map of hostname → user-agent. Env shape: `host1:ua1,host2:ua2,...`.
- * Stores raw template values; use `applyUserAgentMapTemplates` as the field `resolve`.
+ * Map of key → user-agent. Env shape: `key1:ua1,key2:ua2,...`. A key is either a
+ * hostname pattern (`host`, `*.host`, `*`) or a `[context]` label (e.g.
+ * `[nzb_grabs]`) describing the kind of request. A value is either a literal
+ * user-agent or a `{preset}` reference to a built-in header set (see
+ * `header-presets.ts`). Stores raw template values; use
+ * `applyUserAgentMapTemplates` as the field `resolve`.
  */
 export const userAgentMap = z.union([
   z.record(z.string(), z.string()),
   z.string().transform((value, ctx) => {
     const out: Record<string, string> = {};
     if (!value.trim()) return out;
-    const regex = /([a-zA-Z0-9.\-*]+):([^,]*(?:,[^a-zA-Z0-9.\-*][^,]*)*)/g;
+    const regex = /([a-zA-Z0-9.\-*[\]_]+):([^,]*(?:,[^a-zA-Z0-9.\-*[][^,]*)*)/g;
     let match;
     let any = false;
     while ((match = regex.exec(value)) !== null) {
       any = true;
-      const host = match[1].trim();
+      const key = match[1].trim();
       const ua = match[2].trim();
-      if (!host || !ua) continue;
-      out[host] = ua;
+      if (!key || !ua) continue;
+      out[key] = ua;
     }
     if (!any) {
       ctx.addIssue({
         code: 'custom',
-        message: 'Expected hostname:user-agent pairs.',
+        message: 'Expected key:user-agent pairs.',
       });
       return z.NEVER;
     }
@@ -317,8 +330,10 @@ export const applyUserAgentMapTemplates = (
 };
 
 /**
- * `addonProxyConfig` env format: comma-separated `hostname:bool|number` pairs.
- * Stored as `Record<hostname, boolean|number>`.
+ * `addonProxyConfig` env format: comma-separated `key:bool|number` pairs, where
+ * a key is a hostname (`host`, `*.host`, `*`) or a `[context]` label (e.g.
+ * `[newznab]`). The value enables/disables proxying or selects an `addonProxy`
+ * index. Stored as `Record<key, boolean|number>`.
  */
 export const addonProxyConfigMap = z.union([
   z.record(z.string(), z.union([z.boolean(), z.number().int()])),
@@ -367,28 +382,40 @@ export const boolOrList = z.union([
   }),
 ]);
 
+const BYTE_MULTIPLIERS: Record<string, number> = {
+  b: 1,
+  kb: 1000,
+  mb: 1_000_000,
+  gb: 1_000_000_000,
+  tb: 1_000_000_000_000,
+};
+
+/**
+ * Parse a size string ("20MB", "1.5tb", "1024") to bytes. Returns null when the
+ * value is not a size, so callers can raise their own issue.
+ */
+export function parseByteSize(value: string): number | null {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const m = trimmed.match(/^(\d+(?:\.\d+)?)\s*([kmgt]?b)?$/i);
+  if (!m) return null;
+  return Math.floor(
+    Number(m[1]) * BYTE_MULTIPLIERS[(m[2] || 'b').toLowerCase()]
+  );
+}
+
 /**
  * A size value: integer bytes or a human-readable string like "20MB".
  */
 export const byteSize = z.union([
   z.number().int().nonnegative(),
   z.string().transform((value, ctx) => {
-    const trimmed = value.trim();
-    if (/^\d+$/.test(trimmed)) return Number(trimmed);
-    const m = trimmed.match(/^(\d+(?:\.\d+)?)\s*([kmg]?b)?$/i);
-    if (!m) {
+    const bytes = parseByteSize(value);
+    if (bytes === null) {
       ctx.addIssue({ code: 'custom', message: `Invalid size: "${value}"` });
       return z.NEVER;
     }
-    const n = Number(m[1]);
-    const unit = (m[2] || 'b').toLowerCase();
-    const mult: Record<string, number> = {
-      b: 1,
-      kb: 1000,
-      mb: 1_000_000,
-      gb: 1_000_000_000,
-    };
-    return Math.floor(n * mult[unit]);
+    return bytes;
   }),
 ]);
 

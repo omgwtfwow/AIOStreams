@@ -1,4 +1,4 @@
-﻿import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
+import { Addon, Option, ParsedStream, Stream, UserData } from '../db/index.js';
 import { Preset, baseOptions } from './preset.js';
 import { appConfig, RESOURCES, ServiceId, constants } from '../utils/index.js';
 import { BuiltinAddonPreset, BuiltinStreamParser } from './builtin.js';
@@ -20,11 +20,94 @@ class NewznabStreamParser extends BuiltinStreamParser {
         ? stream.zyclopsHealth
         : undefined;
     if (zyclopsHealth) {
-      return 'NZB Health: ' + zyclopsHealth.replace('healthy', 'ðŸ§');
+      return 'NZB Health: ' + zyclopsHealth.replace('healthy', '🧝');
     }
     return undefined;
   }
 }
+
+const NEWZNAB_INDEXERS: {
+  label: string;
+  value: string;
+  apiKeyUrl?: string;
+}[] = [
+  {
+    label: 'altHUB',
+    value: 'https://api.althub.co.za/api',
+    apiKeyUrl: 'https://althub.co.za/profile',
+  },
+  // AnimeTosho needs no key at all
+  { label: 'AnimeTosho', value: 'https://feed.animetosho.org/api' },
+  {
+    label: 'AnimeTosho (NEW)',
+    value: 'https://feed.animetosho.xyz/api',
+    apiKeyUrl: 'https://animetosho.xyz/profile',
+  },
+  { label: 'Aninzb', value: 'https://aninzb.moe/api' },
+  { label: 'ClubNZB', value: 'https://clubnzb.com/api' },
+  { label: 'DOGnzb', value: 'https://api.dognzb.cr/api' },
+  {
+    label: 'DrunkenSlug',
+    value: 'https://drunkenslug.com/api',
+    apiKeyUrl: 'https://drunkenslug.com/profile',
+  },
+  {
+    label: 'Miatrix',
+    value: 'https://www.miatrix.com/api',
+    apiKeyUrl: 'https://www.miatrix.com/profile',
+  },
+  {
+    label: 'NinjaCentral',
+    value: 'https://ninjacentral.co.za/api',
+    apiKeyUrl: 'https://ninjacentral.co.za/profile',
+  },
+  {
+    label: 'Nzb.life',
+    value: 'https://api.nzb.life/api',
+    apiKeyUrl: 'https://www.nzb.life/profile',
+  },
+  {
+    label: 'NZBFinder',
+    value: 'https://nzbfinder.ws/api',
+    apiKeyUrl: 'https://nzbfinder.ws/profile',
+  },
+  {
+    label: 'NZBgeek',
+    value: 'https://api.nzbgeek.info/api',
+    apiKeyUrl: 'https://nzbgeek.info/profile',
+  },
+  {
+    label: 'NzbNoob',
+    value: 'https://nzbnoob.com/api',
+    apiKeyUrl: 'https://nzbnoob.com/profile',
+  },
+  {
+    label: 'NzbPlanet',
+    value: 'https://api.nzbplanet.net/api',
+    apiKeyUrl: 'https://nzbplanet.net/profile',
+  },
+  { label: 'NZBStars', value: 'https://nzbstars.com/api' },
+  {
+    label: 'Treasure Maps (formerly SceneNZBs)',
+    value: 'https://treasure-maps.com/api',
+    apiKeyUrl: 'https://treasure-maps.com/account',
+  },
+  {
+    label: 'Tabula Rasa',
+    value: 'https://www.tabula-rasa.pw/api/v1/api',
+    apiKeyUrl: 'https://www.tabula-rasa.pw/profile',
+  },
+  {
+    label: 'TorBox Search',
+    value: 'https://search-api.torbox.app/newznab/api',
+    apiKeyUrl: 'https://torbox.app/settings?section=account',
+  },
+  {
+    label: 'Usenet Crawler',
+    value: 'https://www.usenet-crawler.com/api',
+    apiKeyUrl: 'https://www.usenet-crawler.com/profile',
+  },
+];
 
 export class NewznabPreset extends BuiltinAddonPreset {
   static override getParser() {
@@ -39,6 +122,7 @@ export class NewznabPreset extends BuiltinAddonPreset {
       constants.ALTMOUNT_SERVICE,
       constants.STREMIO_NNTP_SERVICE,
       constants.STREMTHRU_NEWZ_SERVICE,
+      constants.AIOSTREAMS_SERVICE,
     ] as ServiceId[];
     const options: Option[] = [
       {
@@ -50,61 +134,36 @@ export class NewznabPreset extends BuiltinAddonPreset {
         default: 'Newznab',
       },
       {
-        id: 'newznabUrl',
-        name: 'Newznab URL',
-        description: 'Provide the URL to the Newznab endpoint ',
-        type: 'select-with-custom',
-        options: [
-          { label: 'altHUB', value: 'https://api.althub.co.za' },
-          {
-            label: 'AnimeTosho',
-            value: 'https://feed.animetosho.org/',
-          },
-          { label: 'ClubNZB', value: 'https://clubnzb.com/' },
-          { label: 'DOGnzb', value: 'https://api.dognzb.cr/' },
-          { label: 'DrunkenSlug', value: 'https://drunkenslug.com/' },
-          { label: 'Miatrix', value: 'https://www.miatrix.com' },
-          { label: 'NinjaCentral', value: 'https://ninjacentral.co.za/' },
-          { label: 'Nzb.life', value: 'https://api.nzb.life/' },
-          { label: 'NZBFinder', value: 'https://nzbfinder.ws/' },
-          { label: 'NZBgeek', value: 'https://api.nzbgeek.info/' },
-          { label: 'NzbNoob', value: 'https://nzbnoob.com' },
-          { label: 'NzbPlanet', value: 'https://api.nzbplanet.net' },
-          { label: 'NZBStars', value: 'https://nzbstars.com/' },
-          { label: 'SceneNZBs', value: 'https://scenenzbs.com' },
-          {
-            label: 'Tabula Rasa',
-            value: 'https://www.tabula-rasa.pw/api/v1/',
-          },
-          {
-            label: 'TorBox Search',
-            value: 'https://search-api.torbox.app/newznab',
-          },
-          { label: 'Usenet Crawler', value: 'https://www.usenet-crawler.com/' },
-        ],
+        id: 'api',
+        name: 'Newznab Endpoint',
+        description: '',
+        type: 'nab-endpoint',
+        nab: { namespace: 'newznab', preset: 'newznab' },
         required: true,
-      },
-      {
-        id: 'apiKey',
-        name: 'API Key',
-        description:
-          'The password for the Newznab API. This is used to authenticate with the Newznab endpoint.',
-        type: 'password',
-        required: false,
-      },
-      {
-        id: 'apiPath',
-        name: 'API Path',
-        description: 'The path to the Newznab API. Usually /api.',
-        type: 'string',
-        required: false,
-        default: '/api',
-        showInSimpleMode: false,
+        subOptions: [
+          {
+            id: 'url',
+            name: 'Newznab URL',
+            description:
+              'Pick an indexer, or choose `Custom` to enter the full URL of the Newznab API endpoint (including the path, usually `/api`). New to Usenet indexers? Compare options at [nzb-sources](https://hampelmen.github.io/nzb-sources/).',
+            type: 'select-with-custom',
+            required: true,
+            options: NEWZNAB_INDEXERS,
+          },
+          {
+            id: 'apiKey',
+            name: 'API Key',
+            description:
+              'The password for the Newznab API. This is used to authenticate with the Newznab endpoint.',
+            type: 'password',
+            required: false,
+          },
+        ],
       },
       {
         id: 'proxyAuth',
         name: 'AIOStreams Proxy Auth',
-        description: `${appConfig.nzbProxy.publicEnabled ? 'This instance will proxy NZBs by default, however you can optionally p' : 'P'}rovide a username:password pair from the \`AIOSTREAMS_AUTH\` environment variable to use for proxying the NZB.`,
+        description: `Provide a username:password pair from the \`AIOSTREAMS_AUTH\` environment variable to use for proxying the NZB.`,
         type: 'password',
         required: false,
       },
@@ -171,7 +230,7 @@ export class NewznabPreset extends BuiltinAddonPreset {
         id: 'searchMode',
         name: 'Search Mode',
         description:
-          'The search mode to use when querying the Newznab endpoint. **Note**: `Both` will result in two addons being created, one for each search mode.',
+          '`Auto` searches by ID (TVDB/IMDb/TMDB + season/episode) when the indexer supports it; `Forced Query` always searches by title text instead. **Note**: `Both` creates two separate addons, one per mode.',
         type: 'select',
         required: false,
         default: 'auto',
@@ -180,6 +239,25 @@ export class NewznabPreset extends BuiltinAddonPreset {
           { label: 'Auto', value: 'auto' },
           { label: 'Forced Query', value: 'query' },
           { label: 'Both', value: 'both' },
+        ],
+      },
+      {
+        id: 'seasonEpisodeStrategy',
+        name: 'Season/Episode Search Strategy',
+        description:
+          "Controls whether series searches in `Auto` mode query at the episode level, the season level, or both - useful for private trackers where season packs replace individual episodes. A season-level search may return season packs, individual episodes, or both, depending on the indexer. `Dynamic` decides based on whether the season is still airing. Pair with `Season/Episode Matching` in Filters to filter out results that don't match.",
+        type: 'select',
+        required: false,
+        showInSimpleMode: false,
+        default: 'episode',
+        options: [
+          { label: 'Episode', value: 'episode' },
+          { label: 'Season', value: 'season' },
+          { label: 'Dynamic (Season Preferred)', value: 'dynamic' },
+          {
+            label: 'Episode First, Season Fallback',
+            value: 'episodeFirst',
+          },
         ],
       },
       {
@@ -202,7 +280,7 @@ export class NewznabPreset extends BuiltinAddonPreset {
       },
       {
         id: 'zyclopsHealthProxy',
-        name: 'ðŸ§ Zyclops Health Proxy',
+        name: '🧝 Zyclops Health Proxy',
         description:
           'Route searches through ElfHosted\'s Zyclops "magic" 🔮 crowdsourced health database to return only known-healthy releases for your backbone/provider ([learn more](https://zyclops.elfhosted.com)).',
         type: 'subsection',
@@ -212,7 +290,7 @@ export class NewznabPreset extends BuiltinAddonPreset {
             id: 'enabled',
             name: 'Enable',
             description:
-              'Enable Zyclops health filtering. âš ï¸ Sends your indexer URL/API key with the proxy request and submits the newest untested NZB to enrich the health database. Many indexers prohibit this (*some prohibit Stremio altogether!*), proceed at **your own risk**. The health database is further directly searchable via Newznab on private ElfHosted instances only.',
+              'Enable Zyclops health filtering. ⚠️ Sends your indexer URL/API key with the proxy request and submits the newest untested NZB to enrich the health database. Many indexers prohibit this (*some prohibit Stremio altogether!*), proceed at **your own risk**. The health database is further directly searchable via Newznab on private ElfHosted instances only.',
             type: 'boolean',
           },
           {
@@ -288,7 +366,11 @@ export class NewznabPreset extends BuiltinAddonPreset {
     userData: UserData,
     options: Record<string, any>
   ): Promise<Addon[]> {
-    const usableServices = this.getUsableServices(userData, options.services);
+    const usableServices = this.getUsableServices(
+      userData,
+      options.services,
+      options.name
+    );
     if (!usableServices || usableServices.length === 0) {
       throw new Error(
         `${this.METADATA.NAME} requires at least one usable service, but none were found. Please enable at least one of the following services: ${this.METADATA.SUPPORTED_SERVICES.join(
@@ -411,12 +493,13 @@ export class NewznabPreset extends BuiltinAddonPreset {
     }
     const config: Record<string, any> = {
       ...this.getBaseConfig(userData, services),
-      url: options.newznabUrl,
-      apiPath: options.apiPath,
-      apiKey: options.apiKey,
+      url: options.api?.url,
+      apiPath: '',
+      apiKey: options.api?.apiKey,
       proxyAuth: options.proxyAuth,
       forceQuerySearch: options.forceQuerySearch ?? false,
       paginate: options.paginate ?? false,
+      seasonEpisodeStrategy: options.seasonEpisodeStrategy ?? 'episode',
       zyclopsHealthProxy: zyclopsHealthProxyConfig,
     };
 

@@ -20,7 +20,7 @@ import {
   SERVICE_DETAILS,
 } from '../../utils/index.js';
 import { config as appConfig } from '../../config/index.js';
-import { TorrentClient } from '../../utils/torrent.js';
+import { TorrentGrabber } from '../../utils/torrent.js';
 import {
   BuiltinDebridServices,
   PlaybackInfo,
@@ -38,15 +38,20 @@ import {
   FileInfo,
 } from '../../debrid/index.js';
 import { processTorrents, processNZBs } from '../utils/debrid.js';
-import { calculateAbsoluteEpisode } from '../utils/general.js';
+import {
+  calculateAbsoluteEpisode,
+  isNonAnimeAbsoluteEligible,
+  isPredominantlyLatin,
+} from '../utils/general.js';
 import { MetadataService } from '../../metadata/service.js';
-import { MetadataTitle } from '../../metadata/utils.js';
+import { MetadataTitle, TitleConflict } from '../../metadata/utils.js';
+import { stripTitleDisambiguators } from '../../metadata/conflicts.js';
+import { countryToReleaseTag } from '../../utils/countries.js';
 import type { Logger } from '../../logging/logger.js';
 import pLimit from 'p-limit';
-import { cleanTitle } from '../../parser/utils.js';
+import { cleanTitle, normaliseTitle } from '../../parser/utils.js';
 import { NzbDavConfig, NzbDAVService } from '../../debrid/nzbdav.js';
 import { AltmountConfig, AltmountService } from '../../debrid/altmount.js';
-import { createProxy } from '../../proxy/index.js';
 import { formatHours } from '../../formatters/utils.js';
 
 export interface SearchMetadata extends TitleMetadata {
@@ -60,6 +65,15 @@ export interface SearchMetadata extends TitleMetadata {
   titlesWithLang?: MetadataTitle[];
   /** ISO 639-1 code of the content's original language (from TMDB). */
   originalLanguage?: string;
+  /** Whether the requested season is the latest season and still has an upcoming episode. */
+  ongoingSeason?: boolean;
+  /** episodeAirDates[0] — used for query generation on date-based shows. */
+  episodeAirDate?: string;
+  /** First episode number of the resolved season (>1 means continuous absolute numbering). */
+  resolvedSeasonFirstEpisode?: number;
+  /** Scene-mapping search titles, best (non-identity) first. */
+  sceneTitles?: string[];
+  titleConflicts?: TitleConflict[];
 }
 
 export const BaseDebridConfigSchema = z.object({
@@ -180,13 +194,17 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         type
       ).then((metadata) => {
         if (metadata.primaryTitle) {
-          metadata.primaryTitle = cleanTitle(metadata.primaryTitle);
+          metadata.primaryTitle = cleanTitle(
+            metadata.primaryTitle,
+            metadata.originalLanguage
+          );
           this.logger.debug(
             `Cleaned primary title for ${id}: ${metadata.primaryTitle}`
           );
         }
         return metadata;
       });
+      this._searchMetadataPromise.catch(() => {});
     } else {
       // Provide a minimal empty metadata object for addons that don't need it
       this._searchMetadataPromise = Promise.resolve({
@@ -249,7 +267,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       const start = Date.now();
       const metadataPromises = torrentsToDownload.map(async (torrent) => {
         try {
-          const metadata = await TorrentClient.getMetadata(torrent);
+          const metadata = await TorrentGrabber.getMetadata(torrent);
           if (!metadata) {
             return torrent.hash ? (torrent as Torrent) : null;
           }
@@ -275,7 +293,14 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     }
 
     const torrentServices = this.userData.services.filter(
-      (s) => !['nzbdav', 'altmount'].includes(s.id)
+      (s) =>
+        ![
+          'nzbdav',
+          'altmount',
+          'stremio_nntp',
+          'stremthru_newz',
+          'aiostreams',
+        ].includes(s.id)
     );
     const nzbServices = this.userData.services.filter((s) =>
       [
@@ -284,6 +309,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         'torbox',
         'stremio_nntp',
         'stremthru_newz',
+        'aiostreams',
       ].includes(s.id)
     );
 
@@ -384,10 +410,13 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       titles: searchMetadata.titles,
       year: searchMetadata.year,
       seasonYear: searchMetadata.seasonYear,
+      country: searchMetadata.country,
       season: searchMetadata.season,
       episode: searchMetadata.episode,
       absoluteEpisode: searchMetadata.absoluteEpisode,
       relativeAbsoluteEpisode: searchMetadata.relativeAbsoluteEpisode,
+      airDates: searchMetadata.airDates,
+      isDateBased: searchMetadata.isDateBased,
     };
     const metadataId = getSimpleTextHash(JSON.stringify(titleMetadata));
     await metadataStore().set(
@@ -468,7 +497,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         } else if (spec === 'all') {
           metadata.titlesWithLang
             ?.slice(0, appConfig.builtins.scrape.titleLimit)
-            .forEach((t) => selected.add(cleanTitle(t.title)));
+            .forEach((t) => selected.add(cleanTitle(t.title, t.language)));
           break; // no need to process further specs
         } else if (spec === 'original') {
           // First title in the content's original language (from TMDB).
@@ -477,13 +506,17 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
                 (t) => t.language === metadata.originalLanguage
               )
             : undefined;
-          if (match) selected.add(cleanTitle(match.title));
+          if (match) selected.add(cleanTitle(match.title, match.language));
+        } else if (spec === 'scene') {
+          metadata.sceneTitles
+            ?.slice(0, appConfig.builtins.scrape.titleLimit)
+            .forEach((title) => selected.add(cleanTitle(title)));
         } else {
           // take only the first matching title.
           const match = metadata.titlesWithLang?.find(
             (t) => t.language === spec
           );
-          if (match) selected.add(cleanTitle(match.title));
+          if (match) selected.add(cleanTitle(match.title, match.language));
         }
       }
       titles = [...selected];
@@ -492,16 +525,25 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         titles = [metadata.primaryTitle];
       }
     } else if (options?.useAllTitles) {
-      titles = metadata.titles
+      titles = (
+        metadata.titlesWithLang ??
+        metadata.titles.map((title) => ({ title, language: undefined }))
+      )
         .slice(0, appConfig.builtins.scrape.titleLimit)
-        .map(cleanTitle);
+        .map((t) => cleanTitle(t.title, t.language));
     } else {
       titles = [metadata.primaryTitle];
     }
 
+    // Drop non-Latin-script titles from queries
+    if (appConfig.builtins.scrape.latinQueriesOnly) {
+      const latin = titles.filter(isPredominantlyLatin);
+      if (latin.length > 0) titles = latin;
+    }
+
     const titlePlaceholder = '<___title___>';
-    const addQuery = (query: string) => {
-      titles.forEach((title) => {
+    const addQuery = (query: string, titleList: string[] = titles) => {
+      titleList.forEach((title) => {
         queries.push(query.replace(titlePlaceholder, title));
       });
     };
@@ -510,21 +552,76 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         `${titlePlaceholder}${metadata.year ? ` ${metadata.year}` : ''}`
       );
     } else if (parsedId.mediaType === 'series' && addSeasonEpisode) {
+      const normSeen = new Set(titles.map((t) => normaliseTitle(t)));
+      const variantTitles: string[] = [];
+      const addVariant = (title: string) => {
+        const cleaned = cleanTitle(title);
+        const norm = normaliseTitle(cleaned);
+        if (!norm || normSeen.has(norm)) return;
+        normSeen.add(norm);
+        variantTitles.push(cleaned);
+      };
+      const primarySelected = metadata.primaryTitle
+        ? normSeen.has(normaliseTitle(metadata.primaryTitle))
+        : false;
+      if (metadata.titleConflicts?.length) {
+        const rawPrimary = metadata.titles?.[0];
+        if (primarySelected && rawPrimary) {
+          addVariant(stripTitleDisambiguators(rawPrimary));
+        }
+        if (!variantTitles.length) {
+          const year = metadata.year;
+          if (
+            year &&
+            metadata.titleConflicts.some((c) => c.year && c.year < year)
+          ) {
+            // year tagging is language-agnostic
+            for (const title of titles.slice(0, 2)) {
+              addVariant(`${title} ${year}`);
+            }
+          }
+          const tag = countryToReleaseTag(metadata.country);
+          if (
+            primarySelected &&
+            tag &&
+            metadata.titleConflicts.some(
+              (c) => c.country && c.country !== metadata.country
+            )
+          ) {
+            // country tags attach to the canonical name only
+            addVariant(`${metadata.primaryTitle} ${tag}`);
+          }
+        }
+      }
+      const seriesTitles = variantTitles.length
+        ? [...titles, ...variantTitles]
+        : titles;
+
+      // season numbers are meaningless in release names when episodes are
+      // numbered continuously across seasons
+      const continuousAbsolute = (metadata.resolvedSeasonFirstEpisode ?? 1) > 1;
       if (
         parsedId.season &&
+        !metadata.isDateBased &&
+        !continuousAbsolute &&
         (parsedId.episode ? Number(parsedId.episode) < 100 : true)
       ) {
         addQuery(
-          `${titlePlaceholder} S${parsedId.season!.toString().padStart(2, '0')}`
+          `${titlePlaceholder} S${parsedId.season!.toString().padStart(2, '0')}`,
+          seriesTitles
         );
       }
       if (metadata.absoluteEpisode) {
         addQuery(
-          `${titlePlaceholder} ${metadata.absoluteEpisode!.toString().padStart(2, '0')}`
+          metadata.isAnime
+            ? `${titlePlaceholder} ${metadata.absoluteEpisode!.toString().padStart(2, '0')}`
+            : `${titlePlaceholder} E${metadata.absoluteEpisode!.toString().padStart(2, '0')}`,
+          seriesTitles
         );
       } else if (parsedId.episode && !parsedId.season) {
         addQuery(
-          `${titlePlaceholder} E${parsedId.episode!.toString().padStart(2, '0')}`
+          `${titlePlaceholder} E${parsedId.episode!.toString().padStart(2, '0')}`,
+          seriesTitles
         );
       }
       if (
@@ -535,13 +632,26 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         )
       ) {
         addQuery(
-          `${titlePlaceholder} ${metadata.relativeAbsoluteEpisode!.toString().padStart(2, '0')}`
+          `${titlePlaceholder} ${metadata.relativeAbsoluteEpisode!.toString().padStart(2, '0')}`,
+          seriesTitles
         );
       }
-      if (parsedId.season && parsedId.episode) {
+      if (parsedId.season && parsedId.episode && !continuousAbsolute) {
         addQuery(
-          `${titlePlaceholder} S${parsedId.season!.toString().padStart(2, '0')}E${parsedId.episode!.toString().padStart(2, '0')}`
+          `${titlePlaceholder} S${parsedId.season!.toString().padStart(2, '0')}E${parsedId.episode!.toString().padStart(2, '0')}`,
+          seriesTitles
         );
+      }
+      // date-based releases are named by air date
+      if (metadata.isDateBased && metadata.episodeAirDate) {
+        const [yyyy, mm, dd] = metadata.episodeAirDate.split('-');
+        if (yyyy && mm && dd) {
+          const sceneAlias = metadata.sceneTitles?.[0];
+          const dateTitles = sceneAlias
+            ? [...new Set([cleanTitle(sceneAlias), ...titles])]
+            : titles;
+          addQuery(`${titlePlaceholder} ${yyyy} ${mm} ${dd}`, dateTitles);
+        }
       }
     } else {
       addQuery(titlePlaceholder);
@@ -560,7 +670,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
   ): Promise<SearchMetadata> {
     const start = Date.now();
 
-    const animeEntry = AnimeDatabase.getInstance().getEntryById(
+    const animeEntry = await AnimeDatabase.getInstance().getEntryById(
       parsedId.type,
       parsedId.value,
       parsedId.season ? Number(parsedId.season) : undefined,
@@ -584,6 +694,33 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     // Calculate absolute episode if needed
     let absoluteEpisode: number | undefined;
     let relativeAbsoluteEpisode: number | undefined;
+    const nonAnimeAbsolute =
+      !animeEntry && isNonAnimeAbsoluteEligible(metadata);
+    if (
+      (animeEntry || nonAnimeAbsolute) &&
+      parsedId.season &&
+      parsedId.episode &&
+      metadata.seasons
+    ) {
+      const seasons = metadata.seasons.map(
+        ({ season_number, episode_count }) => ({
+          number: season_number.toString(),
+          episodes: episode_count,
+        })
+      );
+      if (nonAnimeAbsolute && (metadata.resolvedSeasonFirstEpisode ?? 1) > 1) {
+        // episodes are already numbered continuously across seasons
+        absoluteEpisode = Number(parsedId.episode);
+      } else {
+        this.logger.debug(
+          `Calculating absolute episode with current season and episode: ${parsedId.season}, ${parsedId.episode} and seasons: ${JSON.stringify(seasons)}`
+        );
+        // Calculate base absolute episode
+        absoluteEpisode = Number(
+          calculateAbsoluteEpisode(parsedId.season, parsedId.episode, seasons)
+        );
+      }
+    }
     if (animeEntry && parsedId.season && parsedId.episode && metadata.seasons) {
       const seasons = metadata.seasons.map(
         ({ season_number, episode_count }) => ({
@@ -591,20 +728,13 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
           episodes: episode_count,
         })
       );
-      this.logger.debug(
-        `Calculating absolute episode with current season and episode: ${parsedId.season}, ${parsedId.episode} and seasons: ${JSON.stringify(seasons)}`
-      );
-      // Calculate base absolute episode
-      absoluteEpisode = Number(
-        calculateAbsoluteEpisode(parsedId.season, parsedId.episode, seasons)
-      );
 
       // Calculate relative absolute episode (within current AniDB entry)
       // Find the first season of this AniDB entry
       const startingSeason =
         animeEntry.imdb?.seasonNumber ??
-        animeEntry.trakt?.seasonNumber ??
         animeEntry.tvdb?.seasonNumber ??
+        animeEntry.trakt?.seasonNumber ??
         animeEntry.tmdb?.seasonNumber;
 
       if (startingSeason) {
@@ -626,7 +756,6 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
           relativeAbsoluteEpisode = calculated;
         }
       }
-
 
       const parsedSeasonRecord = seasons.find(
         (s) => s.number === parsedId.season
@@ -689,6 +818,18 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       tmdbId: metadata.tmdbId ?? null,
       tvdbId: metadata.tvdbId ?? null,
       isAnime: animeEntry ? true : false,
+      ongoingSeason:
+        metadata.nextAirDate && metadata.seasons?.length
+          ? Number(parsedId.season) ===
+            Math.max(...metadata.seasons.map((s) => s.season_number))
+          : undefined,
+      isDateBased: metadata.isDateBased,
+      airDates: metadata.episodeAirDates,
+      episodeAirDate: metadata.episodeAirDate,
+      resolvedSeasonFirstEpisode: metadata.resolvedSeasonFirstEpisode,
+      sceneTitles: metadata.sceneTitles,
+      country: metadata.country,
+      titleConflicts: metadata.titleConflicts,
     };
 
     this.logger.debug(
@@ -734,6 +875,8 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
             nzb: torrentOrNzb.nzb,
             title: torrentOrNzb.title,
             hash: torrentOrNzb.hash,
+            releaseKey: torrentOrNzb.releaseKey,
+            indexer: torrentOrNzb.indexer,
             index: torrentOrNzb.file.index,
             easynewsUrl:
               torrentOrNzb.service?.id === 'easynews'
@@ -779,6 +922,9 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
             )
           : undefined,
       nzbUrl: torrentOrNzb.type === 'usenet' ? torrentOrNzb.nzb : undefined,
+      releaseKey:
+        torrentOrNzb.type === 'usenet' ? torrentOrNzb.releaseKey : undefined,
+      idMatched: torrentOrNzb.confirmed === true ? true : undefined,
       servers:
         torrentOrNzb.service?.id === 'stremio_nntp'
           ? (encryptedStoreAuth as string[])
@@ -790,8 +936,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
           ? 'stremio-usenet'
           : torrentOrNzb.type,
       age: torrentOrNzb.age,
-      duration: torrentOrNzb.duration,
-      infoHash: torrentOrNzb.hash,
+      infoHash: torrentOrNzb.type === 'torrent' ? torrentOrNzb.hash : undefined,
       fileIdx: torrentOrNzb.file.index,
       behaviorHints: {
         videoSize: torrentOrNzb.file.size,
@@ -823,7 +968,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     const errorStreams: Stream[] = [];
 
     let resultStreams = [...streams];
-    let serviceIds = [...streamServiceIds];
+    const serviceIds = [...streamServiceIds];
 
     let nzbdavAuth: z.infer<typeof NzbDavConfig> | undefined;
     let altmountAuth: z.infer<typeof AltmountConfig> | undefined;
@@ -877,21 +1022,6 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       });
     };
 
-    const getServiceIndices = (serviceId: BuiltinServiceId): number[] =>
-      serviceIds
-        .map((id, i) => ({ id, i }))
-        .filter(({ id }) => id === serviceId)
-        .map(({ i }) => i);
-
-    const dropServiceStreams = (serviceId: BuiltinServiceId) => {
-      const keep: number[] = serviceIds
-        .map((id, i) => ({ id, i }))
-        .filter(({ id }) => id !== serviceId)
-        .map(({ i }) => i);
-      resultStreams = keep.map((i) => resultStreams[i]);
-      serviceIds = keep.map((i) => serviceIds[i]);
-    };
-
     const nzbdavBasicAuth =
       nzbdavAuth?.webdavUser && nzbdavAuth?.webdavPassword
         ? `Basic ${Buffer.from(
@@ -905,80 +1035,15 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
           ).toString('base64')}`
         : undefined;
 
-    if (nzbdavAuth) {
+    // Only stamp proxy headers / notWebReady when the service will NOT proxy
+    // itself at resolve time.
+    if (nzbdavAuth && !nzbdavAuth.aiostreamsAuth) {
       setProxyHeaders('nzbdav', nzbdavBasicAuth);
     }
 
-    if (altmountAuth) {
+    if (altmountAuth && !altmountAuth.aiostreamsAuth) {
       setProxyHeaders('altmount', altmountBasicAuth);
     }
-
-    const proxyServiceStreams = async (
-      serviceId: BuiltinServiceId,
-      proxyCredential: string | undefined,
-      authorization: string | undefined,
-      errorDescription: string
-    ) => {
-      const indices = getServiceIndices(serviceId);
-      if (indices.length === 0 || !proxyCredential) return;
-
-      const proxy = createProxy({
-        id: 'builtin',
-        enabled: true,
-        credentials: proxyCredential,
-      });
-
-      const proxiedStreams = await proxy.generateUrls(
-        indices.map((i) => ({
-          url: resultStreams[i].url!,
-          filename: resultStreams[i].behaviorHints?.filename ?? undefined,
-          headers: authorization
-            ? {
-                request: {
-                  Authorization: authorization,
-                },
-              }
-            : undefined,
-        }))
-      );
-
-      if (proxiedStreams && !('error' in proxiedStreams)) {
-        for (let i = 0; i < indices.length; i++) {
-          const index = indices[i];
-          const proxiedUrl = proxiedStreams[i];
-          if (proxiedUrl) {
-            resultStreams[index].url = proxiedUrl;
-            resultStreams[index].behaviorHints = {
-              ...resultStreams[index].behaviorHints,
-              notWebReady: undefined,
-              proxyHeaders: undefined,
-            };
-          }
-        }
-      } else {
-        errorStreams.push(
-          this._createErrorStream({
-            title: `${this.name}`,
-            description: errorDescription,
-          })
-        );
-        dropServiceStreams(serviceId);
-      }
-    };
-
-    await proxyServiceStreams(
-      'nzbdav',
-      nzbdavAuth?.aiostreamsAuth,
-      nzbdavBasicAuth,
-      'Failed to proxy NzbDAV streams, ensure your proxy auth is correct.'
-    );
-
-    await proxyServiceStreams(
-      'altmount',
-      altmountAuth?.aiostreamsAuth,
-      altmountBasicAuth,
-      'Failed to proxy Altmount streams, ensure your proxy auth is correct.'
-    );
 
     return {
       streams: resultStreams,

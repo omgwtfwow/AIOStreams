@@ -1,5 +1,7 @@
 ﻿import { z } from 'zod';
 import { constants, ServiceId, Cache, appConfig } from '../utils/index.js';
+import { registerLockErrorClass } from '../utils/lock-error-registry.js';
+import { WD1_KEY_REGEX } from '../release-blocklist/keys.js';
 
 type DebridErrorCode =
   | 'BAD_GATEWAY'
@@ -16,13 +18,17 @@ type DebridErrorCode =
   | 'SERVICE_UNAVAILABLE'
   | 'STORE_LIMIT_EXCEEDED'
   | 'STORE_MAGNET_INVALID'
+  | 'TOO_MANY_ACTIVE_CONNECTIONS'
   | 'TOO_MANY_REQUESTS'
   | 'UNAUTHORIZED'
   | 'UNAVAILABLE_FOR_LEGAL_REASONS'
   | 'UNKNOWN'
   | 'UNPROCESSABLE_ENTITY'
   | 'UNSUPPORTED_MEDIA_TYPE'
-  | 'NO_MATCHING_FILE';
+  | 'NO_MATCHING_FILE'
+  | 'TIMEOUT'
+  | 'DOWNLOAD_FAILED';
+
 type DebridErrorType =
   | 'api_error'
   | 'store_error'
@@ -71,6 +77,30 @@ export class DebridError extends Error {
     }
   }
 }
+registerLockErrorClass(DebridError);
+
+export const convertStatusCodeToError = (code: number): DebridError['code'] => {
+  switch (code) {
+    case 400:
+      return 'BAD_REQUEST';
+    case 401:
+      return 'UNAUTHORIZED';
+    case 403:
+      return 'FORBIDDEN';
+    case 404:
+      return 'NOT_FOUND';
+    case 429:
+      return 'TOO_MANY_REQUESTS';
+    case 500:
+      return 'INTERNAL_SERVER_ERROR';
+    case 501:
+      return 'NOT_IMPLEMENTED';
+    case 503:
+      return 'SERVICE_UNAVAILABLE';
+    default:
+      return 'UNKNOWN';
+  }
+};
 
 /**
  * Codes that are service-level failures (auth, quota, rate-limit) rather than
@@ -179,10 +209,14 @@ const TitleMetadataSchema = z.object({
   titles: z.array(z.string()),
   year: z.number().optional(),
   seasonYear: z.number().optional(),
+  country: z.string().optional(),
   season: z.number().optional(),
   episode: z.number().optional(),
   absoluteEpisode: z.number().optional(),
   relativeAbsoluteEpisode: z.number().optional(),
+  // local air dates ('YYYY-MM-DD') of the requested episode for date-based shows
+  airDates: z.array(z.string()).optional(),
+  isDateBased: z.boolean().optional(),
 });
 
 const BasePlaybackInfoSchema = z.object({
@@ -218,6 +252,8 @@ const UsenetInfoSchema = BaseFileInfoSchema.extend({
   hash: z.string(),
   easynewsUrl: z.string().optional(),
   nzb: z.string(),
+  releaseKey: z.string().regex(WD1_KEY_REGEX).optional().catch(undefined),
+  indexer: z.string().optional(),
   type: z.literal('usenet'),
 });
 
@@ -253,7 +289,13 @@ interface BaseDebridService {
     playbackInfo: PlaybackInfo,
     filename: string,
     cacheAndPlay: boolean,
-    autoRemoveDownloads?: boolean
+    autoRemoveDownloads?: boolean,
+    /**
+     * Optional abort signal used by the failover orchestrator to cancel a
+     * losing parallel attempt. Services that can honour it (e.g. native usenet)
+     * should thread it into their I/O; others may ignore it.
+     */
+    signal?: AbortSignal
   ): Promise<string | undefined>;
 
   refreshLibraryCache?(sources?: ('torrent' | 'nzb')[]): Promise<void>;

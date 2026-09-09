@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.10.1](https://github.com/Viren070/AIOStreams/compare/seanime-extensions-v0.10.0...seanime-extensions-v0.10.1) (2026-08-10)
+
+
+### Bug Fixes
+
+* **seanime-extensions:** support parsing path based variant selectors ([5e64202](https://github.com/Viren070/AIOStreams/commit/5e642023d32502be032a2d5602b62dcd2022ae75))
+
+## [0.10.0](https://github.com/Viren070/AIOStreams/compare/seanime-extensions-v0.9.0...seanime-extensions-v0.10.0) (2026-08-09)
+
+
+### Features
+
+* **seanime-extensions:** support variants ([234b580](https://github.com/Viren070/AIOStreams/commit/234b58018a4fb27770a6c0013faf7b4c4e13ab96))
+
+
+### Bug Fixes
+
+* **seanime-extensions:** keep manifest query params on resource requests ([fc969bb](https://github.com/Viren070/AIOStreams/commit/fc969bbfb31fc1530046b0b07865407ef88fa6f2))
+
+## [0.9.0](https://github.com/Viren070/AIOStreams/compare/seanime-extensions-v0.8.3...seanime-extensions-v0.9.0) (2026-07-08)
+
+
+### Features
+
+* **seanime-extensions/aiostreams-plugin:** add auto next episode ([a7d12c8](https://github.com/Viren070/AIOStreams/commit/a7d12c8310d286c05111a008d7220b63c64a097a))
+
+## [0.8.3](https://github.com/Viren070/AIOStreams/compare/seanime-extensions-v0.8.2...seanime-extensions-v0.8.3) (2026-06-11)
+
+
+### Bug Fixes
+
+* **seanime-extensions:** prefer tvdb over trakt for season number ([81093f5](https://github.com/Viren070/AIOStreams/commit/81093f5f629d6b3f3b7c87056aec5fb8bd5020f8))
+
 ## [0.8.2](https://github.com/Viren070/AIOStreams/compare/seanime-extensions-v0.8.1...seanime-extensions-v0.8.2) (2026-05-09)
 
 

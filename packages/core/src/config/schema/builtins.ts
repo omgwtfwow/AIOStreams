@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   boolOrList,
+  byteSize,
   commaSeparatedList,
   optionalPositiveInt,
   positiveInt,
@@ -14,8 +15,20 @@ const nullableString = z.string().nullable();
 const nullableUrl = z.union([urlString, z.null()]);
 const stringList = z.array(z.string());
 
+const titleLangSpecs = z
+  .union([z.array(z.string()), z.string().transform((s) => s.split(','))])
+  .transform((specs) =>
+    specs.map((t) => t.trim().toLowerCase()).filter(Boolean)
+  );
+
 const titleLangMap = z.union([
-  z.record(z.string(), z.array(z.string())),
+  z
+    .record(z.string(), titleLangSpecs)
+    .transform((rec) =>
+      Object.fromEntries(
+        Object.entries(rec).map(([k, v]) => [k.trim().toLowerCase(), v])
+      )
+    ),
   z.string().transform((value) => {
     const out: Record<string, string[]> = {};
     if (!value.trim()) return out;
@@ -88,6 +101,10 @@ const boolOrDebridStore = z.union([z.boolean(), debridStore]);
 
 const Day = 86400;
 const Week = 7 * Day;
+
+// Byte-size units (base-10, matching the `byteSize` helper + frontend SizeField).
+const MB = 1000 * 1000;
+const GB = 1000 * MB;
 
 /**
  * Built-in addons.
@@ -260,8 +277,10 @@ export const builtinsSchema = {
       label: 'Scrape with alternative titles',
       description: {
         ui: 'Use alternative titles when scraping built-in addons. Either a boolean or a comma-separated hostname list.',
-        env: 'By default, built-in addons only use the primary title for text-based queries. `true` enables all alternative titles for every indexer; `false` (default) uses the primary title only; a comma-separated hostname list (e.g. `jackett,knaben.org`) enables it only for those indexers. Superseded per-indexer by BUILTIN_SCRAPE_TITLE_LANGUAGES.',
+        env: 'By default, built-in addons only use the primary title for text-based queries. `true` enables all alternative titles for every indexer; `false` (default) uses the primary title only; a comma-separated hostname list (e.g. `jackett,knaben.org`) enables it only for those indexers.',
       },
+      deprecated:
+        'Superseded by "Title languages" (`BUILTIN_SCRAPE_TITLE_LANGUAGES`), which controls titles per indexer.',
       env: 'BUILTIN_SCRAPE_WITH_ALL_TITLES',
       requiresRestart: false,
       secret: false,
@@ -271,12 +290,17 @@ export const builtinsSchema = {
       default: {} as Record<string, string[]>,
       label: 'Title languages',
       description: {
-        ui: 'Per-domain control over which titles to use when scraping. Format: `domain:spec,...` where spec is one of `default`, `all`, `original`, or an ISO 639-1 code.',
+        ui:
+          'Control which titles built-in addons use for text-based queries, per indexer. ' +
+          'Keys are matched in priority order: exact indexer hostname (e.g. `my-indexer.com`), auto-extracted indexer name (Jackett/NZBHydra2), addon ID (`newznab`, `torznab`, `easynews`, `knaben`, `prowlarr`, `torrent-galaxy`), then `*` as the fallback for everything else. ' +
+          'Each value is one or more comma-separated specs: `default` (primary/English-style title), `all` (all alternative titles up to the title limit), `original` (TMDB original-language title), `scene` (scene-release titles from the scene mappings), or an ISO 639-1 code (e.g. `de`, `fr`). ' +
+          'Only the highest-priority matching key applies; duplicates are removed and the primary title is always kept as a fallback. ' +
+          'Example: `*` = `default,original` queries every indexer with the primary and TMDB original-language titles.',
         env:
-          'Fine-grained alternative-title control, per indexer hostname, indexer name, or addon type. Supersedes BUILTIN_SCRAPE_WITH_ALL_TITLES. ' +
+          'Fine-grained alternative-title control, per indexer hostname, indexer name, or addon type. ' +
           'Format: `<key>:<spec>[,<spec>...][,<key>:<spec>...]`. ' +
           'Keys (checked in priority order): exact indexer hostname (e.g. `my-indexer.com`); auto-extracted indexer name (Jackett `/api/v2.0/indexers/<name>/...`, NZBHydra2 `?indexers=<name>`); addon-id (`newznab`, `torznab`, `easynews`, `knaben`, `prowlarr`, `torrent-galaxy`); `*` wildcard fallback. ' +
-          'Specs: `default` (primary/English-style title), `all` (all alternative titles up to BUILTIN_SCRAPE_TITLE_LIMIT), `original` (TMDB original-language title), `<lang>` (ISO 639-1 code, e.g. `de`, `fr`). ' +
+          'Specs: `default` (primary/English-style title), `all` (all alternative titles up to BUILTIN_SCRAPE_TITLE_LIMIT), `original` (TMDB original-language title), `scene` (scene-release titles from the scene mappings), `<lang>` (ISO 639-1 code, e.g. `de`, `fr`). ' +
           'Multiple specs under one key are combined (duplicates removed); only the highest-priority matching key applies; always falls back to the primary title. ' +
           'Examples: `*:default,original` — every indexer gets default + TMDB original-language title. `*:default,newznab:default,original,de` — newznab indexers query English + original + German, others English only. `*:default,germanindexer.com:de,default` — germanindexer.com queries German + English, all others English only.',
       },
@@ -302,6 +326,60 @@ export const builtinsSchema = {
       requiresRestart: false,
       secret: false,
     },
+    latinQueriesOnly: {
+      schema: z.boolean(),
+      default: true,
+      label: 'Latin-only search queries',
+      description:
+        'Skip predominantly non-Latin-script titles (e.g. kanji) when building search queries, since scene releases are named in Latin script. Such titles are still used for matching results. Disable if you use native-language indexers (e.g. Cyrillic trackers).',
+      env: 'BUILTIN_SCRAPE_LATIN_QUERIES_ONLY',
+      requiresRestart: false,
+      secret: false,
+    },
+    dateBased: {
+      enabled: {
+        schema: z.boolean(),
+        default: true,
+        label: 'Date-based series search',
+        description:
+          'Detect date-based series (talk shows, WWE, game shows, soaps) and search/match their releases by episode air date instead of season/episode numbers.',
+        env: 'BUILTIN_SCRAPE_DATE_BASED_ENABLED',
+        requiresRestart: false,
+        secret: false,
+      },
+      episodeCountThreshold: {
+        schema: positiveInt,
+        default: 40,
+        label: 'Date-based episode count threshold',
+        description:
+          'A season with at least this many episodes counts towards detecting a series as date-based.',
+        env: 'BUILTIN_SCRAPE_DATE_BASED_EPISODE_COUNT_THRESHOLD',
+        requiresRestart: false,
+        secret: false,
+      },
+      minSeasons: {
+        schema: positiveInt,
+        default: 4,
+        label: 'Date-based minimum seasons',
+        description:
+          'Minimum number of seasons required before the episode count threshold marks a series as date-based. Prevents long single-season dramas from being misdetected.',
+        env: 'BUILTIN_SCRAPE_DATE_BASED_MIN_SEASONS',
+        requiresRestart: false,
+        secret: false,
+      },
+    },
+    absoluteSearch: {
+      languages: {
+        schema: commaSeparatedList,
+        default: ['ko', 'zh', 'ja', 'th'],
+        label: 'Absolute search languages',
+        description:
+          'Original languages (ISO 639-1) whose non-anime series also get absolute-episode search queries (e.g. Asian dramas released as "Show E40"). Requires a TMDB key for original language detection. Empty disables.',
+        env: 'BUILTIN_SCRAPE_ABSOLUTE_SEARCH_LANGUAGES',
+        requiresRestart: false,
+        secret: false,
+      },
+    },
   },
   getTorrent: {
     timeout: {
@@ -315,7 +393,7 @@ export const builtinsSchema = {
     },
     concurrency: {
       schema: positiveInt,
-      default: 100,
+      default: 5,
       label: 'Get-torrent concurrency',
       description: 'Maximum concurrent torrent fetches.',
       env: 'BUILTIN_GET_TORRENT_CONCURRENCY',
@@ -350,6 +428,50 @@ export const builtinsSchema = {
       description:
         'Minimum interval between background search-cache refreshes triggered during normal searches.',
       env: 'BUILTIN_MINIMUM_BACKGROUND_REFRESH_INTERVAL',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  grab: {
+    nzbCacheBytes: {
+      schema: byteSize,
+      default: 64 * MB,
+      label: 'NZB grab cache size',
+      description:
+        'In-memory cache size for grabbed .nzb files. Accepts plain bytes or `64MB`-style strings.',
+      env: 'BUILTIN_NZB_GRAB_CACHE_BYTES',
+      requiresRestart: false,
+      secret: false,
+    },
+    nzbDiskCacheBytes: {
+      schema: byteSize,
+      default: 1 * GB,
+      label: 'NZB grab disk cache size',
+      description:
+        'On-disk cache size for grabbed .nzb files (survives restarts). Set to ' +
+        '`0` to disable the disk tier. Accepts plain bytes or `1GB`-style strings.',
+      env: 'BUILTIN_NZB_GRAB_DISK_CACHE_BYTES',
+      requiresRestart: false,
+      secret: false,
+    },
+    torrentCacheBytes: {
+      schema: byteSize,
+      default: 64 * MB,
+      label: 'Torrent grab cache size',
+      description:
+        'In-memory cache size for grabbed .torrent files. Accepts plain bytes or `64MB`-style strings.',
+      env: 'BUILTIN_TORRENT_GRAB_CACHE_BYTES',
+      requiresRestart: false,
+      secret: false,
+    },
+    torrentDiskCacheBytes: {
+      schema: byteSize,
+      default: 512 * MB,
+      label: 'Torrent grab disk cache size',
+      description:
+        'On-disk cache size for grabbed .torrent files (survives restarts). Set ' +
+        'to `0` to disable the disk tier. Accepts plain bytes or `512MB`-style strings.',
+      env: 'BUILTIN_TORRENT_GRAB_DISK_CACHE_BYTES',
       requiresRestart: false,
       secret: false,
     },
@@ -491,7 +613,12 @@ export const builtinsSchema = {
       default: null,
       label: 'Newznab/Torznab user agent',
       env: 'BUILTIN_NAB_USER_AGENT',
-      description: 'User-Agent for Newznab/Torznab requests.',
+      description:
+        'User-Agent for Newznab/Torznab requests; the fallback when no ' +
+        'host/context override matches.',
+      deprecated:
+        'Prefer `[newznab]`/`[torznab]` entries in `REQUEST_HEADER_OVERRIDES` ' +
+        '(which also support `{preset}` header sets).',
       requiresRestart: false,
       secret: false,
     },
@@ -501,7 +628,12 @@ export const builtinsSchema = {
       label: 'Newznab/Torznab HTTP proxy',
       env: 'BUILTIN_NAB_HTTP_PROXY',
       description:
-        'Per-protocol HTTP proxy override (`torznab:URL,newznab:URL`). Overrides the global addon proxy.',
+        'Per-protocol HTTP proxy override (`torznab:URL,newznab:URL`); still ' +
+        'honoured and overrides the global addon proxy when set.',
+      deprecated:
+        'Add the proxy URL to `ADDON_PROXY` and route Newznab/Torznab through ' +
+        'it with a `[newznab]`/`[torznab]` entry in `ADDON_PROXY_CONFIG` ' +
+        '(e.g. `[newznab]:0`).',
       requiresRestart: false,
       secret: false,
     },
@@ -512,6 +644,16 @@ export const builtinsSchema = {
       env: 'BUILTIN_NAB_MAX_PAGES',
       description:
         'Maximum pages to fetch when paginating Newznab/Torznab results.',
+      requiresRestart: false,
+      secret: false,
+    },
+    zyclopsHealthProxyEndpoint: {
+      schema: urlString,
+      default: 'https://zyclops.elfhosted.com',
+      label: 'Zyclops health proxy endpoint',
+      description:
+        'Base URL of the Zyclops health proxy used by the Newznab preset.',
+      env: 'ZYCLOPS_HEALTH_PROXY_ENDPOINT',
       requiresRestart: false,
       secret: false,
     },
@@ -552,6 +694,26 @@ export const builtinsSchema = {
       label: 'AnimeTosho timeout (ms)',
       env: 'BUILTIN_DEFAULT_ANIMETOSHO_TIMEOUT',
       description: 'Timeout for AnimeTosho requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  animeToshoNew: {
+    url: {
+      schema: urlString,
+      default: 'https://feed.animetosho.xyz',
+      label: 'Anime Tosho (New) URL',
+      env: 'BUILTIN_ANIME_TOSHO_NEW_URL',
+      description: 'Base URL for the Anime Tosho (New) built-in addon.',
+      requiresRestart: false,
+      secret: false,
+    },
+    timeout: {
+      schema: optionalPositiveInt,
+      default: null,
+      label: 'Anime Tosho (New) timeout (ms)',
+      env: 'BUILTIN_DEFAULT_ANIME_TOSHO_NEW_TIMEOUT',
+      description: 'Timeout for Anime Tosho (New) requests.',
       requiresRestart: false,
       secret: false,
     },
@@ -800,7 +962,7 @@ export const builtinsSchema = {
     },
     maxPages: {
       schema: positiveInt,
-      default: 5,
+      default: 8,
       label: 'Easynews max pages',
       env: 'BUILTIN_EASYNEWS_SEARCH_MAX_PAGES',
       description:
@@ -900,6 +1062,91 @@ export const builtinsSchema = {
       label: 'EZTV max pages',
       env: 'BUILTIN_EZTV_MAX_PAGES',
       description: 'Maximum pages fetched when paginating EZTV results.',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  therarbg: {
+    url: {
+      schema: urlString,
+      default: 'https://therarbg.to',
+      label: 'TheRARBG URL',
+      env: 'BUILTIN_THERARBG_URL',
+      description: 'Base URL for the TheRARBG built-in addon.',
+      requiresRestart: false,
+      secret: false,
+    },
+    defaultTimeout: {
+      schema: optionalPositiveInt,
+      default: null,
+      label: 'TheRARBG default timeout (ms)',
+      env: 'BUILTIN_DEFAULT_THERARBG_TIMEOUT',
+      description: 'Default timeout for TheRARBG requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchTimeout: {
+      schema: positiveInt,
+      default: 30000,
+      label: 'TheRARBG search timeout (ms)',
+      env: 'BUILTIN_THERARBG_SEARCH_TIMEOUT',
+      description: 'Timeout for TheRARBG search requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchCacheTtl: {
+      schema: seconds,
+      default: Week,
+      label: 'TheRARBG search cache TTL (s)',
+      env: 'BUILTIN_THERARBG_SEARCH_CACHE_TTL',
+      description: 'Cache TTL for TheRARBG search results.',
+      requiresRestart: false,
+      secret: false,
+    },
+    pageLimit: {
+      schema: positiveInt,
+      default: 5,
+      label: 'TheRARBG page limit',
+      env: 'BUILTIN_THERARBG_PAGE_LIMIT',
+      description: 'Maximum pages fetched when paginating TheRARBG results.',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  thePirateBay: {
+    url: {
+      schema: urlString,
+      default: 'https://apibay.org',
+      label: 'The Pirate Bay URL',
+      env: 'BUILTIN_THE_PIRATE_BAY_URL',
+      description: 'Base URL for The Pirate Bay built-in addon.',
+      requiresRestart: false,
+      secret: false,
+    },
+    defaultTimeout: {
+      schema: optionalPositiveInt,
+      default: null,
+      label: 'The Pirate Bay default timeout (ms)',
+      env: 'BUILTIN_DEFAULT_THE_PIRATE_BAY_TIMEOUT',
+      description: 'Default timeout for The Pirate Bay requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchTimeout: {
+      schema: positiveInt,
+      default: 30000,
+      label: 'The Pirate Bay search timeout (ms)',
+      env: 'BUILTIN_THE_PIRATE_BAY_SEARCH_TIMEOUT',
+      description: 'Timeout for The Pirate Bay search requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchCacheTtl: {
+      schema: seconds,
+      default: Week,
+      label: 'The Pirate Bay search cache TTL (s)',
+      env: 'BUILTIN_THE_PIRATE_BAY_SEARCH_CACHE_TTL',
+      description: 'Cache TTL for The Pirate Bay search results.',
       requiresRestart: false,
       secret: false,
     },
