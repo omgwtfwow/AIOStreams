@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   stremthru: 5d59636029f2455cfc103c8b8206ce24ff67c7f7f77e6fb8ea3f65dca52105dd
-  yencode@1.2.4: 789de3a1a93eb2db8c8833260e74c663adee24df0e3dff0bddd220a6f4c4b31f
+  yencode@1.2.4: 4729807b155c5689f927b5c797e0f55f69eac931363789fff38dae912f4b3aba
 
 importers:
 
@@ -113,7 +113,7 @@ importers:
         version: 5.10.0
       yencode:
         specifier: ^1.2.4
-        version: 1.2.4(patch_hash=789de3a1a93eb2db8c8833260e74c663adee24df0e3dff0bddd220a6f4c4b31f)
+        version: 1.2.4(patch_hash=4729807b155c5689f927b5c797e0f55f69eac931363789fff38dae912f4b3aba)
       zod:
         specifier: ^4.4.3
         version: 4.4.3
@@ -14777,7 +14777,7 @@ snapshots:
 
   yallist@5.0.0: {}
 
-  yencode@1.2.4(patch_hash=789de3a1a93eb2db8c8833260e74c663adee24df0e3dff0bddd220a6f4c4b31f): {}
+  yencode@1.2.4(patch_hash=4729807b155c5689f927b5c797e0f55f69eac931363789fff38dae912f4b3aba): {}
 
   yn@3.1.1: {}
 
