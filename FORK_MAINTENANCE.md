@@ -103,8 +103,13 @@ git log --left-right --cherry-pick --oneline upstream/main...main
 
 ## Deployment Rollback
 
-Rollback should be an image-pin change in the homeserver environment, followed
-by recreating only AIOStreams-dependent services.
+Before each upgrade, save a consistent database backup and the current
+immutable image reference. When the upgrade advances the database schema,
+stop only AIOStreams and its shared-state migrator, restore that pre-upgrade
+database backup, then recreate those services with the previous image. An
+image-only rollback across schema versions is unsupported: the older build
+refuses to use a newer database. Preserve the upgraded database separately
+before restoring so rollback does not discard the only copy of new state.
 
 ```text
 AIOSTREAMS_IMAGE=ghcr.io/omgwtfwow/aiostreams:<previous-known-good-tag>
