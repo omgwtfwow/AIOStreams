@@ -62,6 +62,8 @@ test('default release and PR matrices use native runners', () => {
 test('unsupported platforms, duplicate architectures, wrong owner and unsafe inputs fail closed', () => {
   for (const overrides of [
     { INPUT_PLATFORMS: 'linux/arm/v7' },
+    { INPUT_PLATFORMS: 'linux/constructor' },
+    { INPUT_PLATFORMS: 'linux/__proto__' },
     { INPUT_PLATFORMS: 'linux/amd64,linux/amd64' },
     { INPUT_PLATFORMS: 'linux/arm64,' },
     { INPUT_TAG: 'bad\ntag' },

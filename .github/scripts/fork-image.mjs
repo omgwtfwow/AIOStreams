@@ -21,7 +21,8 @@ export function configuration(env, now = new Date()) {
   const include = platforms.map((platform) => {
     const architecture = platform.split('/')[1];
     assert.ok(
-      platform === `linux/${architecture}` && runners[architecture],
+      platform === `linux/${architecture}` &&
+        Object.hasOwn(runners, architecture),
       'Unsupported native platform'
     );
     return { platform, architecture, runner: runners[architecture] };
