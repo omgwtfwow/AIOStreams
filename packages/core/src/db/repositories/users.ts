@@ -1,4 +1,4 @@
-﻿import { UserData } from '../schemas.js';
+﻿import { UserData, isPersonaLockHash } from '../schemas.js';
 import { getDb } from '../db.js';
 import { sql } from '../sql.js';
 import { config as appConfig } from '../../config/index.js';
@@ -55,9 +55,9 @@ interface ConfigKeyEntry {
   key: string;
 }
 
-const CONFIG_KEY_CACHE_TTL = 30 * 60;
+const CONFIG_KEY_CACHE_TTL = 24 * 60 * 60;
 
-const configKeyCache = Cache.getInstance<string, string>('config-key', 5000);
+const configKeyCache = Cache.getInstance<string, string>('config-key', 50000);
 
 let trustedUuidsSource: string | null | undefined;
 let trustedUuidPatterns: RegExp[] = [];
@@ -241,7 +241,9 @@ export class UserRepository {
     const key = await this.resolveConfigKey(uuid, password, row);
 
     await db.exec(
-      sql`UPDATE users SET accessed_at = CURRENT_TIMESTAMP WHERE uuid = ${uuid}`
+      sql`UPDATE users SET accessed_at = CURRENT_TIMESTAMP
+           WHERE uuid = ${uuid}
+             AND (accessed_at IS NULL OR accessed_at < ${db.intervalAgo(1, 'hours')})`
     );
 
     const decryptedConfig = this.decryptConfigWithKey(row.config, key);
@@ -575,6 +577,14 @@ export class UserRepository {
     password: string,
     salt?: string
   ): Promise<{ encryptedConfig: string; salt: string }> {
+    // Every stored config passes here, so a PIN is never kept plain.
+    for (const user of [
+      config.jellyfin?.primary,
+      ...(config.jellyfin?.personas ?? []),
+    ]) {
+      if (user?.lock && !isPersonaLockHash(user.lock))
+        user.lock = await getTextHash(user.lock);
+    }
     const { key, salt: saltUsed } = await deriveKey(
       `${password}:${appConfig.bootstrap.secretKey}`,
       salt

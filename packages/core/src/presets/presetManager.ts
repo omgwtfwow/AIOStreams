@@ -71,6 +71,7 @@ import { LibraryPreset } from './library.js';
 import { EztvPreset } from './eztv.js';
 import { TheRARBGPreset } from './therarbg.js';
 import { ThePirateBayPreset } from './thePirateBay.js';
+import { TsukihimePreset } from './tsukihime.js';
 import { BitmagnetPreset } from './bitmagnet.js';
 import { BrazucaTorrentsPreset } from './brazucaTorrents.js';
 import { SootioPreset } from './sootio.js';
@@ -82,6 +83,7 @@ import { SeaDexPreset } from './seadex.js';
 import { StreamNZBPreset } from './streamnzb.js';
 import { DavexPreset } from './davex.js';
 import { HdHubPreset } from './hdhub.js';
+import { PenguPlayPreset } from './penguplay.js';
 import { BaguettioPreset } from './baguettio.js';
 import { Preset } from './index.js';
 
@@ -103,6 +105,7 @@ let PRESET_LIST: string[] = [
   'eztv',
   'therarbg',
   'the-pirate-bay',
+  'tsukihime',
   'torrent-galaxy',
   'bitmagnet',
   'seadex',
@@ -131,6 +134,7 @@ let PRESET_LIST: string[] = [
   'streamnzb',
   'davex',
   'dmm-cast',
+  'penguplay',
   'nuvio-streams',
   'webstreamr',
   'hdhub',
@@ -245,6 +249,8 @@ export class PresetManager {
         return FKStreamPreset;
       case 'flix-streams':
         return FlixStreamsPreset;
+      case 'penguplay':
+        return PenguPlayPreset;
       case 'anime-kitsu':
         return AnimeKitsuPreset;
       case 'nuvio-streams':
@@ -335,6 +341,8 @@ export class PresetManager {
         return TheRARBGPreset;
       case 'the-pirate-bay':
         return ThePirateBayPreset;
+      case 'tsukihime':
+        return TsukihimePreset;
       case 'bitmagnet':
         return BitmagnetPreset;
       case 'seadex':

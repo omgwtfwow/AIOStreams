@@ -4,6 +4,8 @@ import {
   config as appConfig,
   getEnvironmentServiceDetails,
   PresetManager,
+  segmentProviders,
+  segmentsEnabled,
   SelAccess,
   UserRepository,
 } from '@aiostreams/core';
@@ -15,11 +17,22 @@ import { getSeanimeExtensionVersion } from '../../utils/seanime.js';
 
 const router: Router = Router();
 
+const USER_COUNT_TTL_MS = 60_000;
+let countedUsers: { value: number; at: number } | null = null;
+
+async function recentUserCount(): Promise<number> {
+  if (!countedUsers || Date.now() - countedUsers.at > USER_COUNT_TTL_MS) {
+    countedUsers = {
+      value: await UserRepository.getUserCount(),
+      at: Date.now(),
+    };
+  }
+  return countedUsers.value;
+}
+
 const statusInfo = async (): Promise<StatusResponse> => {
   const shouldExposeUsers = appConfig.api.exposeUserCount;
-  const userCount = shouldExposeUsers
-    ? await UserRepository.getUserCount()
-    : null;
+  const userCount = shouldExposeUsers ? await recentUserCount() : null;
 
   let forcedPublicProxyUrl: string | null = appConfig.proxy.force.publicUrl;
 
@@ -43,6 +56,20 @@ const statusInfo = async (): Promise<StatusResponse> => {
           : undefined,
       alternateDesign: appConfig.branding.alternateDesign,
       protected: appConfig.api.authRequired,
+      jellyfin: {
+        enabled: appConfig.jellyfin.enabled === true,
+        maxVersions: appConfig.jellyfin.maxVersions,
+        resolveOnOpen: appConfig.jellyfin.resolveOnOpen,
+        maxCatalogItems: appConfig.jellyfin.maxCatalogItems,
+        maxLibraries: appConfig.jellyfin.maxLibraries,
+        maxPersonas: appConfig.jellyfin.maxPersonas,
+        pinSignIn: appConfig.jellyfin.pinSignIn,
+        maxTrackers: appConfig.watchState.maxSinks,
+        segments: {
+          enabled: segmentsEnabled(),
+          providers: segmentProviders(),
+        },
+      },
       community: {
         formatters: appConfig.community.formatters,
         templates: appConfig.community.templates,
@@ -65,6 +92,9 @@ const statusInfo = async (): Promise<StatusResponse> => {
           apiKey: !!appConfig.metadata.tvdb.apiKey,
         },
       },
+      remuxdb: {
+        enabled: appConfig.remuxdb.enabled,
+      },
       regexAccess: {
         level: appConfig.userLimits.regex.access,
         ...allowedRegexes,
@@ -77,8 +107,8 @@ const statusInfo = async (): Promise<StatusResponse> => {
         access: appConfig.userLimits.variants.access,
         max: appConfig.userLimits.variants.max,
         maxScriptLength: appConfig.userLimits.variants.maxScriptLength,
-        maxInstructions: appConfig.userLimits.variants.maxInstructions,
-        maxActive: appConfig.userLimits.variants.maxActive,
+        maxTotalInstructions:
+          appConfig.userLimits.variants.maxTotalInstructions,
         maxValueDepth: appConfig.userLimits.variants.maxValueDepth,
         maxPathSegments: appConfig.userLimits.variants.maxPathSegments,
         maxPathMatches: appConfig.userLimits.variants.maxPathMatches,
@@ -89,7 +119,6 @@ const statusInfo = async (): Promise<StatusResponse> => {
         minTtl: appConfig.userLimits.healthChecks.minTtl,
         maxTimeout: appConfig.userLimits.healthChecks.maxTimeout,
         maxBytes: appConfig.userLimits.healthChecks.maxBytes,
-        allowPrivateUrls: appConfig.userLimits.healthChecks.allowPrivateUrls,
       },
       loggingSensitiveInfo: appConfig.logging.logSensitiveInfo,
       searchApiDisabled: !appConfig.api.enableSearchApi,
@@ -165,6 +194,7 @@ const statusInfo = async (): Promise<StatusResponse> => {
         maxFailoverAttempts: appConfig.userLimits.maxFailoverAttempts,
         maxParallelAttempts: appConfig.userLimits.maxParallelAttempts,
         maxBackgroundPings: appConfig.userLimits.maxBackgroundPings,
+        maxLinkedAccounts: appConfig.linkedAccounts.maxPerUser,
       },
     },
   };

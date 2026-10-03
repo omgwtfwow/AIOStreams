@@ -1,5 +1,5 @@
 import React from 'react';
-import { cn } from '@/components/ui/core/styling';
+import { cn } from '@aiostreams/ui/core/styling';
 
 export interface VariantOption {
   id: string;
@@ -18,7 +18,7 @@ interface VariantPillsProps {
   className?: string;
 }
 
-const pill = (active: boolean) =>
+export const pill = (active: boolean) =>
   cn(
     'px-2.5 py-1 text-xs font-medium rounded-full border transition-colors',
     active
@@ -64,9 +64,7 @@ export function VariantPills({
           }
         >
           {variant.name || variant.id}
-          {variant.when ? (
-            <span className="ml-1 opacity-60">auto</span>
-          ) : null}
+          {variant.when ? <span className="ml-1 opacity-60">auto</span> : null}
         </button>
       ))}
     </div>

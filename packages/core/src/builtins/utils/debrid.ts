@@ -14,16 +14,19 @@ import {
   TorrentWithSelectedFile,
   NZBWithSelectedFile,
   NZB,
+  UnprocessedTorrent,
   isSeasonWrong,
   isEpisodeWrong,
   isTitleWrong,
   isCountryWrong,
   DebridDownload,
   isNotVideoFile,
+  hasTooManySelectableFiles,
   isTorrentDebridService,
   isUsenetDebridService,
   TitleMetadata,
   hashNzbUrl,
+  parseFileNames,
 } from '../../debrid/index.js';
 import { ParsedResult } from '@viren070/parse-torrent-title';
 import { parseTorrentTitleCached } from '../../parser/title.js';
@@ -31,6 +34,7 @@ import {
   preprocessTitle,
   normaliseTitle,
   extractInfoHashFromMagnet,
+  base32ToHex,
 } from '../../parser/utils.js';
 export { extractInfoHashFromMagnet };
 
@@ -41,15 +45,84 @@ type Metadata = TitleMetadata;
 export function validateInfoHash(
   infoHash: string | undefined
 ): string | undefined {
-  return infoHash && /^[a-f0-9]{40}$/i.test(infoHash)
-    ? infoHash.toLowerCase()
-    : undefined;
+  if (!infoHash) return undefined;
+  if (/^[a-f0-9]{40}$/i.test(infoHash)) return infoHash.toLowerCase();
+  if (/^[a-z2-7]{32}$/i.test(infoHash)) return base32ToHex(infoHash);
+  return undefined;
 }
 
 export function extractTrackersFromMagnet(magnet: string): string[] {
   return new URL(magnet.replace('&amp;', '&')).searchParams
     .getAll('tr')
     .filter((tracker) => tracker.trim() !== '');
+}
+
+function getValidationFailureReason(
+  rawTitle: string | undefined,
+  parsed: ParsedResult,
+  metadata: Metadata,
+  confirmed: boolean | undefined,
+  normTitles: Set<string> | null
+): 'country' | 'title' | 'season' | 'episode' | null {
+  if (confirmed !== true) {
+    if (isCountryWrong(parsed, metadata)) return 'country';
+    if (normTitles !== null) {
+      const preprocessedTitle = preprocessTitle(
+        parsed.title ?? '',
+        [rawTitle],
+        metadata.titles
+      );
+      if (
+        !normTitles.has(normaliseTitle(preprocessedTitle)) &&
+        isTitleWrong({ title: preprocessedTitle }, metadata)
+      ) {
+        return 'title';
+      }
+    }
+  }
+  if (isSeasonWrong(parsed, metadata)) return 'season';
+  if (isEpisodeWrong(parsed, metadata)) return 'episode';
+  return null;
+}
+
+// Runs before .torrent download to skip resolving results that
+// processTorrents would discard anyway.
+export function filterUnprocessedTorrentsPreDownload<
+  T extends UnprocessedTorrent,
+>(torrents: T[], metadata?: Metadata): T[] {
+  if (!metadata || torrents.length === 0) return torrents;
+
+  const parsedTitlesMap = new Map<string, ParsedResult>();
+  for (const t of torrents) {
+    const key = t.title ?? '';
+    if (!parsedTitlesMap.has(key)) {
+      parsedTitlesMap.set(key, parseTorrentTitleCached(key));
+    }
+  }
+  const normTitles: Set<string> | null = metadata.titles?.length
+    ? new Set(metadata.titles.map(normaliseTitle))
+    : null;
+
+  const filtered = torrents.filter((torrent) => {
+    const parsed = parsedTitlesMap.get(torrent.title ?? '');
+    if (!parsed) return true;
+    return !getValidationFailureReason(
+      torrent.title,
+      parsed,
+      metadata,
+      torrent.confirmed,
+      normTitles
+    );
+  });
+
+  if (filtered.length < torrents.length) {
+    logger.debug(`Filtered torrents before .torrent download`, {
+      before: torrents.length,
+      after: filtered.length,
+    });
+  }
+
+  return filtered;
 }
 
 export async function processTorrents(
@@ -283,36 +356,34 @@ async function processTorrentsForDebridService(
     );
 
     if (metadata && parsedTorrent) {
-      const preprocessedTitle = preprocessTitle(
-        parsedTorrent.title ?? '',
-        [torrent.title ?? magnetCheckResult?.name],
-        metadata.titles
+      const reason = getValidationFailureReason(
+        torrent.title ?? magnetCheckResult?.name,
+        parsedTorrent,
+        metadata,
+        torrent.confirmed,
+        normTitles
       );
-      if (torrent.confirmed !== true) {
-        if (isCountryWrong(parsedTorrent, metadata)) {
-          filteredTitle++;
-          continue;
-        }
-        if (normTitles !== null) {
-          const normParsed = normaliseTitle(preprocessedTitle);
-          const exactMatch = normTitles.has(normParsed);
-          if (
-            !exactMatch &&
-            isTitleWrong({ title: preprocessedTitle }, metadata)
-          ) {
-            filteredTitle++;
-            continue;
-          }
-        }
+      if (reason === 'country' || reason === 'title') {
+        filteredTitle++;
+        continue;
       }
-      if (isSeasonWrong(parsedTorrent, metadata)) {
+      if (reason === 'season') {
         filteredSeason++;
         continue;
       }
-      if (isEpisodeWrong(parsedTorrent, metadata)) {
+      if (reason === 'episode') {
         filteredEpisode++;
         continue;
       }
+    }
+
+    if (hasTooManySelectableFiles(magnetCheckResult?.files)) {
+      logger.debug(`Skipping torrent with too many files to select from`, {
+        service: service.id,
+        torrent: torrent.title,
+        files: magnetCheckResult?.files?.length,
+      });
+      continue;
     }
 
     validTorrents.push({
@@ -333,14 +404,7 @@ async function processTorrentsForDebridService(
     }
   }
 
-  // Parse all file strings in one call
-  const allParsedFiles: ParsedResult[] = allFileStrings.map((string) =>
-    parseTorrentTitleCached(string)
-  );
-  const parsedFiles = new Map<string, ParsedResult>();
-  for (const [index, result] of allParsedFiles.entries()) {
-    parsedFiles.set(allFileStrings[index], result);
-  }
+  const parsedFiles = await parseFileNames(allFileStrings);
 
   for (const [title, parsed] of parsedTitlesMap.entries()) {
     parsedFiles.set(title, parsed);
@@ -384,9 +448,9 @@ async function processTorrentsForDebridService(
         parsedMediaInfo,
         service: {
           id: service.id,
+          // The account lists queued and stalled items too, so it is not proof.
           cached:
-            magnetCheckResult?.status === 'cached' ||
-            (magnetCheckResult?.library || torrent.library) === true,
+            magnetCheckResult?.status === 'cached' || torrent.library === true,
           library: (magnetCheckResult?.library || torrent.library) === true,
         },
       });
@@ -449,6 +513,13 @@ export async function processTorrentsForP2P(
         continue;
       }
     }
+    if (hasTooManySelectableFiles(torrent.files)) {
+      logger.debug(`Skipping torrent with too many files to select from`, {
+        torrent: torrent.title,
+        files: torrent.files?.length,
+      });
+      continue;
+    }
     validTorrents.push({ torrent, parsedTitle: parsedTorrent! });
   }
 
@@ -463,13 +534,7 @@ export async function processTorrentsForP2P(
     }
   }
 
-  const allParsedFiles: ParsedResult[] = allFileStrings.map((string) =>
-    parseTorrentTitleCached(string)
-  );
-  const parsedFiles = new Map<string, ParsedResult>();
-  for (const [index, result] of allParsedFiles.entries()) {
-    parsedFiles.set(allFileStrings[index], result);
-  }
+  const parsedFiles = await parseFileNames(allFileStrings);
 
   for (const { torrent } of validTorrents) {
     let file: DebridFile | undefined;
@@ -667,32 +732,25 @@ async function processNZBsForDebridService(
     );
 
     if (metadata && parsedNzb) {
-      const preprocessedTitle = preprocessTitle(
-        parsedNzb.title ?? '',
-        [nzb.title ?? nzbCheckResult?.name],
-        metadata.titles
+      const reason = getValidationFailureReason(
+        nzb.title ?? nzbCheckResult?.name,
+        parsedNzb,
+        metadata,
+        nzb.confirmed,
+        normTitles
       );
-      if (nzb.confirmed !== true) {
-        if (isCountryWrong(parsedNzb, metadata)) {
-          continue;
-        }
-        if (normTitles !== null) {
-          const normParsed = normaliseTitle(preprocessedTitle);
-          const exactMatch = normTitles.has(normParsed);
-          if (
-            !exactMatch &&
-            isTitleWrong({ title: preprocessedTitle }, metadata)
-          ) {
-            continue;
-          }
-        }
-      }
-      if (isSeasonWrong(parsedNzb, metadata)) {
+      if (reason) {
         continue;
       }
-      if (isEpisodeWrong(parsedNzb, metadata)) {
-        continue;
-      }
+    }
+
+    if (hasTooManySelectableFiles(nzbCheckResult?.files)) {
+      logger.debug(`Skipping NZB with too many files to select from`, {
+        service: service.id,
+        nzb: nzb.title,
+        files: nzbCheckResult?.files?.length,
+      });
+      continue;
     }
 
     validNZBs.push({ nzb, nzbCheckResult, parsedTitle: parsedNzb! });
@@ -709,13 +767,7 @@ async function processNZBsForDebridService(
     }
   }
 
-  const allParsedFiles: ParsedResult[] = allFileStrings.map((string) =>
-    parseTorrentTitleCached(string)
-  );
-  const parsedFiles = new Map<string, ParsedResult>();
-  for (const [index, result] of allParsedFiles.entries()) {
-    parsedFiles.set(allFileStrings[index], result);
-  }
+  const parsedFiles = await parseFileNames(allFileStrings);
 
   for (const [title, parsed] of parsedTitlesMap.entries()) {
     parsedFiles.set(title, parsed);
@@ -746,9 +798,7 @@ async function processNZBsForDebridService(
         file,
         service: {
           id: service.id,
-          cached:
-            nzbCheckResult?.status === 'cached' ||
-            (nzbCheckResult?.library || nzb.library) === true,
+          cached: nzbCheckResult?.status === 'cached' || nzb.library === true,
           library: (nzbCheckResult?.library || nzb.library) === true,
         },
       });

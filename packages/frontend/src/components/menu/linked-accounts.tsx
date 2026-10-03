@@ -1,18 +1,18 @@
 import React from 'react';
 import { toast } from 'sonner';
 import { LuLink2, LuRefreshCw, LuSettings } from 'react-icons/lu';
-import { Button, IconButton } from '@/components/ui/button';
-import { Modal } from '@/components/ui/modal';
-import { Select } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { TextInput } from '@/components/ui/text-input';
-import { Alert } from '@/components/ui/alert';
-import { LoadingSpinner } from '@/components/ui/loading-spinner';
+import { Button, IconButton } from '@aiostreams/ui/button';
+import { Modal } from '@aiostreams/ui/modal';
+import { Select } from '@aiostreams/ui/select';
+import { Switch } from '@aiostreams/ui/switch';
+import { TextInput } from '@aiostreams/ui/text-input';
+import { Alert } from '@aiostreams/ui/alert';
+import { LoadingSpinner } from '@aiostreams/ui/loading-spinner';
 import {
   ConfirmationDialog,
   useConfirmationDialog,
-} from '@/components/shared/confirmation-dialog';
-import { useDisclosure } from '@/hooks/disclosure';
+} from '@aiostreams/ui/shared/confirmation-dialog';
+import { useDisclosure } from '@aiostreams/ui/hooks/disclosure';
 import { useUserData } from '@/context/userData';
 import {
   PushTargetsField,
@@ -139,6 +139,9 @@ export function LinkedAccountsSection({
   };
 
   const hasAccounts = (accounts?.length ?? 0) > 0;
+  const maxAccounts = status?.settings?.limits?.maxLinkedAccounts;
+  const atLimit =
+    maxAccounts !== undefined && (accounts?.length ?? 0) >= maxAccounts;
 
   return (
     <div id="linked-accounts">
@@ -172,9 +175,13 @@ export function LinkedAccountsSection({
           <button
             type="button"
             onClick={linkModal.open}
-            className="group flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-700 p-3 text-sm text-gray-400 transition-colors hover:border-brand-400 hover:text-brand-400"
+            disabled={atLimit}
+            className="group flex items-center justify-center gap-2 rounded-xl border-2 border-dashed border-gray-700 p-3 text-sm text-gray-400 transition-colors enabled:hover:border-brand-400 enabled:hover:text-brand-400 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            <LuLink2 className="h-4 w-4" /> Link another account
+            <LuLink2 className="h-4 w-4" />
+            {atLimit
+              ? `Limit of ${maxAccounts} linked accounts reached`
+              : 'Link another account'}
           </button>
         </div>
       ) : (

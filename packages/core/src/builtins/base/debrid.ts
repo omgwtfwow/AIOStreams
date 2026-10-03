@@ -15,6 +15,7 @@ import {
   enrichParsedIdWithAnimeEntry,
   formatZodError,
   fromUrlSafeBase64,
+  getEnrichedImdbId,
   getSimpleTextHash,
   getTimeTakenSincePoint,
   SERVICE_DETAILS,
@@ -37,7 +38,11 @@ import {
   fileInfoStore,
   FileInfo,
 } from '../../debrid/index.js';
-import { processTorrents, processNZBs } from '../utils/debrid.js';
+import {
+  processTorrents,
+  processNZBs,
+  filterUnprocessedTorrentsPreDownload,
+} from '../utils/debrid.js';
 import {
   calculateAbsoluteEpisode,
   isNonAnimeAbsoluteEligible,
@@ -256,8 +261,9 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       ];
     }
 
-    const torrentsToDownload = torrentResults.filter(
-      (t) => !t.hash && t.downloadUrl
+    const torrentsToDownload = filterUnprocessedTorrentsPreDownload(
+      torrentResults.filter((t) => !t.hash && t.downloadUrl),
+      searchMetadata
     );
     torrentResults = torrentResults.filter((t) => t.hash);
     if (torrentsToDownload.length > 0) {
@@ -292,26 +298,8 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       torrentResults = [...torrentResults, ...enrichedResults];
     }
 
-    const torrentServices = this.userData.services.filter(
-      (s) =>
-        ![
-          'nzbdav',
-          'altmount',
-          'stremio_nntp',
-          'stremthru_newz',
-          'aiostreams',
-        ].includes(s.id)
-    );
-    const nzbServices = this.userData.services.filter((s) =>
-      [
-        'nzbdav',
-        'altmount',
-        'torbox',
-        'stremio_nntp',
-        'stremthru_newz',
-        'aiostreams',
-      ].includes(s.id)
-    );
+    const torrentServices = this.getTorrentServices();
+    const nzbServices = this.getNzbServices();
 
     if (torrentServices.length === 0 && torrentResults.length > 0) {
       errorStreams.push(
@@ -415,6 +403,8 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       episode: searchMetadata.episode,
       absoluteEpisode: searchMetadata.absoluteEpisode,
       relativeAbsoluteEpisode: searchMetadata.relativeAbsoluteEpisode,
+      tvdbSeason: searchMetadata.tvdbSeason,
+      tvdbEpisode: searchMetadata.tvdbEpisode,
       airDates: searchMetadata.airDates,
       isDateBased: searchMetadata.isDateBased,
     };
@@ -462,6 +452,32 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     });
 
     return [...resultStreams, ...errorStreams];
+  }
+
+  protected getTorrentServices(): T['services'] {
+    return this.userData.services.filter(
+      (s) =>
+        ![
+          'nzbdav',
+          'altmount',
+          'stremio_nntp',
+          'stremthru_newz',
+          'aiostreams',
+        ].includes(s.id)
+    );
+  }
+
+  protected getNzbServices(): T['services'] {
+    return this.userData.services.filter((s) =>
+      [
+        'nzbdav',
+        'altmount',
+        'torbox',
+        'stremio_nntp',
+        'stremthru_newz',
+        'aiostreams',
+      ].includes(s.id)
+    );
   }
 
   protected buildQueries(
@@ -793,7 +809,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     const imdbId =
       parsedId.type === 'imdbId'
         ? parsedId.value.toString()
-        : animeEntry?.mappings?.imdbId?.toString();
+        : getEnrichedImdbId(parsedId, animeEntry);
     // const tmdbId =
     //   parsedId.type === 'themoviedbId'
     //     ? parsedId.value.toString()
@@ -827,6 +843,8 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
       airDates: metadata.episodeAirDates,
       episodeAirDate: metadata.episodeAirDate,
       resolvedSeasonFirstEpisode: metadata.resolvedSeasonFirstEpisode,
+      tvdbSeason: metadata.tvdbSeason,
+      tvdbEpisode: metadata.tvdbEpisode,
       sceneTitles: metadata.sceneTitles,
       country: metadata.country,
       titleConflicts: metadata.titleConflicts,
@@ -907,7 +925,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
     const name = `${torrentOrNzb.service?.library ? '🗃️ ' : ''}${isPrivate ? '🔑 ' : ''}[${shortCode} ${cacheIndicator}] ${this.name} ${isFreeleech ? 'FREELEECH' : ''} `;
     const description = `${torrentOrNzb.title ? torrentOrNzb.title : ''}\n${torrentOrNzb.file.name ? torrentOrNzb.file.name : ''}\n${
       torrentOrNzb.indexer ? `🔍 ${torrentOrNzb.indexer}` : ''
-    } ${'seeders' in torrentOrNzb && torrentOrNzb.seeders ? `👤 ${torrentOrNzb.seeders}` : ''} ${
+    } ${'seeders' in torrentOrNzb && typeof torrentOrNzb.seeders === 'number' ? `👤 ${torrentOrNzb.seeders}` : ''} ${
       torrentOrNzb.age ? `🕒 ${formatHours(torrentOrNzb.age)}` : ''
     } ${torrentOrNzb.group ? `\n🏷️ ${torrentOrNzb.group}` : ''}`;
 
@@ -942,6 +960,7 @@ export abstract class BaseDebridAddon<T extends BaseDebridConfig> {
         videoSize: torrentOrNzb.file.size,
         filename: torrentOrNzb.file.name,
         folderSize: torrentOrNzb.size,
+        videoHash: torrentOrNzb.file.videoHash,
       },
       parsedMediaInfo: torrentOrNzb.parsedMediaInfo,
     };

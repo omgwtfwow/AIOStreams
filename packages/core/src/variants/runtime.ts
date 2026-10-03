@@ -25,6 +25,7 @@ import {
   applyCelProgram,
   runCelProgram,
   compileCelScript,
+  createCelBudget,
   CelError,
   DEFAULT_CEL_LIMITS,
   parseCelScript,
@@ -52,7 +53,7 @@ export function getVariantLimits(): CelLimits {
   const limits = appConfig.userLimits.variants;
   return {
     maxScriptLength: limits.maxScriptLength,
-    maxInstructions: limits.maxInstructions,
+    maxTotalInstructions: limits.maxTotalInstructions,
     maxValueDepth: limits.maxValueDepth,
     maxPathSegments: limits.maxPathSegments,
     maxPathMatches: limits.maxPathMatches,
@@ -116,12 +117,6 @@ export function parseVariantSelector(raw: unknown): string[] {
   const seen = new Set<string>();
   const unique = ids.filter((id) => !seen.has(id) && seen.add(id));
 
-  const max = appConfig.userLimits.variants.maxActive;
-  if (unique.length > max) {
-    throw new VariantSelectionError(
-      `Too many variants selected (${unique.length}); this instance allows at most ${max}.`
-    );
-  }
   for (const id of unique) {
     if (!VARIANT_ID_PATTERN.test(id)) {
       throw new VariantSelectionError(`Invalid variant id "${id}".`);
@@ -192,6 +187,7 @@ export function applyVariants(
   const notes: CelDiagnostic[] = [];
   const applied: string[] = [];
   const limits = getVariantLimits();
+  const budget = createCelBudget(limits);
 
   for (const variant of selected) {
     let program: CelProgram;
@@ -206,15 +202,25 @@ export function applyVariants(
     const applyResult = runCelProgram(result, program, {
       resolveVariant,
       activeVariants: [variant.id.toLowerCase()],
-      maxDepth: appConfig.userLimits.variants.maxDepth,
+      budget,
       limits,
     });
     notes.push(...applyResult.notes);
     applied.push(variant.id.toLowerCase());
   }
 
-  result.activeVariants = applied;
-  return { userData: result, applied, notes };
+  // Scripts cannot name this path, but `set jellyfin = ...` could still replace it.
+  if (userData.jellyfin?.personas) {
+    result.jellyfin = {
+      ...result.jellyfin,
+      personas: userData.jellyfin.personas,
+    };
+  } else if (result.jellyfin?.personas) {
+    result.jellyfin = { ...result.jellyfin, personas: undefined };
+  }
+  const pinned = withOwnAccountLock(result, userData);
+  pinned.activeVariants = applied;
+  return { userData: pinned, applied, notes };
 }
 
 /**
@@ -276,7 +282,6 @@ export function validateVariants(
     const program = programs.get(variant.id.toLowerCase())!;
     const { userData: patched } = applyCelProgram(userData, program, {
       resolveVariant: (id) => programs.get(id.toLowerCase()),
-      maxDepth: limits.maxDepth,
       limits: celLimits,
     });
     patched.variants = undefined;
@@ -482,18 +487,7 @@ export async function activateVariants(
   }
 
   const { matched } = await evaluateVariantConditions(userData, context);
-  const candidates = matched.filter((id) => !selected.includes(id));
-  const budget = Math.max(
-    appConfig.userLimits.variants.maxActive - selected.length,
-    0
-  );
-  const auto = candidates.slice(0, budget);
-  if (auto.length < candidates.length) {
-    logger.warn(
-      { uuid: userData.uuid, dropped: candidates.slice(budget) },
-      'not applying every matched variant: this instance limits how many combine'
-    );
-  }
+  const auto = matched.filter((id) => !selected.includes(id));
 
   const result = applyVariants(userData, [...auto, ...selected]);
   if (!result.applied.length) return { ...result, auto: [] };
@@ -515,7 +509,8 @@ function expressionFields(
 ): { label: string; value: string }[] {
   const fields: { label: string; value: string }[] = [];
   const push = (label: string, value?: string | null) => {
-    if (typeof value === 'string' && value.trim()) fields.push({ label, value });
+    if (typeof value === 'string' && value.trim())
+      fields.push({ label, value });
   };
 
   for (const variant of userData.variants ?? []) {
@@ -685,3 +680,16 @@ export function knownHealthCheckIds(userData: UserData): string[] {
 export type { HealthResult, VariantRequestContext };
 
 export { DEFAULT_CEL_LIMITS };
+
+/** The account's PIN is always the config's own, whatever else was merged or applied. */
+export function withOwnAccountLock(result: UserData, own: UserData): UserData {
+  const lock = own.jellyfin?.primary?.lock;
+  if (result.jellyfin?.primary?.lock === lock) return result;
+  return {
+    ...result,
+    jellyfin: {
+      ...result.jellyfin,
+      primary: { ...result.jellyfin?.primary, lock },
+    },
+  };
+}

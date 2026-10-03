@@ -1,5 +1,9 @@
 ﻿import app from './app.js';
 import {
+  attachJellyfinWebSocket,
+  registerJellyfinTasks,
+} from './routes/jellyfin/index.js';
+import {
   startMetricsHistory,
   settleMetricsHistory,
   stopMetricsHistory,
@@ -13,6 +17,7 @@ import {
   createLogger,
   initDb,
   initialiseConfig,
+  installPrivateAddressGuard,
   closeDb,
   UserRepository,
   logStartupInfo,
@@ -38,6 +43,8 @@ import {
   ConfigSessionRepository,
   TaskManager,
   instanceId,
+  flushWatchState,
+  flushPendingIds,
   drainUsenetMetrics,
   pruneUsenetMetrics,
   runLibraryRecheck,
@@ -58,6 +65,7 @@ async function initialiseDatabase() {
   try {
     await initDb(appConfig.bootstrap.databaseUri);
     await initialiseConfig();
+    installPrivateAddressGuard();
   } catch (error) {
     if (error instanceof ConfigStartupError) throw error;
     logger.error('Failed to initialise database:', error);
@@ -368,6 +376,7 @@ async function start() {
     registerUsenetTasks();
     registerStreamTasks();
     registerReleaseBlocklistTasks();
+    registerJellyfinTasks();
     // Otherwise sessions from the last run stay active forever.
     await recoverStreamSessions().catch((error) =>
       logger.warn('Failed to recover orphaned stream sessions:', error)
@@ -387,6 +396,7 @@ async function start() {
       );
       settleMetricsHistory();
     });
+    attachJellyfinWebSocket(server);
   } catch (error) {
     if (error instanceof ConfigStartupError) throw error;
     logger.error('Failed to start server:', error);
@@ -404,6 +414,8 @@ async function shutdown() {
   await flushStreamSessions().catch(() => undefined);
   await stopAnalytics().catch(() => undefined);
   await flushAllDiskCaches().catch(() => undefined);
+  await flushWatchState().catch(() => undefined);
+  await flushPendingIds().catch(() => undefined);
   await Cache.close();
   RegexAccess.cleanup();
   SelAccess.cleanup();

@@ -647,6 +647,33 @@ export const builtinsSchema = {
       requiresRestart: false,
       secret: false,
     },
+    maxResults: {
+      schema: positiveInt,
+      default: 1000,
+      label: 'Newznab/Torznab max results per request',
+      env: 'BUILTIN_NAB_MAX_RESULTS',
+      description:
+        'Most results taken from a single Newznab/Torznab response. The ' +
+        'requested `limit` is capped to this, and parsing stops here even ' +
+        'when an indexer ignores `limit` and returns everything it has. ' +
+        'Raising it costs CPU and cache space on indexers that return ' +
+        'thousands of results per query.',
+      requiresRestart: false,
+      secret: false,
+    },
+    maxResponseBytes: {
+      schema: byteSize,
+      default: 10 * MB,
+      label: 'Newznab/Torznab max response size',
+      env: 'BUILTIN_NAB_MAX_RESPONSE_BYTES',
+      description:
+        'Largest Newznab/Torznab response body downloaded. Past this the ' +
+        'download is cut off and only the whole results received so far are ' +
+        'used, rather than failing the search. Accepts plain bytes or ' +
+        '`10MB`-style strings.',
+      requiresRestart: false,
+      secret: false,
+    },
     zyclopsHealthProxyEndpoint: {
       schema: urlString,
       default: 'https://zyclops.elfhosted.com',
@@ -1147,6 +1174,62 @@ export const builtinsSchema = {
       label: 'The Pirate Bay search cache TTL (s)',
       env: 'BUILTIN_THE_PIRATE_BAY_SEARCH_CACHE_TTL',
       description: 'Cache TTL for The Pirate Bay search results.',
+      requiresRestart: false,
+      secret: false,
+    },
+  },
+  tsukihime: {
+    url: {
+      schema: urlString,
+      default: 'https://api.tsukihime.org',
+      label: 'TsukiHime URL',
+      env: 'BUILTIN_TSUKIHIME_URL',
+      description: 'Base URL for the TsukiHime built-in addon.',
+      requiresRestart: false,
+      secret: false,
+    },
+    storageUrl: {
+      schema: urlString,
+      default: 'https://storage.tsukihime.org',
+      label: 'TsukiHime storage URL',
+      env: 'BUILTIN_TSUKIHIME_STORAGE_URL',
+      description: 'Base URL that TsukiHime NZB files are served from.',
+      requiresRestart: false,
+      secret: false,
+    },
+    defaultTimeout: {
+      schema: optionalPositiveInt,
+      default: null,
+      label: 'TsukiHime default timeout (ms)',
+      env: 'BUILTIN_DEFAULT_TSUKIHIME_TIMEOUT',
+      description: 'Default timeout for TsukiHime requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchTimeout: {
+      schema: positiveInt,
+      default: 30000,
+      label: 'TsukiHime search timeout (ms)',
+      env: 'BUILTIN_TSUKIHIME_SEARCH_TIMEOUT',
+      description: 'Timeout for TsukiHime search requests.',
+      requiresRestart: false,
+      secret: false,
+    },
+    searchCacheTtl: {
+      schema: seconds,
+      default: Week,
+      label: 'TsukiHime search cache TTL (s)',
+      env: 'BUILTIN_TSUKIHIME_SEARCH_CACHE_TTL',
+      description: 'Cache TTL for TsukiHime search results.',
+      requiresRestart: false,
+      secret: false,
+    },
+    pageLimit: {
+      schema: positiveInt,
+      default: 5,
+      label: 'TsukiHime page limit',
+      env: 'BUILTIN_TSUKIHIME_PAGE_LIMIT',
+      description: 'Maximum pages fetched when paginating TsukiHime results.',
       requiresRestart: false,
       secret: false,
     },
