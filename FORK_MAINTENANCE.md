@@ -1,7 +1,7 @@
 # Fork Maintenance
 
 This fork carries private deployment changes for the homeserver media stack.
-Keep production deployments pinned to explicit fork image tags; do not deploy a
+Keep production deployments pinned to immutable fork image digests; do not deploy a
 mutable `latest` tag from this fork.
 
 Migration ID 7 is permanently reserved for the fork's `proxy_aliases`
@@ -40,11 +40,33 @@ Use the `Fork Image` GitHub Actions workflow in this repository.
 5. Deploy the resulting pinned image:
 
 ```text
-ghcr.io/omgwtfwow/aiostreams:<tag>
+ghcr.io/omgwtfwow/aiostreams@sha256:<published-index-digest>
 ```
 
-The workflow also runs as a pull request check with `push=false`, so Docker
-context and build failures should be caught before release.
+PR checks build and run the image separately on native `ubuntu-24.04` (amd64)
+and `ubuntu-24.04-arm` runners. Each architecture uses its own build cache and
+verifies its image architecture, canonical OCI source, full revision label,
+and embedded application metadata. Obsolete PR runs are cancelled; explicit
+release runs are never cancelled by that concurrency policy.
+
+PR jobs have only repository read permission and do not publish images.
+Dispatch-only jobs publish each verified architecture by digest, validate that
+all digest artifacts belong to the same source revision, and combine them into
+an index with source/revision annotations. Only the final release-record job
+receives repository write permission. Supported `platforms` values are
+`linux/amd64`, `linux/arm64`, or both. An existing Git release tag must refer to
+the selected source revision.
+
+A workflow-only maintenance PR does not need an image publication or media-stack
+rollout. Keep the deployed digest and its matching vendored source unchanged
+until the next application release. Upstream Pages and Header Presets jobs are
+owner-gated to `Viren070/AIOStreams`, like the inherited desktop workflows.
+
+Validate workflow changes with `actionlint` and
+`node --test .github/scripts/fork-image.test.mjs`. The PR's native image checks
+exercise the shared build steps used by releases. Release manifest validation
+can also be rehearsed with `docker buildx imagetools create --dry-run`, without
+publishing a new tag.
 
 ## Local Verification
 
@@ -112,7 +134,7 @@ refuses to use a newer database. Preserve the upgraded database separately
 before restoring so rollback does not discard the only copy of new state.
 
 ```text
-AIOSTREAMS_IMAGE=ghcr.io/omgwtfwow/aiostreams:<previous-known-good-tag>
+AIOSTREAMS_IMAGE=ghcr.io/omgwtfwow/aiostreams@sha256:<previous-known-good-digest>
 ```
 
-Do not roll back by switching to fork `latest`; use a known release tag.
+Do not roll back by switching to fork `latest`; use the saved immutable digest.

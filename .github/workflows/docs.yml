@@ -11,8 +11,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: 'pages'
@@ -20,6 +18,7 @@ concurrency:
 
 jobs:
   build:
+    if: github.repository == 'Viren070/AIOStreams'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -46,6 +45,11 @@ jobs:
           path: packages/docs/out
 
   deploy:
+    if: github.repository == 'Viren070/AIOStreams'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
