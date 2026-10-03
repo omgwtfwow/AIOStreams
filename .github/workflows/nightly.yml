@@ -6,8 +6,14 @@ on:
     paths:
       - 'packages/**'
       - '!packages/docs/**'
-      - 'package-lock.json'
+      - '!packages/desktop/**'
+      - '!packages/**/*.md'
       - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'pnpm-workspace.yaml'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'resources/**'
       - 'tsconfig.json'
       - 'tsconfig.base.json'
       - 'Dockerfile'
@@ -15,7 +21,7 @@ on:
 jobs:
   release:
     name: release
-    if: ${{ github.repository == 'Viren070/AIOStreams' && github.ref == 'refs/heads/main' }}
+    if: "${{ github.repository == 'Viren070/AIOStreams' && github.ref == 'refs/heads/main' && !startsWith(github.event.head_commit.message, 'chore: release ') }}"
     runs-on: ubuntu-latest
     permissions:
       actions: write
@@ -23,7 +29,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -36,7 +42,7 @@ jobs:
       - name: Get last nightly tag
         id: get_last_nightly_tag
         run: |
-          LAST_NIGHTLY_TAG=$(git tag -l "*-nightly" --sort=-committerdate | head -n 1 || echo "")
+          LAST_NIGHTLY_TAG=$(git tag -l "[0-9]*-nightly" --sort=-committerdate | head -n 1 || echo "")
           echo "last_nightly_tag=$LAST_NIGHTLY_TAG" >> $GITHUB_OUTPUT
           echo "Found last nightly tag: ${LAST_NIGHTLY_TAG:-none}"
 

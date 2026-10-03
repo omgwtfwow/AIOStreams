@@ -10,6 +10,23 @@ starting with `0007_usenet.ts` are intentionally assigned IDs one greater
 than their filenames in this fork. Keep that offset for future upstream syncs
 and test upgrades from an existing proxy-alias database before release.
 
+## Current Upstream Baseline
+
+The fork includes upstream `v2.35.8` at
+`70ffb17a7bb99dd73dbab257af040b04f56eaa42`. Its new migrations
+`0028_watch_state` through `0041_index_trim` use fork IDs 29 through 42.
+The migration rehearsal starts from a 2.34 database with an existing alias,
+checks that the alias survives all new migrations, and repeats startup to
+check idempotency. Rolling back this release requires restoring the database
+backup as well as the previous image because older builds reject schema 42.
+
+Stable `/s` and on-demand `/o` proxy aliases remain the only playback proxy
+routes; legacy bearer-path proxy and auth routes remain retired. The upstream
+server now includes Jellyfin-compatible APIs and a web UI; these do not replace
+or reconfigure the separate Emby service in the media stack. Desktop release,
+update-PR, and OS-matrix workflows remain upstream-owned and are disabled in
+this server-image fork.
+
 ## Publish A Private Image Release
 
 Use the `Fork Image` GitHub Actions workflow in this repository.
@@ -86,8 +103,13 @@ git log --left-right --cherry-pick --oneline upstream/main...main
 
 ## Deployment Rollback
 
-Rollback should be an image-pin change in the homeserver environment, followed
-by recreating only AIOStreams-dependent services.
+Before each upgrade, save a consistent database backup and the current
+immutable image reference. When the upgrade advances the database schema,
+stop only AIOStreams and its shared-state migrator, restore that pre-upgrade
+database backup, then recreate those services with the previous image. An
+image-only rollback across schema versions is unsupported: the older build
+refuses to use a newer database. Preserve the upgraded database separately
+before restoring so rollback does not discard the only copy of new state.
 
 ```text
 AIOSTREAMS_IMAGE=ghcr.io/omgwtfwow/aiostreams:<previous-known-good-tag>

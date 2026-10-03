@@ -1,0 +1,361 @@
+//! Messages between the page and the shell. Anything the page asks of mpv is
+//! checked here first, since a page must not reach local files or scripts.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::discord::Presence;
+use crate::mpv::Kind;
+use crate::now_playing::{self, MediaKey};
+
+/// Bumped when a message changes shape, so pages can tell shells apart.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Stable,
+    Nightly,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Inbound {
+    MpvCommand {
+        args: Vec<Value>,
+    },
+    MpvSetProp {
+        name: String,
+        value: Value,
+    },
+    /// Resends every observed property's current value.
+    MpvSync,
+    Fullscreen {
+        value: Option<bool>,
+    },
+    Minimize,
+    Close,
+    /// Moves the window with the mouse, from a press on the page's title strip.
+    WindowDrag,
+    /// Resizes from the top edge, which the page covers: `n`, `ne` or `nw`.
+    WindowResize {
+        edge: String,
+    },
+    WindowMaximize,
+    /// Asks for a `window-state` answer.
+    WindowState,
+    /// Shows or hides the system's own window buttons, where it draws them over the page.
+    WindowButtons {
+        visible: bool,
+    },
+    AppInfo,
+    OpenMpvConfig,
+    OpenLogs,
+    /// Versions, paths and the recent log, for a bug report; the page names its own build and the server's.
+    Diagnostics {
+        web: Option<String>,
+        server: Option<String>,
+    },
+    /// Checks for an update and downloads it; `None` keeps the installed channel.
+    UpdateCheck {
+        channel: Option<UpdateChannel>,
+    },
+    /// Restarts into a downloaded update.
+    UpdateApply,
+    /// An error from the page: uncaught, or passed to `console.error`.
+    WebError {
+        message: String,
+    },
+    /// What Discord shows the user doing; `None` clears it.
+    Presence {
+        presence: Option<Presence>,
+    },
+    /// Connects to Discord if need be and answers with a `discord-status`.
+    DiscordCheck,
+    /// The title the player shows; `None` once it closes.
+    NowPlaying {
+        item: Option<now_playing::Item>,
+    },
+    /// The page can take `link` messages, and any that arrived before it loaded.
+    LinksReady,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum Outbound {
+    MpvProp {
+        name: String,
+        data: Value,
+    },
+    MpvEvent {
+        name: &'static str,
+    },
+    MpvEnded {
+        reason: &'static str,
+        error: Option<String>,
+    },
+    Fullscreen {
+        value: bool,
+    },
+    WindowState {
+        maximized: bool,
+    },
+    AppInfo {
+        app: &'static str,
+        platform: &'static str,
+        mpv: Option<String>,
+        ffmpeg: Option<String>,
+    },
+    Diagnostics {
+        text: String,
+    },
+    /// `checking`, `downloading`, `ready`, `current`, `error`, or `off` for a
+    /// copy Velopack did not install.
+    UpdateState {
+        state: &'static str,
+        channel: Option<UpdateChannel>,
+        version: Option<String>,
+        error: Option<String>,
+    },
+    /// `connected`, `not-found`, `failed` or `refused`, with the reason for the last two.
+    DiscordStatus {
+        state: &'static str,
+        message: Option<String>,
+    },
+    /// An `aiostreams://` link the app was opened with.
+    Link {
+        url: String,
+    },
+    MediaKey {
+        key: MediaKey,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl Outbound {
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+pub const OBSERVED: &[(&str, Kind)] = &[
+    ("time-pos", Kind::Double),
+    ("duration", Kind::Double),
+    ("demuxer-cache-time", Kind::Double),
+    ("pause", Kind::Flag),
+    ("paused-for-cache", Kind::Flag),
+    ("seeking", Kind::Flag),
+    ("idle-active", Kind::Flag),
+    ("volume", Kind::Double),
+    ("volume-max", Kind::Double),
+    ("mute", Kind::Flag),
+    ("speed", Kind::Double),
+    ("aid", Kind::String),
+    ("sid", Kind::String),
+    ("track-list", Kind::Json),
+    ("chapter-list", Kind::Json),
+    ("video-params", Kind::Json),
+];
+
+pub const THROTTLED: &[&str] = &["time-pos", "demuxer-cache-time"];
+pub const THROTTLE_MS: u64 = 250;
+
+const SETTABLE: &[&str] = &[
+    "pause",
+    "volume",
+    "mute",
+    "speed",
+    "aid",
+    "sid",
+    "secondary-sid",
+    "sub-delay",
+    "audio-delay",
+    "panscan",
+    "keepaspect",
+    "sub-scale",
+    "sub-pos",
+    "sub-visibility",
+    "time-pos",
+    "sub-bold",
+    "sub-color",
+    "sub-outline-color",
+    "sub-outline-size",
+    "sub-back-color",
+    "sub-border-style",
+    "sub-ass-override",
+    "sub-ass-force-margins",
+    "hwdec",
+    "audio-channels",
+    "audio-spdif",
+];
+
+const LOADFILE_OPTIONS: &[&str] = &[
+    "start",
+    "aid",
+    "sid",
+    "alang",
+    "slang",
+    "force-media-title",
+    "subs-fallback",
+    "subs-fallback-forced",
+    "subs-with-matching-audio",
+];
+
+/// mpv's built-in stats.lua; a page toggle hides the overlay when it is shown.
+const STATS_BINDINGS: &[&str] = &[
+    "stats/display-stats-toggle",
+    "stats/display-page-1-toggle",
+    "stats/display-page-2-toggle",
+    "stats/display-page-3-toggle",
+    "stats/display-page-5-toggle",
+];
+
+const SEEK_FLAGS: &[&str] = &[
+    "relative",
+    "absolute",
+    "absolute-percent",
+    "relative-percent",
+    "keyframes",
+    "exact",
+];
+
+pub fn origin(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    let origin = url.origin();
+    // A custom scheme's origin is opaque, "null" for every such page, so it is spelled out.
+    if origin.is_tuple() {
+        Some(origin.ascii_serialization())
+    } else {
+        Some(format!("{}://{}", url.scheme(), url.host_str()?))
+    }
+}
+
+fn is_web_url(s: &str) -> bool {
+    url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+}
+
+fn arg_string(v: &Value) -> Result<String, String> {
+    match v {
+        Value::String(s) => Ok(s.clone()),
+        Value::Number(n) => Ok(n.to_string()),
+        Value::Bool(b) => Ok(if *b { "yes" } else { "no" }.into()),
+        _ => Err(format!("unsupported argument {v}")),
+    }
+}
+
+fn check_options(options: &str) -> Result<(), String> {
+    for pair in options.split(',').filter(|p| !p.is_empty()) {
+        let (key, value) = pair.split_once('=').ok_or("options are key=value")?;
+        if !LOADFILE_OPTIONS.contains(&key) {
+            return Err(format!("option {key} is not allowed"));
+        }
+        // mpv reads %n% as a length prefix, which could smuggle in more options.
+        if value.contains('%') {
+            return Err(format!("option {key} has an unsupported value"));
+        }
+    }
+    Ok(())
+}
+
+fn check_flags(flags: Option<&String>, allowed: &[&str]) -> Result<(), String> {
+    match flags {
+        Some(f) if !f.split('+').all(|p| allowed.contains(&p)) => {
+            Err(format!("flags {f} are not allowed"))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_number(v: Option<&String>) -> Result<(), String> {
+    match v {
+        Some(n) if n.parse::<f64>().is_err() => Err(format!("{n} is not a number")),
+        _ => Ok(()),
+    }
+}
+
+pub fn command(args: &[Value]) -> Result<Vec<String>, String> {
+    let args = args.iter().map(arg_string).collect::<Result<Vec<_>, _>>()?;
+    let name = args.first().ok_or("empty command")?.as_str();
+    match name {
+        // loadfile <url> [<flags> [<index> [<options>]]]
+        "loadfile" => {
+            if !args.get(1).is_some_and(|u| is_web_url(u)) {
+                return Err("loadfile takes an http(s) url".into());
+            }
+            check_flags(
+                args.get(2),
+                &[
+                    "replace",
+                    "append",
+                    "append-play",
+                    "insert-next",
+                    "insert-next-play",
+                ],
+            )?;
+            check_number(args.get(3))?;
+            if let Some(options) = args.get(4) {
+                check_options(options)?;
+            }
+            if args.len() > 5 {
+                return Err("too many arguments".into());
+            }
+        }
+        "sub-add" | "audio-add" => {
+            if !args.get(1).is_some_and(|u| is_web_url(u)) {
+                return Err(format!("{name} takes an http(s) url"));
+            }
+            check_flags(args.get(2), &["select", "auto", "cached"])?;
+            if args.len() > 5 {
+                return Err("too many arguments".into());
+            }
+        }
+        "sub-remove" | "audio-remove" => {
+            check_number(args.get(1))?;
+            if args.len() > 2 {
+                return Err("too many arguments".into());
+            }
+        }
+        "seek" => {
+            check_number(args.get(1))?;
+            check_flags(args.get(2), SEEK_FLAGS)?;
+            if args.len() > 3 {
+                return Err("too many arguments".into());
+            }
+        }
+        "stop" | "frame-step" | "frame-back-step" => {
+            if args.len() > 1 {
+                return Err("too many arguments".into());
+            }
+        }
+        // Only the user's own input.conf binds keys, since default bindings are off.
+        "keypress" => {
+            if args.len() != 2 || args[1].is_empty() || args[1].chars().any(char::is_whitespace) {
+                return Err("keypress takes one key name".into());
+            }
+        }
+        "script-binding" => {
+            if args.len() != 2 || !STATS_BINDINGS.contains(&args[1].as_str()) {
+                return Err("only the stats overlay's bindings are allowed".into());
+            }
+        }
+        "set" | "cycle" | "add" => {
+            if !args.get(1).is_some_and(|p| SETTABLE.contains(&p.as_str())) {
+                return Err(format!("{name} is not allowed on that property"));
+            }
+            if args.len() > 3 {
+                return Err("too many arguments".into());
+            }
+        }
+        _ => return Err(format!("command {name} is not allowed")),
+    }
+    Ok(args)
+}
+
+pub fn set_prop(name: &str, value: &Value) -> Result<String, String> {
+    if !SETTABLE.contains(&name) {
+        return Err(format!("property {name} is not settable"));
+    }
+    arg_string(value)
+}

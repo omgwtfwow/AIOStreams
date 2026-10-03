@@ -3,9 +3,9 @@ import type { Template } from '@aiostreams/core';
 
 import { PageWrapper } from '@/components/shared/page-wrapper';
 import { SettingsCard } from '@/components/shared/settings-card';
-import { DonationModal } from '@/components/shared/donation-modal';
+import { DonationModal } from '@aiostreams/ui/shared/donation-modal';
 import { ConfigTemplatesModal } from '@/components/shared/templates';
-import { useDisclosure } from '@/hooks/disclosure';
+import { useDisclosure } from '@aiostreams/ui/hooks/disclosure';
 import { useStatus } from '@/context/status';
 import { useUserData } from '@/context/userData';
 import { useMenu } from '@/context/menu';
@@ -15,11 +15,10 @@ import {
   useTemplateLoader,
   type AppliedTemplateUpdate,
 } from '@/hooks/templates/loader';
-import {
-  DocsChangelogEntry,
-  ReleaseChannel,
-  fetchDocsChangelog,
-} from '@/lib/changelog';
+import { useQuery } from '@tanstack/react-query';
+import { ReleaseChannel } from '@/lib/changelog';
+import { docsChangelogQuery } from '@/lib/queries';
+import { useReleases } from '@/components/shared/releases/use-releases';
 
 import { AboutHero } from './_components/hero';
 import { GetStartedCard } from './_components/get-started-card';
@@ -30,7 +29,6 @@ import { WhatsNew } from './_components/whats-new';
 import { InstanceUpdatedModal } from './_components/instance-updated-modal';
 import { CustomizeModal } from './_components/customize-modal';
 import { TemplateUpdatesModal } from './_components/template-updates-modal';
-import { useReleases } from './_components/use-releases';
 
 export function AboutMenu() {
   return (
@@ -62,10 +60,8 @@ function Content() {
   const [deepLinkTemplateId, setDeepLinkTemplateId] = React.useState<
     string | undefined
   >();
-  const [docsEntries, setDocsEntries] = React.useState<DocsChangelogEntry[]>(
-    []
-  );
-  const [docsLoading, setDocsLoading] = React.useState(true);
+  const docs = useQuery(docsChangelogQuery);
+  const docsEntries = docs.data ?? [];
 
   const hasOpenedUpdateModalRef = React.useRef(false);
 
@@ -98,13 +94,6 @@ function Content() {
 
   React.useEffect(() => {
     loader.loadTemplates();
-  }, []);
-
-  React.useEffect(() => {
-    fetchDocsChangelog()
-      .then(setDocsEntries)
-      .catch(() => setDocsEntries([]))
-      .finally(() => setDocsLoading(false));
   }, []);
 
   // A first-time visitor lands straight in the setup flow rather than being
@@ -244,10 +233,11 @@ function Content() {
 
         <WhatsNew
           version={version}
+          baseVersion={status?.version}
           channel={channel}
           releases={releases}
           docsEntries={docsEntries}
-          docsLoading={docsLoading}
+          docsLoading={docs.isLoading}
         />
 
         <InterfaceMode />
@@ -321,7 +311,8 @@ function Content() {
       />
 
       <InstanceUpdatedModal
-        version={version}
+        tag={version}
+        baseVersion={status?.version}
         channel={channel}
         docsEntries={docsEntries}
       />

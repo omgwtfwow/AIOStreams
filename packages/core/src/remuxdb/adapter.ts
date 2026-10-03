@@ -1,0 +1,154 @@
+import type { ParsedStream } from '../db/schemas.js';
+import { decodeProxyToken, ProxyDataSchema } from '../proxy/token.js';
+import type { MediaInfo } from '../utils/media-info.js';
+import { NEWZNAB_INDEXERS } from '../presets/newznab.js';
+import type { MediaProbeVersion, ProbeSource, TrackDetail } from './client.js';
+
+function unwrapProxyUrl(nzbUrl: string): string {
+  try {
+    const segments = new URL(nzbUrl).pathname.split('/');
+    const token = segments[segments.indexOf('proxy') + 1];
+    if (!token) return nzbUrl;
+    const decoded = decodeProxyToken(token);
+    if (!decoded) return nzbUrl;
+    const data = ProxyDataSchema.safeParse(JSON.parse(decoded.rawData));
+    return data.success ? data.data.url : nzbUrl;
+  } catch {
+    return nzbUrl;
+  }
+}
+
+const KNOWN_INDEXER_HOSTNAMES: Record<string, string> = Object.fromEntries(
+  NEWZNAB_INDEXERS.flatMap((i) =>
+    i.remuxDbIndexer
+      ? [[new URL(i.value).hostname.replace(/^www\./, ''), i.remuxDbIndexer]]
+      : []
+  )
+);
+
+export function resolveRemuxDbIndexer(
+  nzbUrl: string | undefined
+): string | undefined {
+  if (!nzbUrl) return undefined;
+  try {
+    const hostname = new URL(unwrapProxyUrl(nzbUrl)).hostname
+      .toLowerCase()
+      .replace(/^www\./, '');
+    return KNOWN_INDEXER_HOSTNAMES[hostname];
+  } catch {
+    return undefined;
+  }
+}
+
+export function extractNzbGuid(nzbUrl: string | undefined): string | undefined {
+  if (!nzbUrl) return undefined;
+  const realUrl = unwrapProxyUrl(nzbUrl);
+  try {
+    const url = new URL(realUrl);
+    return (
+      url.searchParams.get('id') ??
+      url.pathname.match(/\/([a-f0-9]{32,40})(?:[./]|$)/i)?.[1]
+    );
+  } catch {
+    return realUrl;
+  }
+}
+
+const baseName = (path: string | null | undefined) =>
+  path?.split('/').pop()?.toLowerCase();
+
+/** Filename goes before fileIdx, as RemuxDB can number a torrent's files differently. */
+export function matchEntry(
+  versions: MediaProbeVersion[],
+  stream: ParsedStream
+): MediaProbeVersion | undefined {
+  const hash = stream.torrent?.infoHash?.toLowerCase();
+  if (hash) {
+    const inTorrent = (s: ProbeSource) =>
+      s.torrent_info_hash?.toLowerCase() === hash;
+    const candidates = versions.filter((v) => v.sources.some(inTorrent));
+    const name = baseName(stream.filename);
+    const fileIdx = stream.torrent?.fileIdx;
+    const size = stream.size;
+    const match =
+      (name &&
+        candidates.find((v) =>
+          v.sources.some((s) => inTorrent(s) && baseName(s.filename) === name)
+        )) ||
+      (fileIdx !== undefined &&
+        candidates.find((v) =>
+          v.sources.some((s) => inTorrent(s) && s.torrent_file_idx === fileIdx)
+        )) ||
+      // No file index: the hash only counts if the sizes agree, ruling out packs.
+      (fileIdx === undefined &&
+        size &&
+        candidates.find(
+          (v) => v.size && Math.abs(v.size - size) <= size * 0.01
+        ));
+    if (match) return match;
+  }
+
+  const indexer = resolveRemuxDbIndexer(stream.nzbUrl);
+  const guid = extractNzbGuid(stream.nzbUrl);
+  if (indexer && guid) {
+    return versions.find((v) =>
+      v.sources.some((s) => s.indexer === indexer && s.indexer_guid === guid)
+    );
+  }
+
+  return undefined;
+}
+
+function deriveHdrTags(track: TrackDetail): string[] {
+  if ((track.dv_profile ?? 0) > 0) return ['dv'];
+  if (track.hdr10_plus_present) return ['hdr10+'];
+  if (track.color_transfer === 'smpte2084') return ['hdr10'];
+  if (track.color_transfer === 'arib-std-b67') return ['hlg'];
+  return [];
+}
+
+export function toWireMediaInfo(entry: MediaProbeVersion): MediaInfo {
+  // Clients pick a track by its position in the file, so order matters.
+  const tracks = [...entry.tracks].sort((a, b) => a.idx - b.idx);
+  const videoTrack = tracks.find((t) => t.kind === 'video');
+  const audioTracks = tracks.filter((t) => t.kind === 'audio');
+  const subtitleTracks = tracks.filter(
+    (t) => t.kind === 'subtitle' && !t.is_external
+  );
+
+  return {
+    video: videoTrack
+      ? {
+          codec: videoTrack.codec ?? undefined,
+          w: videoTrack.width ?? undefined,
+          h: videoTrack.height ?? undefined,
+          hdr: deriveHdrTags(videoTrack),
+        }
+      : undefined,
+    audio: audioTracks.map((t) => ({
+      codec: t.codec ?? undefined,
+      profile: t.profile ?? undefined,
+      lang: t.language ?? undefined,
+      title: t.title ?? undefined,
+      ch_layout: t.channel_layout ?? undefined,
+      ch: t.channels ?? undefined,
+      default: t.is_default,
+      hearing_impaired: t.is_hearing_impaired,
+    })),
+    subtitle: subtitleTracks.map((t) => ({
+      codec: t.codec ?? undefined,
+      lang: t.language ?? undefined,
+      title: t.title ?? undefined,
+      default: t.is_default,
+      forced: t.is_forced,
+      hearing_impaired: t.is_hearing_impaired,
+    })),
+    format: {
+      n: entry.container ?? '',
+      dur: (entry.duration ?? 0) * 1_000_000_000,
+      s: entry.size ?? 0,
+      br: entry.bitrate ?? 0,
+    },
+    has_chapters: entry.has_chapters,
+  };
+}

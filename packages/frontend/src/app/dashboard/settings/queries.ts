@@ -12,6 +12,7 @@ export type SettingsUiKind =
   | 'string'
   | 'enum'
   | 'list'
+  | 'multiEnum'
   | 'map'
   | 'boolOrList'
   | 'duration'
@@ -41,6 +42,8 @@ export interface SettingsUiHint {
   max?: number;
   /** For `number` fields - step size (default: 1). */
   step?: number;
+  /** For `multiEnum` - the picked order is the setting, so it is reorderable. */
+  orderable?: boolean;
 }
 
 export interface SettingsKey {
@@ -102,7 +105,7 @@ export function useSaveSettings() {
   return useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
       api<PatchResult>('PATCH /dashboard/settings', { body: patch }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: DASHBOARD_SCOPE }),
+    onSettled: () => qc.invalidateQueries({ queryKey: DASHBOARD_SCOPE }),
   });
 }
 

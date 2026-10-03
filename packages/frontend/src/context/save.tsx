@@ -11,12 +11,16 @@ import {
   type LinkedAccountPushAllResult,
 } from '@/lib/api';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { linkedAccountsQuery, LINKED_ACCOUNTS_QUERY_ROOT } from '@/lib/queries';
+import {
+  linkedAccountsQuery,
+  LINKED_ACCOUNTS_QUERY_ROOT,
+  WATCH_STATE_TRACKERS_QUERY_ROOT,
+} from '@/lib/queries';
 import { manifestFingerprint } from '../../../core/src/utils/manifest-fingerprint';
 import { computeUserDataDiff } from '../utils/diff/userData';
 import { toast } from 'sonner';
-import { Modal } from '@/components/ui/modal';
-import { Button } from '@/components/ui/button';
+import { Modal } from '@aiostreams/ui/modal';
+import { Button } from '@aiostreams/ui/button';
 import { UserDataDiffViewer } from '@/components/shared/userdata-diff-viewer';
 import {
   ManifestDiffViewer,
@@ -26,7 +30,7 @@ import {
   hasSevereManifestChanges,
   hasAnyManifestChanges,
 } from '../utils/diff/manifest';
-import { Switch } from '@/components/ui/switch';
+import { Switch } from '@aiostreams/ui/switch';
 
 interface SaveContextType {
   handleSave: (options?: {
@@ -293,6 +297,9 @@ export function SaveProvider({ children }: { children: React.ReactNode }) {
       try {
         await updateUserConfig(uuid, userData, password);
         setBaseline(userData);
+        void queryClient.invalidateQueries({
+          queryKey: WATCH_STATE_TRACKERS_QUERY_ROOT,
+        });
         if (!suppressSuccessToast) {
           toast.success('Configuration updated successfully');
         }
@@ -317,6 +324,7 @@ export function SaveProvider({ children }: { children: React.ReactNode }) {
       setSelectedMenu,
       setUserData,
       setBaseline,
+      queryClient,
     ]
   );
 

@@ -10,7 +10,7 @@ import {
   DEFAULT_FAILOVER_PARALLEL,
 } from '../../../core/src/utils/constants';
 import { useStatus } from './status';
-import { filterForDiff } from '../utils/diff/userData';
+import { computeUserDataDiff } from '../utils/diff/userData';
 import {
   clearDrafts,
   isDraftOptOut,
@@ -507,31 +507,44 @@ export const DefaultUserData: UserData = {
 
 type Status = NonNullable<ReturnType<typeof useStatus>['status']>;
 
-/**
- * Overlays the instance's forced and default settings. Applied to both the live
- * configuration and the draft baseline, so it must not mutate its input.
- */
-function applyStatusDefaults(data: UserData, status: Status): UserData {
-  const forced = status.settings.forced;
-  const defaults = status.settings.defaults;
+/** Defaults are for a fresh configuration only. Must not mutate its input. */
+function applyStatusSettings(
+  data: UserData,
+  status: Status,
+  fillDefaults: boolean
+): UserData {
+  const forced = status.settings.forced.proxy;
+  const defaults = fillDefaults ? status.settings.defaults.proxy : undefined;
   const services = status.settings.services;
+  const proxy = data.proxy;
 
   const next: UserData = { ...data };
   next.proxy = {
-    ...next.proxy,
-    enabled: forced.proxy.enabled ?? defaults.proxy?.enabled ?? undefined,
-    id: (forced.proxy.id ?? defaults.proxy?.id ?? 'builtin') as
+    ...proxy,
+    enabled: forced.enabled ?? proxy?.enabled ?? defaults?.enabled ?? undefined,
+    id: (forced.id ??
+      proxy?.id ??
+      defaults?.id ??
+      (fillDefaults ? 'builtin' : undefined)) as
       | 'builtin'
       | 'mediaflow'
       | 'stremthru'
       | undefined,
-    url: forced.proxy.url ?? defaults.proxy?.url ?? undefined,
-    publicUrl: forced.proxy.publicUrl ?? defaults.proxy?.publicUrl ?? undefined,
-    publicIp: forced.proxy.publicIp ?? defaults.proxy?.publicIp ?? undefined,
+    url: forced.url ?? proxy?.url ?? defaults?.url ?? undefined,
+    publicUrl:
+      forced.publicUrl ?? proxy?.publicUrl ?? defaults?.publicUrl ?? undefined,
+    publicIp:
+      forced.publicIp ?? proxy?.publicIp ?? defaults?.publicIp ?? undefined,
     credentials:
-      forced.proxy.credentials ?? defaults.proxy?.credentials ?? undefined,
+      forced.credentials ??
+      proxy?.credentials ??
+      defaults?.credentials ??
+      undefined,
     proxiedServices:
-      forced.proxy.proxiedServices ?? defaults.proxy?.proxiedServices ?? [],
+      forced.proxiedServices ??
+      proxy?.proxiedServices ??
+      defaults?.proxiedServices ??
+      (fillDefaults ? [] : undefined),
   };
 
   next.services = (data.services ?? []).map((service) => {
@@ -541,29 +554,40 @@ function applyStatusDefaults(data: UserData, status: Status): UserData {
     serviceMeta.credentials.forEach((credential) => {
       if (credential.forced) {
         credentials[credential.id] = credential.forced;
-      } else if (credential.default) {
+      } else if (
+        fillDefaults &&
+        credential.default &&
+        credentials[credential.id] === undefined
+      ) {
         credentials[credential.id] = credential.default;
       }
     });
     return {
       ...service,
       credentials,
-      // enable if every credential is set
-      enabled: serviceMeta.credentials.every(
-        (credential) =>
-          credential.forced ||
-          credential.default ||
-          credentials[credential.id] !== undefined
-      ),
+      enabled: fillDefaults
+        ? serviceMeta.credentials.every(
+            (credential) =>
+              credential.forced ||
+              credential.default ||
+              credentials[credential.id] !== undefined
+          )
+        : service.enabled,
     };
   });
 
   return next;
 }
 
-/** Stable comparison that ignores identity and other volatile fields. */
+export function resolveDraft(draft: Draft, status: Status | null): UserData {
+  // migrations mutate, and the draft is still held
+  const restored = applyMigrations(structuredClone(draft.data));
+  return status ? applyStatusSettings(restored, status, false) : restored;
+}
+
+// Must agree with the review diff, or a draft can open with nothing in it.
 function sameConfig(a: UserData, b: UserData): boolean {
-  return JSON.stringify(filterForDiff(a)) === JSON.stringify(filterForDiff(b));
+  return computeUserDataDiff(a, b).diffs.length === 0;
 }
 
 /** Whether a configuration holds work worth offering to restore. */
@@ -633,9 +657,12 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
   const baselineRef = React.useRef<UserData>(DefaultUserData);
   const anonBaselineRef = React.useRef<UserData>(DefaultUserData);
   const [baselineReady, setBaselineReady] = React.useState(false);
+  // A save leaves userData untouched, so this re-runs the draft check.
+  const [baselineVersion, setBaselineVersion] = React.useState(0);
 
   const setBaseline = React.useCallback((data: UserData) => {
     baselineRef.current = data;
+    setBaselineVersion((v) => v + 1);
   }, []);
 
   const statusApplied = React.useRef(false);
@@ -645,10 +672,15 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
     statusApplied.current = true;
 
     // The baseline takes the same overlay, or defaults read as unsaved edits.
-    const anonBaseline = applyStatusDefaults(DefaultUserData, status);
+    // A configuration can load before status does.
+    const anonBaseline = applyStatusSettings(DefaultUserData, status, true);
+    const overlay = (data: UserData) =>
+      data === DefaultUserData
+        ? anonBaseline
+        : applyStatusSettings(data, status, false);
     anonBaselineRef.current = anonBaseline;
-    baselineRef.current = anonBaseline;
-    setUserData((prev) => applyStatusDefaults(prev, status));
+    baselineRef.current = overlay(baselineRef.current);
+    setUserData(overlay);
     setBaselineReady(true);
   }, [status]);
 
@@ -658,7 +690,15 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     if (draftIdentity.current === uuid) return;
     draftIdentity.current = uuid;
-    setPendingDraft(readDraftFor(uuid));
+    const draft = readDraftFor(uuid);
+    let differs = false;
+    try {
+      differs = !!draft && !sameConfig(resolveDraft(draft, status), userData);
+    } catch {
+      /* unusable draft */
+    }
+    setPendingDraft(differs ? draft : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uuid]);
 
   React.useEffect(() => {
@@ -672,16 +712,14 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
       writeLocalDraft(userData, uuid, userData.addonName);
     }, 400);
     return () => clearTimeout(handle);
-  }, [userData, uuid, baselineReady]);
+  }, [userData, uuid, baselineReady, baselineVersion]);
 
   const restoreDraft = React.useCallback(() => {
     setPendingDraft((draft) => {
       if (draft) {
         try {
-          const restored = applyMigrations(draft.data);
-          setUserData(() =>
-            status ? applyStatusDefaults(restored, status) : restored
-          );
+          const restored = resolveDraft(draft, status);
+          setUserData(() => restored);
         } catch {
           /* unusable draft; drop it rather than breaking the page */
         }
@@ -709,41 +747,56 @@ export function UserDataProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // Clearing means signing out; resetting to the baseline writes no draft.
-  const safeSetUserData = (
-    data: ((prev: UserData) => UserData | null) | null
-  ) => {
-    const reset = () => {
-      baselineRef.current = anonBaselineRef.current;
-      return anonBaselineRef.current;
-    };
-    if (data === null) {
-      setUserData(reset);
-    } else {
-      setUserData((prev) => {
-        const result = data(prev);
-        return result === null ? reset() : result;
-      });
-    }
-  };
+  const safeSetUserData = React.useCallback(
+    (data: ((prev: UserData) => UserData | null) | null) => {
+      const reset = () => {
+        baselineRef.current = anonBaselineRef.current;
+        return anonBaselineRef.current;
+      };
+      if (data === null) {
+        setUserData(reset);
+      } else {
+        setUserData((prev) => {
+          const result = data(prev);
+          return result === null ? reset() : result;
+        });
+      }
+    },
+    []
+  );
+
+  const value = React.useMemo(
+    () => ({
+      userData,
+      setUserData: safeSetUserData,
+      uuid,
+      setUuid,
+      password,
+      setPassword,
+      encryptedPassword,
+      setEncryptedPassword,
+      setBaseline,
+      pendingDraft: applicableDraft,
+      restoreDraft,
+      discardDraft,
+      disableDrafts,
+    }),
+    [
+      userData,
+      safeSetUserData,
+      uuid,
+      password,
+      encryptedPassword,
+      setBaseline,
+      applicableDraft,
+      restoreDraft,
+      discardDraft,
+      disableDrafts,
+    ]
+  );
 
   return (
-    <UserDataContext.Provider
-      value={{
-        userData,
-        setUserData: safeSetUserData,
-        uuid,
-        setUuid,
-        password,
-        setPassword,
-        encryptedPassword,
-        setEncryptedPassword,
-        setBaseline,
-        pendingDraft: applicableDraft,
-        restoreDraft,
-        discardDraft,
-        disableDrafts,
-      }}
-    >
+    <UserDataContext.Provider value={value}>
       {children}
     </UserDataContext.Provider>
   );

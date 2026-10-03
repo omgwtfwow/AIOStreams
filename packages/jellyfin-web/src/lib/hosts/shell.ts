@@ -1,0 +1,641 @@
+import React from 'react';
+import { toast } from 'sonner';
+import { storage } from '../storage';
+import { subtitleUrl, textSubtitles } from '../playback';
+import { sameLanguage } from '../languages';
+import { parseChapters, type Chapter } from '../chapters';
+import {
+  settings,
+  useSetting,
+  onSettingsChange,
+  type UpdateChannelSetting,
+  type SubtitleStyle,
+} from '../settings';
+import type { PlaybackPrefs } from '../user-config';
+import {
+  clampDelay,
+  parseSubtitleLines,
+  savedSubtitleDelay,
+  saveSubtitleDelay,
+} from '../subtitle-lines';
+import { MPV_OUTLINE, mpvColor, subtitleScale } from '../subtitle-style';
+import {
+  initialState,
+  storedVolume,
+  trackLabel,
+  useLatest,
+  VOLUME_KEY,
+  type NativePlayerOptions,
+  type PlayerController,
+  type PlayerState,
+  type Track,
+} from '../player';
+import type { Host } from '.';
+
+export type ShellMessage =
+  | { type: 'mpv-prop'; name: string; data: unknown }
+  | { type: 'mpv-event'; name: string }
+  | { type: 'mpv-ended'; reason: string; error: string | null }
+  | { type: 'fullscreen'; value: boolean }
+  | { type: 'window-state'; maximized: boolean }
+  | {
+      type: 'app-info';
+      app: string;
+      platform: string;
+      mpv: string | null;
+      ffmpeg: string | null;
+    }
+  | { type: 'diagnostics'; text: string }
+  | {
+      type: 'update-state';
+      state: 'checking' | 'downloading' | 'ready' | 'current' | 'error' | 'off';
+      channel: 'stable' | 'nightly' | null;
+      version: string | null;
+      error: string | null;
+    }
+  | {
+      type: 'discord-status';
+      state: 'connected' | 'not-found' | 'failed' | 'refused';
+      message: string | null;
+    }
+  | { type: 'link'; url: string }
+  | { type: 'media-key'; key: MediaKey }
+  | { type: 'error'; message: string };
+
+/** A press on the system's media controls; positions and offsets are milliseconds. */
+export type MediaKey =
+  | { action: 'play' | 'pause' | 'toggle' | 'stop' | 'next' | 'previous' }
+  | { action: 'seek'; position: number }
+  | { action: 'skip'; offset: number };
+
+/** The AIOStreams desktop app's bridge to mpv. */
+interface ShellBridge {
+  protocol: number;
+  version: string;
+  platform: string;
+  /** The computer's name. */
+  device: string;
+  send(message: { type: string; [key: string]: unknown }): void;
+  subscribe(listener: (message: ShellMessage) => void): () => void;
+}
+
+declare global {
+  interface Window {
+    aiostreamsDesktop?: ShellBridge;
+  }
+}
+
+interface MpvTrack {
+  id: number;
+  type: 'video' | 'audio' | 'sub';
+  title?: string;
+  lang?: string;
+  external?: boolean;
+  'external-filename'?: string;
+  selected?: boolean;
+  codec?: string;
+}
+
+const IMAGE_SUBTITLE_CODECS = new Set([
+  'hdmv_pgs_subtitle',
+  'dvd_subtitle',
+  'dvb_subtitle',
+]);
+
+function mpvTrackLabel(track: MpvTrack): string {
+  const parts = [track.title, track.lang?.toUpperCase()].filter(Boolean);
+  return parts.join(' · ') || `Track ${track.id}`;
+}
+
+const EXTERNAL = 'ext:';
+
+const STATS_PAGES: Track[] = [
+  { id: '1', label: 'Playback' },
+  { id: '2', label: 'Frame timings' },
+  { id: '3', label: 'Cache' },
+  { id: '5', label: 'Tracks' },
+];
+
+/**
+ * The AIOStreams desktop app's mpv, drawn beneath the page. Its tracks are the
+ * file's own, plus the server's external subtitles, which mpv downloads only
+ * when picked: a version can carry dozens.
+ */
+export function useShellPlayer(opts: NativePlayerOptions): PlayerController {
+  const { source, startMs, url } = opts;
+  const [state, setState] = React.useState(() => initialState(source, startMs));
+  const [tracks, setTracks] = React.useState<MpvTrack[]>([]);
+  const [chapters, setChapters] = React.useState<Chapter[]>([]);
+  const latest = useLatest({ ...opts, state });
+  const externals = React.useMemo(
+    () =>
+      textSubtitles(source)
+        .filter((s) => s.IsExternal)
+        .flatMap((s, i) => {
+          const link = subtitleUrl(opts.client, s);
+          return link
+            ? [
+                {
+                  id: `${EXTERNAL}${s.Index}`,
+                  url: link,
+                  label: trackLabel(s, i + 1),
+                  lang: s.Language ?? '',
+                },
+              ]
+            : [];
+        }),
+    [source, opts.client]
+  );
+  const loaded = (url: string) =>
+    tracks.find((t) => t.type === 'sub' && t['external-filename'] === url);
+  // mpv's id for a loaded external subtitle reads back as its external id.
+  const subtitleId = (sid: string | null) => {
+    const track = tracks.find((t) => t.type === 'sub' && String(t.id) === sid);
+    const external = externals.find(
+      (e) => e.url === track?.['external-filename']
+    );
+    return external?.id ?? sid;
+  };
+  const patch = (next: Partial<PlayerState>) =>
+    setState((s) => ({ ...s, ...next }));
+  const shell = window.aiostreamsDesktop!;
+  const set = (name: string, value: unknown) =>
+    shell.send({ type: 'mpv-set-prop', name, value });
+  const command = (...args: unknown[]) =>
+    shell.send({ type: 'mpv-command', args });
+
+  const [statsPage, setStatsPage] = React.useState<string | null>(null);
+  const shownStats = useLatest(statsPage);
+  const showStats = (page: string | null) => {
+    if (shownStats.current)
+      command('script-binding', 'stats/display-stats-toggle');
+    if (page) command('script-binding', `stats/display-page-${page}-toggle`);
+    setStatsPage(page);
+  };
+  React.useEffect(
+    () => () => {
+      if (shownStats.current)
+        command('script-binding', 'stats/display-stats-toggle');
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  const [fit] = useSetting(settings.videoFit);
+  React.useEffect(() => {
+    set('keepaspect', fit !== 'stretch');
+    set('panscan', fit === 'crop' ? 1 : 0);
+    set('sub-ass-force-margins', fit === 'crop');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fit]);
+
+  const imageSubtitle = React.useRef(false);
+  const { subtitleStyle } = opts;
+  React.useEffect(
+    () => applySubtitleStyle(subtitleStyle, imageSubtitle.current),
+    [subtitleStyle]
+  );
+
+  React.useEffect(() => {
+    // mpv refuses anything above its volume-max.
+    const { volume, muted } = storedVolume(Infinity);
+    let cache = false;
+    let seeking = false;
+
+    let fileTracks: MpvTrack[] = [];
+    let sid: string | null = null;
+    const syncSubtitleScale = () => {
+      const track = fileTracks.find(
+        (t) => t.type === 'sub' && String(t.id) === sid
+      );
+      const image = IMAGE_SUBTITLE_CODECS.has(track?.codec ?? '');
+      const style = latest.current.subtitleStyle;
+      if (image === imageSubtitle.current || !style) return;
+      imageSubtitle.current = image;
+      set('sub-scale', image ? 1 : subtitleScale(style));
+    };
+    // Shows an external subtitle in the user's language when their mode wants
+    // one and the file has none of its own; Default only honours the file's.
+    const addPreferredSubtitle = () => {
+      const { SubtitleLanguagePreference: lang, SubtitleMode: mode } =
+        latest.current.prefs ?? {};
+      if (!lang || (mode !== 'Always' && mode !== 'Smart')) return;
+      const has = (type: MpvTrack['type']) =>
+        fileTracks.some(
+          (t) =>
+            t.type === type &&
+            (type === 'sub' ? !t.external : t.selected) &&
+            sameLanguage(lang, t.lang)
+        );
+      if (has('sub') || (mode === 'Smart' && has('audio'))) return;
+      const external = externals.find((e) => sameLanguage(lang, e.lang));
+      if (external)
+        command(
+          'sub-add',
+          external.url,
+          'select',
+          external.label,
+          external.lang
+        );
+    };
+    const onProp = (name: string, data: unknown) => {
+      const num = typeof data === 'number' ? data : null;
+      switch (name) {
+        case 'time-pos':
+          if (num !== null) patch({ positionMs: num * 1000 });
+          break;
+        case 'duration':
+          if (num !== null) patch({ durationMs: num * 1000 });
+          break;
+        case 'demuxer-cache-time':
+          if (num !== null) patch({ bufferedMs: num * 1000 });
+          break;
+        case 'pause':
+          patch({ paused: data === true });
+          break;
+        case 'paused-for-cache':
+        case 'seeking':
+          if (name === 'seeking') seeking = data === true;
+          else cache = data === true;
+          patch({ waiting: cache || seeking });
+          break;
+        case 'volume':
+          if (num !== null) patch({ volume: num / 100 });
+          break;
+        case 'volume-max':
+          if (num !== null) patch({ maxVolume: num / 100 });
+          break;
+        case 'mute':
+          patch({ muted: data === true });
+          break;
+        case 'speed':
+          if (num !== null) patch({ rate: num });
+          break;
+        case 'aid':
+        case 'sid': {
+          const id =
+            typeof data === 'string' && /^\d+$/.test(data) ? data : null;
+          patch(name === 'aid' ? { audio: id } : { subtitle: id });
+          if (name === 'sid') {
+            sid = id;
+            syncSubtitleScale();
+          }
+          break;
+        }
+        case 'track-list':
+          fileTracks = Array.isArray(data) ? (data as MpvTrack[]) : [];
+          setTracks(fileTracks);
+          syncSubtitleScale();
+          break;
+        case 'chapter-list':
+          setChapters(parseChapters(data));
+          break;
+      }
+    };
+
+    const unsubscribe = shell.subscribe((m) => {
+      if (m.type === 'mpv-prop') onProp(m.name, m.data);
+      else if (m.type === 'fullscreen') patch({ fullscreen: m.value });
+      else if (m.type === 'error') console.warn(m.message);
+      else if (m.type === 'mpv-event' && m.name === 'playback-restart')
+        patch({ started: true, waiting: false });
+      else if (m.type === 'mpv-event' && m.name === 'file-loaded')
+        addPreferredSubtitle();
+      else if (m.type === 'mpv-ended' && m.reason === 'eof')
+        latest.current.onEnded();
+      else if (m.type === 'mpv-ended' && m.reason === 'error')
+        patch({ error: m.error ?? 'mpv could not play this version' });
+    });
+    shell.send({ type: 'mpv-sync' });
+    // mpv keeps pause from the last file.
+    set('pause', false);
+    set('volume', Math.round(volume * 100));
+    set('mute', muted);
+    const delay = savedSubtitleDelay(source.Id);
+    set('sub-delay', delay / 1000);
+    patch({ subtitleDelayMs: delay });
+    const options = [
+      ...(startMs ? [`start=${(startMs / 1000).toFixed(3)}`] : []),
+      ...trackOptions(latest.current.prefs ?? {}),
+    ];
+    command('loadfile', url, 'replace', -1, options.join(','));
+    return () => {
+      unsubscribe();
+      command('stop');
+    };
+    // Reloading restarts playback, so only a new url or start does it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url, startMs]);
+
+  const setVolume = (volume: number, muted = volume === 0) => {
+    set('volume', Math.round(volume * 100));
+    set('mute', muted);
+    storage.set(VOLUME_KEY, { volume, muted });
+    patch({ volume, muted });
+  };
+
+  const toTrack = (t: MpvTrack): Track => ({
+    id: String(t.id),
+    label: mpvTrackLabel(t),
+  });
+  return {
+    state: { ...state, subtitle: subtitleId(state.subtitle) },
+    audioTracks: tracks.filter((t) => t.type === 'audio').map(toTrack),
+    subtitleTracks: [
+      ...tracks.filter((t) => t.type === 'sub' && !t.external).map(toTrack),
+      ...externals.map(({ id, label }) => ({ id, label })),
+    ],
+    togglePlay: () => set('pause', !latest.current.state.paused),
+    seek: (ms) => {
+      command('seek', ms / 1000, 'absolute');
+      patch({ positionMs: ms });
+    },
+    setVolume: (volume) => setVolume(volume),
+    toggleMute: () => {
+      const { volume, muted } = latest.current.state;
+      setVolume(muted && volume === 0 ? 0.5 : volume, !muted);
+    },
+    setRate: (rate) => set('speed', rate),
+    setAudio: (id) => set('aid', Number(id)),
+    setSubtitle: (id) => {
+      const external = externals.find((e) => e.id === id);
+      if (!external) return set('sid', id ? Number(id) : 'no');
+      const track = loaded(external.url);
+      if (track) set('sid', track.id);
+      else
+        command(
+          'sub-add',
+          external.url,
+          'select',
+          external.label,
+          external.lang
+        );
+    },
+    setSubtitleDelay: (ms) => {
+      const delay = clampDelay(ms);
+      set('sub-delay', delay / 1000);
+      saveSubtitleDelay(source.Id, delay);
+      patch({ subtitleDelayMs: delay });
+    },
+    // Only external subtitles can be read; mpv keeps embedded ones to itself.
+    canReadSubtitle: (id) => externals.some((e) => e.id === id),
+    subtitleLines: async () => {
+      const shown = subtitleId(latest.current.state.subtitle);
+      const external = externals.find((e) => e.id === shown);
+      if (!external) return null;
+      const res = await fetch(external.url);
+      return res.ok ? parseSubtitleLines(await res.text()) : null;
+    },
+    toggleFullscreen: () => shell.send({ type: 'fullscreen' }),
+    chapters,
+    stats: { pages: STATS_PAGES, page: statsPage, show: showStats },
+  };
+}
+
+/**
+ * The user's languages and subtitle mode as mpv's per-file track choices.
+ * mpv matches a language across its two- and three-letter codes.
+ */
+function trackOptions(prefs: PlaybackPrefs): string[] {
+  const options: string[] = [];
+  if (prefs.AudioLanguagePreference)
+    options.push(`alang=${prefs.AudioLanguagePreference}`);
+  const slang = prefs.SubtitleLanguagePreference
+    ? [`slang=${prefs.SubtitleLanguagePreference}`]
+    : [];
+  switch (prefs.SubtitleMode) {
+    case 'None':
+      options.push('sid=no');
+      break;
+    case 'OnlyForced':
+      options.push('subs-fallback=no', 'subs-fallback-forced=always');
+      break;
+    case 'Always':
+      options.push(
+        ...slang,
+        'subs-fallback=yes',
+        'subs-with-matching-audio=yes'
+      );
+      break;
+    case 'Smart':
+      options.push(...slang, 'subs-with-matching-audio=no');
+      break;
+    default:
+      options.push(...slang);
+  }
+  return options;
+}
+
+function setProp(name: string, value: unknown) {
+  window.aiostreamsDesktop?.send({ type: 'mpv-set-prop', name, value });
+}
+
+/** Image subtitles keep their own size. */
+function applySubtitleStyle(
+  style: SubtitleStyle | undefined,
+  image: boolean
+): void {
+  if (!style) return;
+  setProp('sub-scale', image ? 1 : subtitleScale(style));
+  setProp('sub-bold', style.bold);
+  setProp('sub-color', mpvColor(style.textColor));
+  setProp('sub-outline-color', mpvColor(style.outlineColor));
+  setProp('sub-outline-size', MPV_OUTLINE[style.outline]);
+  setProp(
+    'sub-back-color',
+    mpvColor(style.backgroundColor, style.backgroundOpacity)
+  );
+  setProp(
+    'sub-border-style',
+    style.backgroundOpacity > 0 ? 'background-box' : 'outline-and-shadow'
+  );
+  setProp('sub-ass-override', style.overrideStyled ? 'force' : 'scale');
+  setProp('sub-pos', 100 - style.position);
+}
+
+function applyDesktopSettings(): void {
+  const { hardwareDecoding, audioChannels, passthrough } = settings.desktop;
+  const channels = audioChannels.read();
+  setProp('hwdec', hardwareDecoding.read() ? 'auto-safe' : 'no');
+  setProp('audio-channels', channels === 'auto' ? 'auto-safe' : channels);
+  setProp('audio-spdif', passthrough.read() ? 'ac3,eac3,dts-hd,truehd' : '');
+}
+
+export type UpdateState = Extract<ShellMessage, { type: 'update-state' }>;
+
+/* The last report, for a settings page opened after it came. */
+let updateState: UpdateState | null = null;
+const updateListeners = new Set<() => void>();
+
+function subscribeUpdates(listener: () => void): () => void {
+  updateListeners.add(listener);
+  return () => updateListeners.delete(listener);
+}
+
+export function useUpdateState(): UpdateState | null {
+  return React.useSyncExternalStore(subscribeUpdates, () => updateState);
+}
+
+export function checkForUpdates(channel: UpdateChannelSetting): void {
+  window.aiostreamsDesktop?.send({
+    type: 'update-check',
+    channel: channel === 'installed' ? null : channel,
+  });
+}
+
+export function applyUpdate(): void {
+  window.aiostreamsDesktop?.send({ type: 'update-apply' });
+}
+
+function onUpdateState(next: UpdateState) {
+  const announced = updateState?.state === 'ready';
+  updateState = next;
+  for (const listener of updateListeners) listener();
+  if (next.state === 'ready' && !announced)
+    toast('Update ready', {
+      description: `Version ${next.version} installs on the next start.`,
+      action: { label: 'Restart now', onClick: applyUpdate },
+      duration: Infinity,
+    });
+}
+
+export type DiscordStatus = Extract<ShellMessage, { type: 'discord-status' }>;
+
+let discordStatus: DiscordStatus | null = null;
+const discordListeners = new Set<() => void>();
+
+function subscribeDiscord(listener: () => void): () => void {
+  discordListeners.add(listener);
+  return () => discordListeners.delete(listener);
+}
+
+export function useDiscordStatus(): DiscordStatus | null {
+  return React.useSyncExternalStore(subscribeDiscord, () => discordStatus);
+}
+
+export function checkDiscord(): void {
+  window.aiostreamsDesktop?.send({ type: 'discord-check' });
+}
+
+function onDiscordStatus(next: DiscordStatus) {
+  discordStatus = next;
+  for (const listener of discordListeners) listener();
+}
+
+/** The browser's own menu only where it edits or copies; Shift still opens it. */
+function onContextMenu(e: MouseEvent) {
+  const target = e.target as HTMLElement | null;
+  const editable = target?.closest('input, textarea, [contenteditable="true"]');
+  if (e.shiftKey || editable || !!window.getSelection()?.toString()) return;
+  e.preventDefault();
+}
+
+let windowFullscreen = false;
+
+/** Keeps mpv in step with this device's settings, checks for updates, and handles right clicks. */
+export function ShellSetup() {
+  React.useEffect(() => {
+    const shell = window.aiostreamsDesktop;
+    if (!shell) return;
+    const { updateChannel } = settings.desktop;
+    let channel = updateChannel.read();
+    const apply = () => {
+      applyDesktopSettings();
+      if (updateChannel.read() !== channel) {
+        channel = updateChannel.read();
+        checkForUpdates(channel);
+      }
+    };
+    apply();
+    checkForUpdates(channel);
+    const unsubscribeSettings = onSettingsChange(apply);
+    const unsubscribe = shell.subscribe((m) => {
+      if (m.type === 'fullscreen') windowFullscreen = m.value;
+      else if (m.type === 'update-state') onUpdateState(m);
+      else if (m.type === 'discord-status') onDiscordStatus(m);
+    });
+    window.addEventListener('contextmenu', onContextMenu);
+    shell.send({ type: 'mpv-sync' });
+    return () => {
+      unsubscribeSettings();
+      unsubscribe();
+      window.removeEventListener('contextmenu', onContextMenu);
+    };
+  }, []);
+  return null;
+}
+
+export type ShellInfo = Extract<ShellMessage, { type: 'app-info' }>;
+
+export function useShellInfo(): ShellInfo | null {
+  const [info, setInfo] = React.useState<ShellInfo | null>(null);
+  React.useEffect(() => {
+    const shell = window.aiostreamsDesktop;
+    if (!shell) return;
+    const unsubscribe = shell.subscribe((m) => {
+      if (m.type === 'app-info') setInfo(m);
+    });
+    shell.send({ type: 'app-info' });
+    return unsubscribe;
+  }, []);
+  return info;
+}
+
+/** The `aiostreams://` links the app is opened with, including the one that started it. */
+export function useShellLinks(onLink: (url: string) => void): void {
+  const latest = useLatest(onLink);
+  React.useEffect(() => {
+    const shell = window.aiostreamsDesktop;
+    if (!shell) return;
+    const unsubscribe = shell.subscribe((m) => {
+      if (m.type === 'link') latest.current(m.url);
+    });
+    shell.send({ type: 'links-ready' });
+    return unsubscribe;
+  }, [latest]);
+}
+
+export function openMpvConfig(): void {
+  window.aiostreamsDesktop?.send({ type: 'open-mpv-config' });
+}
+
+export function openLogs(): void {
+  window.aiostreamsDesktop?.send({ type: 'open-logs' });
+}
+
+/** Versions, paths and the recent log, for a bug report. */
+export function requestDiagnostics(server: string | null): Promise<string> {
+  const shell = window.aiostreamsDesktop;
+  if (!shell)
+    return Promise.reject(new Error('Only the desktop app has these'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error('The app did not answer'));
+    }, 5000);
+    const unsubscribe = shell.subscribe((m) => {
+      if (m.type !== 'diagnostics') return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(m.text);
+    });
+    shell.send({ type: 'diagnostics', web: __APP_COMMIT__, server });
+  });
+}
+
+const host: Host = {
+  name: 'desktop',
+  device: () => ({ name: window.aiostreamsDesktop?.device }),
+  usePlayer: useShellPlayer,
+  playerFeatures: ['audio', 'chapters', 'stats'],
+  back: () => {
+    if (!windowFullscreen) return false;
+    window.aiostreamsDesktop?.send({ type: 'fullscreen', value: false });
+    return true;
+  },
+};
+
+/** The AIOStreams desktop app, which plays in mpv. */
+export function shellHost(): Host | null {
+  return window.aiostreamsDesktop?.protocol === 1 ? host : null;
+}

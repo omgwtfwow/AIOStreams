@@ -10,5 +10,11 @@ describe('fork migration ordering', () => {
     assert.equal(byId.get(7), 'proxy_aliases');
     assert.equal(byId.get(8), 'usenet');
     assert.equal(byId.get(28), 'usenet_undecodable');
+    assert.equal(byId.get(29), 'watch_state');
+    assert.equal(byId.get(42), 'index_trim');
+    assert.deepEqual(
+      ids,
+      Array.from({ length: 42 }, (_, index) => index + 1)
+    );
   });
 });

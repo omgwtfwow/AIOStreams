@@ -6,8 +6,8 @@ import {
   FormatterDefinition,
 } from '../../../../../../core/src/utils/formatter-definitions';
 import { useUserData } from '@/context/userData';
-import { Modal } from '../../../ui/modal';
-import { Button } from '../../../ui/button';
+import { Modal } from '@aiostreams/ui/modal';
+import { Button } from '@aiostreams/ui/button';
 import { MenuTabs } from '../../../shared/menu-tabs';
 import { getActiveSavedName } from '../templates';
 import { FormatterCard } from './formatter-card';
@@ -172,7 +172,12 @@ export function FormatterBrowser({
       description="Pick a built-in formatter, one you saved, or one shared by the community. Previews use the sample from the preview panel."
       contentClass="max-w-5xl w-full"
     >
-      <MenuTabs tabs={tabs} activeTab={activeTab} onTabChange={setActiveTab} />
+      <MenuTabs
+        tabs={tabs}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
+        animated={false}
+      />
     </Modal>
   );
 }

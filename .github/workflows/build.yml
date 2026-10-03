@@ -6,6 +6,9 @@ on:
       - main
     paths:
       - 'packages/**'
+      - '!packages/desktop/**'
+      - '!packages/docs/**'
+      - '!packages/**/*.md'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
@@ -13,13 +16,18 @@ on:
       - 'tsconfig.json'
       - 'tsconfig.base.json'
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Use Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 24
 

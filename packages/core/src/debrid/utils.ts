@@ -30,6 +30,7 @@ import {
 import { normaliseCountryCode } from '../utils/countries.js';
 import { partial_ratio } from 'fuzzball';
 import { ParsedResult } from '@viren070/parse-torrent-title';
+import { parseTorrentTitleCached } from '../parser/title.js';
 
 const logger = createLogger('debrid');
 
@@ -273,13 +274,23 @@ interface SelectionReport {
 // helpers
 export const isSeasonWrong = (
   parsed: { seasons?: number[]; episodes?: number[] },
-  metadata?: { season?: number; absoluteEpisode?: number }
+  metadata?: {
+    season?: number;
+    absoluteEpisode?: number;
+    tvdbSeason?: number;
+  }
 ) => {
   if (
     parsed.seasons?.length &&
     metadata?.season &&
     !parsed.seasons.includes(metadata.season)
   ) {
+    if (
+      metadata.tvdbSeason !== undefined &&
+      parsed.seasons.includes(metadata.tvdbSeason)
+    ) {
+      return false;
+    }
     // allow if season is "wrong" with value of 1 but absolute episode is correct
     if (
       parsed.seasons.length === 1 &&
@@ -303,20 +314,23 @@ export const isEpisodeWrong = (
   if (parsedDate && metadata?.airDates?.length) {
     return !metadata.airDates.includes(parsedDate);
   }
+  if (!parsed.episodes?.length || !metadata?.episode) return false;
+  // in tvdb's season the request's own episode number belongs to another cour
   if (
-    parsed.episodes?.length &&
-    metadata?.episode &&
-    !(
-      parsed.episodes.includes(metadata.episode) ||
-      (metadata.absoluteEpisode &&
-        parsed.episodes.includes(metadata.absoluteEpisode)) ||
-      (metadata.relativeAbsoluteEpisode &&
-        parsed.episodes.includes(metadata.relativeAbsoluteEpisode))
-    )
+    metadata.tvdbSeason !== undefined &&
+    metadata.tvdbEpisode !== undefined &&
+    parsed.seasons?.includes(metadata.tvdbSeason) &&
+    !(metadata.season && parsed.seasons.includes(metadata.season))
   ) {
-    return true;
+    return !parsed.episodes.includes(metadata.tvdbEpisode);
   }
-  return false;
+  return !(
+    parsed.episodes.includes(metadata.episode) ||
+    (metadata.absoluteEpisode &&
+      parsed.episodes.includes(metadata.absoluteEpisode)) ||
+    (metadata.relativeAbsoluteEpisode &&
+      parsed.episodes.includes(metadata.relativeAbsoluteEpisode))
+  );
 };
 /**
  * A country tag identifies which same-name show a release belongs to, even
@@ -363,6 +377,38 @@ export const isTitleWrongN = (
   }
   return false;
 };
+export async function parseFileNames(
+  names: Iterable<string>
+): Promise<Map<string, ParsedResult>> {
+  const parsed = new Map<string, ParsedResult>();
+  for (const name of names) {
+    if (parsed.has(name)) continue;
+    parsed.set(name, parseTorrentTitleCached(name));
+    if (parsed.size % 200 === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
+  return parsed;
+}
+
+/** Selection never reads the parse of a file it skips. */
+export function selectableFileNames(
+  title: string,
+  files: DebridFile[]
+): string[] {
+  const names = [title];
+  for (const file of files) {
+    if (!isNotVideoFile(file)) names.push(file.name ?? '');
+  }
+  return names;
+}
+
+/** Keeps one file when none are selectable, so nothing is still selected. */
+export function selectableFiles<T extends DebridFile>(files: T[]): T[] {
+  const kept = files.filter((file) => !isNotVideoFile(file));
+  return kept.length > 0 ? kept : files.slice(0, 1);
+}
+
 export async function selectFileInTorrentOrNZB(
   torrentOrNZB: Torrent | NZB,
   debridDownload: DebridDownload,
@@ -525,6 +571,11 @@ export async function selectFileInTorrentOrNZB(
       const parsedHasSeason = parsed.seasons && parsed.seasons.length > 0;
       const isExactMatch = parsedEpisodesCount === 1;
       const isBatchMatch = parsedEpisodesCount > 1;
+      const requestedEpisode =
+        metadata?.tvdbSeason !== undefined &&
+        parsed.seasons?.includes(metadata.tvdbSeason)
+          ? metadata.tvdbEpisode
+          : metadata?.episode;
 
       // For files without season info: prefer absolute episode matches over regular episode
       if (
@@ -570,11 +621,11 @@ export async function selectFileInTorrentOrNZB(
         parsedHasSeason &&
         metadata?.season &&
         metadata?.absoluteEpisode &&
-        metadata?.episode &&
-        metadata.absoluteEpisode !== metadata.episode
+        requestedEpisode &&
+        metadata.absoluteEpisode !== requestedEpisode
       ) {
         // File has season info: prefer regular episode over absolute.
-        const matchesRegular = parsed.episodes?.includes(metadata.episode);
+        const matchesRegular = parsed.episodes?.includes(requestedEpisode);
         const matchesAbsolute = parsed.episodes?.includes(
           metadata.absoluteEpisode
         );
@@ -800,74 +851,113 @@ export function isVideoFile(file: DebridFile): boolean {
   );
 }
 
+// Single-dot entries only: names are matched on the text from their last '.'.
+const NON_VIDEO_EXTENSIONS = new Set([
+  '.txt',
+  '.jpg',
+  '.jpeg',
+  '.png',
+  '.gif',
+  '.bmp',
+  '.svg',
+  '.webp',
+  '.nfo',
+  '.sfv',
+  '.srt',
+  '.ass',
+  '.sub',
+  '.idx',
+  '.cue',
+  '.log',
+  '.doc',
+  '.docx',
+  '.xls',
+  '.xlsx',
+  '.ppt',
+  '.pptx',
+  '.pdf',
+  '.rtf',
+  '.odt',
+  '.ods',
+  '.odp',
+  '.csv',
+  '.tsv',
+  '.exe',
+  '.bat',
+  '.apk',
+  '.dll',
+  '.zip',
+  '.rar',
+  '.7z',
+  '.tar',
+  '.gz',
+  '.bz2',
+  '.xz',
+  '.md',
+  '.json',
+  '.xml',
+  '.ini',
+  '.dat',
+  '.db',
+  '.dbf',
+  '.bak',
+  '.par2',
+  '.clpi',
+  '.jar',
+  '.mpls',
+  '.otf',
+  '.properties',
+  '.bdjo',
+  '.bdmv',
+  '.crt',
+  '.crl',
+  '.sig',
+  '.mp3',
+  '.wav',
+  '.flac',
+  '.aac',
+  '.m4a',
+  '.m4b',
+  '.opus',
+  '.wma',
+  '.mka',
+  '.ac3',
+  '.eac3',
+  '.dts',
+  '.ape',
+  '.aiff',
+  '.epub',
+  '.mobi',
+  '.azw',
+  '.azw3',
+  '.fb2',
+  '.djvu',
+  '.cbz',
+  '.cbr',
+  '.cb7',
+]);
+const NON_VIDEO_PATTERNS = [/\.7z\.\d+$/];
+
 export function isNotVideoFile(file: DebridFile): boolean {
-  const nonVideoExtensions = [
-    '.txt',
-    '.jpg',
-    '.jpeg',
-    '.png',
-    '.gif',
-    '.bmp',
-    '.svg',
-    '.webp',
-    '.nfo',
-    '.sfv',
-    '.srt',
-    '.ass',
-    '.sub',
-    '.idx',
-    '.cue',
-    '.log',
-    '.doc',
-    '.docx',
-    '.xls',
-    '.xlsx',
-    '.ppt',
-    '.pptx',
-    '.pdf',
-    '.rtf',
-    '.odt',
-    '.ods',
-    '.odp',
-    '.csv',
-    '.tsv',
-    '.exe',
-    '.bat',
-    '.apk',
-    '.dll',
-    '.zip',
-    '.rar',
-    '.7z',
-    '.tar',
-    '.gz',
-    '.bz2',
-    '.xz',
-    '.md',
-    '.json',
-    '.xml',
-    '.ini',
-    '.dat',
-    '.db',
-    '.dbf',
-    '.bak',
-    '.par2',
-    '.clpi',
-    '.jar',
-    '.mpls',
-    '.otf',
-    '.properties',
-    '.bdjo',
-    '.bdmv',
-    '.crt',
-    '.crl',
-    '.sig',
-  ];
-  const patterns = [/\.7z\.\d+$/];
+  const name = file.name;
   return (
     (file.mimeType && !file.mimeType.includes('video')) ||
-    nonVideoExtensions.some((ext) => file.name?.endsWith(ext) ?? false) ||
-    patterns.some((pattern) => pattern.test(file.name || ''))
+    (!!name && NON_VIDEO_EXTENSIONS.has(name.slice(name.lastIndexOf('.')))) ||
+    NON_VIDEO_PATTERNS.some((pattern) => pattern.test(name || ''))
   );
+}
+
+const MAX_SELECTABLE_FILES = 10_000;
+
+export function hasTooManySelectableFiles(files?: DebridFile[]): boolean {
+  if (!files || files.length <= MAX_SELECTABLE_FILES) return false;
+  let selectable = 0;
+  for (const file of files) {
+    if (!isNotVideoFile(file) && ++selectable > MAX_SELECTABLE_FILES) {
+      return true;
+    }
+  }
+  return false;
 }
 
 export const metadataStore = () => {

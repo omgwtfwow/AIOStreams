@@ -1,7 +1,7 @@
 import React from 'react';
 import { StatusResponse, ServiceId } from '@aiostreams/core';
-import { TextInput } from '../../../ui/text-input';
-import { PasswordInput } from '../../../ui/password-input';
+import { TextInput } from '@aiostreams/ui/text-input';
+import { PasswordInput } from '@aiostreams/ui/password-input';
 import MarkdownLite from '../../markdown-lite';
 import { ServiceLogo } from '../../service-logo';
 import { ProcessedTemplate, TemplateInput } from '@/lib/templates/types';
@@ -145,8 +145,9 @@ function InputRenderer({
 }: InputRendererProps) {
   return (
     <div>
-      {type === 'string' ? (
+      {type === 'string' || type === 'url' ? (
         <TextInput
+          type={type === 'url' ? 'url' : 'text'}
           value={value}
           onValueChange={onValueChange}
           label={label}

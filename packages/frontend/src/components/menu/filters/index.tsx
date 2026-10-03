@@ -1,6 +1,6 @@
 import { useEffect } from 'react';
 import { PageWrapper } from '../../shared/page-wrapper';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '../../ui/tabs';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@aiostreams/ui/tabs';
 import { SettingsNavCard } from '../../shared/settings-card';
 import { useUserData } from '@/context/userData';
 import {
@@ -28,10 +28,10 @@ import { BiSolidCameraMovie } from 'react-icons/bi';
 import { BsRegex, BsSpeakerFill } from 'react-icons/bs';
 import { GoContainer, GoFileBinary } from 'react-icons/go';
 import { TbFilterCode } from 'react-icons/tb';
-import { Select } from '../../ui/select';
-import { Combobox } from '../../ui/combobox';
+import { Select } from '@aiostreams/ui/select';
+import { Combobox } from '@aiostreams/ui/combobox';
 import { SettingsCard } from '../../shared/settings-card';
-import { Card } from '../../ui/card';
+import { Card } from '@aiostreams/ui/card';
 import {
   RESOLUTIONS,
   QUALITIES,
@@ -56,18 +56,18 @@ import {
   MIN_BITRATE,
   MAX_BITRATE,
 } from '../../../../../core/src/utils/constants';
-import { Switch } from '../../ui/switch';
+import { Switch } from '@aiostreams/ui/switch';
 import { useStatus } from '@/context/status';
-import { NumberInput } from '../../ui/number-input';
-import { IconButton, Button } from '../../ui/button';
-import { Tooltip } from '../../ui/tooltip';
-import { Alert } from '../../ui/alert';
-import { Modal } from '../../ui/modal';
-import { useDisclosure } from '@/hooks/disclosure';
-import { Slider } from '../../ui/slider/slider';
+import { NumberInput } from '@aiostreams/ui/number-input';
+import { IconButton, Button } from '@aiostreams/ui/button';
+import { Tooltip } from '@aiostreams/ui/tooltip';
+import { Alert } from '@aiostreams/ui/alert';
+import { Modal } from '@aiostreams/ui/modal';
+import { useDisclosure } from '@aiostreams/ui/hooks/disclosure';
+import { Slider } from '@aiostreams/ui/slider';
 import MarkdownLite from '../../shared/markdown-lite';
 import { useMode } from '@/context/mode';
-import { copyToClipboard } from '@/utils/clipboard';
+import { copyToClipboard } from '@aiostreams/ui/utils/clipboard';
 import { useParentInheritance } from '@/context/userData';
 import { useSubTab } from '@/context/sub-tab';
 import { InheritedBadge } from '../../shared/inherited-badge';
@@ -112,7 +112,7 @@ import {
 import type { SyncConfig } from './_components/synced-patterns';
 import { UserData } from '@aiostreams/core';
 import { toast } from 'sonner';
-import { Popover } from '@/components/ui/popover';
+import { Popover } from '@aiostreams/ui/popover';
 import { AiOutlineExclamationCircle } from 'react-icons/ai';
 
 /** Create a `<SYNCED: url>` placeholder string. */
@@ -4040,7 +4040,7 @@ function Content() {
                 <SettingsCard
                   id="digitalReleaseFilter"
                   title="Digital Release Filter"
-                  description="This will filter out all results for movies that are determined to not have a digital release."
+                  description="Filters out movies, series, and anime that haven't released yet, based on release dates (movies) or episode air dates (series/anime)."
                 >
                   <Switch
                     label="Enabled"
@@ -4101,6 +4101,24 @@ function Content() {
                     </div>
                   </div>
                   <p className="text-sm text-[--muted]">Tolerance in days</p>
+                  <Switch
+                    label="Also Check Result Age"
+                    side="right"
+                    disabled={!userData.digitalReleaseFilter?.enabled}
+                    value={
+                      userData.digitalReleaseFilter?.checkResultAge ?? false
+                    }
+                    moreHelp="Blocks results uploaded before the release/air date (beyond tolerance). Only works when a result's age is known."
+                    onValueChange={(value) => {
+                      setUserData((prev) => ({
+                        ...prev,
+                        digitalReleaseFilter: {
+                          ...prev.digitalReleaseFilter,
+                          checkResultAge: value,
+                        },
+                      }));
+                    }}
+                  />
                   <div className="space-y-4">
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <Combobox
@@ -4184,6 +4202,25 @@ function Content() {
                     }}
                   />
                 </SettingsCard>
+                {status?.settings.remuxdb.enabled && (
+                  <SettingsCard
+                    id="remuxDb"
+                    title="RemuxDB Integration"
+                    description="Fill in missing audio and subtitle languages, channels, HDR and resolution from RemuxDB's database of probed files. Each lookup sends the title's IMDb ID (and season and episode) to RemuxDB. Usenet results can only be matched when they come from the Newznab addon: NZBHydra and Prowlarr replace the indexer's NZB link with their own, so the NZB's ID can't be read from it."
+                  >
+                    <Switch
+                      label="Enable"
+                      side="right"
+                      value={userData.remuxDb?.enabled ?? false}
+                      onValueChange={(value) => {
+                        setUserData((prev) => ({
+                          ...prev,
+                          remuxDb: { ...prev.remuxDb, enabled: value },
+                        }));
+                      }}
+                    />
+                  </SettingsCard>
+                )}
                 {mode === 'pro' && userData.excludeSeasonPacks && (
                   <SettingsCard
                     id="excludeSeasonPacks"

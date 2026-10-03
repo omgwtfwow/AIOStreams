@@ -1,9 +1,9 @@
 import React from 'react';
-import { Modal } from '@/components/ui/modal';
-import { TextInput } from '@/components/ui/text-input';
-import { Button, IconButton } from '@/components/ui/button';
-import { Checkbox } from '@/components/ui/checkbox';
-import { LoadingSpinner } from '@/components/ui/loading-spinner';
+import { Modal } from '@aiostreams/ui/modal';
+import { TextInput } from '@aiostreams/ui/text-input';
+import { Button, IconButton } from '@aiostreams/ui/button';
+import { Checkbox } from '@aiostreams/ui/checkbox';
+import { LoadingSpinner } from '@aiostreams/ui/loading-spinner';
 import {
   loadRawUserConfig,
   openConfigProfile,
@@ -20,7 +20,7 @@ import { useSession } from '@/context/session';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { BiTrash, BiLinkExternal } from 'react-icons/bi';
-import { PasswordInput } from './ui/password-input';
+import { PasswordInput } from '@aiostreams/ui/password-input';
 
 interface ConfigModalProps {
   open: boolean;
@@ -49,7 +49,7 @@ export function ConfigModal({
   const [uuid, setUuidInput] = React.useState(initialUuid || '');
   const [password, setPasswordInput] = React.useState('');
   const [saveToAccount, setSaveToAccount] = React.useState(false);
-  const [staySignedIn, setStaySignedIn] = React.useState(false);
+  const [staySignedIn, setStaySignedIn] = React.useState(true);
   const [label, setLabel] = React.useState('');
   const [loading, setLoading] = React.useState(false);
   const [busyProfileId, setBusyProfileId] = React.useState<string | null>(null);
@@ -191,7 +191,7 @@ export function ConfigModal({
     if (!open) {
       setPasswordInput('');
       setSaveToAccount(false);
-      setStaySignedIn(false);
+      setStaySignedIn(true);
       setLabel('');
       setShowManualForm(false);
       setPendingDelete(null);
@@ -220,7 +220,7 @@ export function ConfigModal({
 
   const staySignedInField = sessionsEnabled ? (
     <Checkbox
-      label="Stay signed in on this device"
+      label="Remember me"
       value={staySignedIn}
       onValueChange={(v) => setStaySignedIn(v === true)}
     />

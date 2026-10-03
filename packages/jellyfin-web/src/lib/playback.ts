@@ -1,0 +1,203 @@
+import type { JellyfinClient } from './client';
+import { TICKS_PER_MS } from './format';
+import { storage } from './storage';
+import type { MediaStream, SourceInfo } from './types';
+
+/**
+ * The server's stream route. A player cannot send the sign-in header, so the
+ * token rides in the query, which servers that guard the route require.
+ */
+export function streamUrl(
+  client: JellyfinClient,
+  itemId: string,
+  source: SourceInfo,
+  playSessionId?: string | null
+): string {
+  return client.url(`/Videos/${itemId}/stream`, {
+    static: true,
+    MediaSourceId: source.Id,
+    PlaySessionId: playSessionId,
+    ApiKey: client.token,
+  });
+}
+
+/** The source's own address, which outlives this session. */
+export function directUrl(
+  client: JellyfinClient,
+  itemId: string,
+  source: SourceInfo
+): string {
+  return source.Path && /^https?:\/\//i.test(source.Path)
+    ? source.Path
+    : streamUrl(client, itemId, source);
+}
+
+export function textSubtitles(source: SourceInfo): MediaStream[] {
+  return (source.MediaStreams ?? []).filter(
+    (s) => s.Type === 'Subtitle' && s.DeliveryMethod === 'External'
+  );
+}
+
+/**
+ * An absolute address for an external subtitle stream, converted to the
+ * WebVTT a `<video>` element reads unless `original` keeps the file's format.
+ */
+export function subtitleUrl(
+  client: JellyfinClient,
+  stream: MediaStream,
+  { original = false } = {}
+): string | null {
+  if (!stream.DeliveryUrl) return null;
+  const path = original
+    ? stream.DeliveryUrl
+    : stream.DeliveryUrl.replace(/Stream\.\w+(?=\?|$)/, 'Stream.vtt');
+  return new URL(client.url(path), window.location.origin).toString();
+}
+
+const EXTERNAL_PLAYER_KEY = 'aiostreams-web-external-player';
+const EXTERNAL_ALWAYS_KEY = 'aiostreams-web-external-always';
+
+/**
+ * A URL template kept per device: `{url}` or `{encodedUrl}`, and optionally
+ * `{position}` (seconds to start at), `{returnUrl}` (where a player that
+ * reports back sends the position it stopped at), `{filename}` and
+ * `{subtitles}` (its parameter repeated once per external subtitle).
+ */
+export function externalPlayerTemplate(): string {
+  return storage.get<string>(EXTERNAL_PLAYER_KEY) ?? '';
+}
+
+export function setExternalPlayerTemplate(template: string): void {
+  if (template.trim()) storage.set(EXTERNAL_PLAYER_KEY, template.trim());
+  else storage.remove(EXTERNAL_PLAYER_KEY);
+}
+
+/** Whether playing a version opens the external player instead. */
+export function externalAlways(): boolean {
+  return (
+    !!externalPlayerTemplate() &&
+    storage.get<boolean>(EXTERNAL_ALWAYS_KEY) === true
+  );
+}
+
+export function setExternalAlways(value: boolean): void {
+  if (value) storage.set(EXTERNAL_ALWAYS_KEY, true);
+  else storage.remove(EXTERNAL_ALWAYS_KEY);
+}
+
+/**
+ * Writes the parameter holding `{placeholder}` once per value, and drops it
+ * when there are none rather than sending it empty.
+ */
+function fillParam(
+  template: string,
+  placeholder: string,
+  values: string[]
+): string {
+  const match = new RegExp(`([?&])([^=&?]+)=\{${placeholder}\}`).exec(template);
+  if (!match) {
+    return template.replace(
+      `{${placeholder}}`,
+      encodeURIComponent(values[0] ?? '')
+    );
+  }
+  const [param, separator, name] = match;
+  const written = values
+    .map((v, i) => `${i ? '&' : separator}${name}=${encodeURIComponent(v)}`)
+    .join('');
+  const filled = template.replace(param, written);
+  return written ? filled : filled.replace(/^([^?]*)&/, '$1?');
+}
+
+export function externalPlayerUrl(
+  template: string,
+  url: string,
+  opts: {
+    startMs?: number;
+    returnUrl?: string;
+    filename?: string;
+    subtitles?: string[];
+  } = {}
+): string {
+  let filled = template.replace(
+    '{position}',
+    String(Math.floor((opts.startMs ?? 0) / 1000))
+  );
+  filled = fillParam(
+    filled,
+    'returnUrl',
+    opts.returnUrl ? [opts.returnUrl] : []
+  );
+  filled = fillParam(filled, 'filename', opts.filename ? [opts.filename] : []);
+  filled = fillParam(filled, 'subtitles', opts.subtitles ?? []);
+  if (filled.includes('{encodedUrl}'))
+    return filled.replace('{encodedUrl}', encodeURIComponent(url));
+  if (filled.includes('{url}')) return filled.replace('{url}', url);
+  return `${filled}${url}`;
+}
+
+const PROGRESS_EVERY_MS = 10_000;
+
+/**
+ * Reports a playback the way a Jellyfin client does, so it shows as playing,
+ * resumes later and reaches the trackers.
+ */
+export class PlaybackReporter {
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private stopped = false;
+
+  constructor(
+    private readonly client: JellyfinClient,
+    private readonly info: {
+      itemId: string;
+      mediaSourceId: string;
+      playSessionId?: string | null;
+    },
+    private readonly position: () => { ms: number; paused: boolean }
+  ) {}
+
+  private body(extra: Record<string, unknown> = {}) {
+    const { ms, paused } = this.position();
+    return {
+      ItemId: this.info.itemId,
+      MediaSourceId: this.info.mediaSourceId,
+      PlaySessionId: this.info.playSessionId ?? undefined,
+      PositionTicks: Math.round(ms) * TICKS_PER_MS,
+      IsPaused: paused,
+      CanSeek: true,
+      PlayMethod: 'DirectPlay',
+      ...extra,
+    };
+  }
+
+  start(): void {
+    void this.client.post('/Sessions/Playing', this.body()).catch(() => {});
+    this.timer = setInterval(
+      () => this.progress('TimeUpdate'),
+      PROGRESS_EVERY_MS
+    );
+  }
+
+  progress(event: 'TimeUpdate' | 'Pause' | 'Unpause'): void {
+    if (this.stopped) return;
+    void this.client
+      .post('/Sessions/Playing/Progress', this.body({ EventName: event }))
+      .catch(() => {});
+  }
+
+  stop(): Promise<void> {
+    if (this.stopped) return Promise.resolve();
+    this.stopped = true;
+    if (this.timer) clearInterval(this.timer);
+    // keepalive lets the report leave while the page is closing.
+    return this.client
+      .request('POST', '/Sessions/Playing/Stopped', {
+        body: this.body(),
+        keepalive: true,
+      })
+      .then(
+        () => {},
+        () => {}
+      );
+  }
+}

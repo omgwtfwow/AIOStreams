@@ -4,7 +4,9 @@ import {
   ConfigSessionRepository,
   constants,
   decryptString,
+  isConfigUuid,
   isEncrypted,
+  resolveConfigAlias,
 } from '@aiostreams/core';
 import {
   clearConfigSessionCookie,
@@ -15,6 +17,8 @@ import {
 export interface BasicAuthCredentials {
   uuid: string;
   password: string;
+  /** Sent in its encrypted form, as a shared address carries it. */
+  encrypted?: boolean;
 }
 
 /**
@@ -94,7 +98,7 @@ export function parseBasicAuthHeader(
         error
       );
     }
-    password = data;
+    return { uuid, password: data, encrypted: true };
   }
 
   return { uuid, password };
@@ -112,7 +116,12 @@ export async function resolveConfigCredentials(
   opts?: { allowEncrypted?: boolean; allowSession?: boolean }
 ): Promise<BasicAuthCredentials | null> {
   const fromHeader = parseBasicAuthHeader(req, opts);
-  if (fromHeader) return fromHeader;
+  if (fromHeader) {
+    // An alias names the configuration; the password is still checked.
+    if (isConfigUuid(fromHeader.uuid)) return fromHeader;
+    const target = await resolveConfigAlias(fromHeader.uuid);
+    return target ? { ...fromHeader, uuid: target.uuid } : fromHeader;
+  }
 
   if (opts?.allowSession === false || !ConfigSessionRepository.enabled()) {
     return null;

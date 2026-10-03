@@ -7,10 +7,13 @@ import {
   fetchLinkedAccountPlatforms,
   fetchCommunityItems,
   fetchMyCommunityItems,
+  getWatchStateTrackers,
   api,
   type LinkedAccount,
   type LinkedAccountPlatformInfo,
+  type WatchStateOverview,
 } from './api';
+import { fetchDocsChangelog } from './changelog';
 import type {
   CommunityItemMine,
   CommunityItemPublic,
@@ -30,6 +33,12 @@ export const statusQuery = queryOptions({
   queryFn: () => api<StatusResponse>('/status'),
   staleTime: 60_000,
   retry: false,
+});
+
+export const docsChangelogQuery = queryOptions({
+  queryKey: ['docs-changelog'] as const,
+  queryFn: fetchDocsChangelog,
+  staleTime: Infinity,
 });
 
 // 401s without a session, which is a normal state on the configure page.
@@ -57,6 +66,30 @@ export const linkedAccountsQuery = (
   });
 
 export const LINKED_ACCOUNTS_QUERY_ROOT = ['linked-accounts'] as const;
+
+export const WATCH_STATE_TRACKERS_QUERY_ROOT = [
+  'watch-state-trackers',
+] as const;
+
+export const watchStateTrackersQuery = (credentials: Credentials | null) =>
+  queryOptions({
+    queryKey: [
+      ...WATCH_STATE_TRACKERS_QUERY_ROOT,
+      credentials?.uuid ?? null,
+    ] as const,
+    queryFn: (): Promise<WatchStateOverview> =>
+      credentials
+        ? getWatchStateTrackers(credentials)
+        : Promise.resolve({
+            push: false,
+            pull: false,
+            trackers: [],
+            available: [],
+          }),
+    enabled: !!credentials,
+    staleTime: 30_000,
+    retry: false,
+  });
 
 /** Descriptors are static per instance, so they are cached for the session. */
 export const linkedAccountPlatformsQuery = (credentials: Credentials | null) =>

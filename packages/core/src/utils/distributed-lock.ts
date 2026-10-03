@@ -88,7 +88,14 @@ export function parseLockResult<T>(json: string): T {
   return JSON.parse(json, (_key, val) => {
     if (!val || typeof val !== 'object' || !val.__lockError) return val;
     const ctor = resolveErrorCtor(val.className);
-    const err = (ctor ? Object.create(ctor.prototype) : new Error()) as Error;
+    // DOMException's getters throw unless read off a real instance.
+    const err = (
+      ctor === DOMException
+        ? new DOMException(val.message, val.name)
+        : ctor
+          ? Object.create(ctor.prototype)
+          : new Error()
+    ) as Error;
     for (const [k, v] of Object.entries(val)) {
       if (k === '__lockError' || k === 'className') continue;
       // avoids throwing on getter-only accessors, e.g. DOMException.prototype.name
@@ -101,6 +108,10 @@ export function parseLockResult<T>(json: string): T {
     }
     return err;
   });
+}
+
+export function requestLockType(): 'redis' | 'memory' {
+  return appConfig.bootstrap.redisUri ? 'redis' : 'memory';
 }
 
 export class DistributedLock {
@@ -187,6 +198,17 @@ export class DistributedLock {
       : this.withSqlLock(key, fn, options);
   }
 
+  /** Whether anyone is subscribed to a lock's completion channel. */
+  private async hasWaiters(channel: string): Promise<boolean> {
+    try {
+      const counts = await this.redis!.pubSubNumSub(channel);
+      return Number(Object.values(counts ?? {})[0] ?? 0) > 0;
+    } catch {
+      // Unknown means publish: a missed result is worse than a wasted one.
+      return true;
+    }
+  }
+
   private async withRedisLock<T>(
     key: string,
     fn: () => Promise<T>,
@@ -205,28 +227,35 @@ export class DistributedLock {
       return result === 'OK';
     };
 
+    const release = async () => {
+      if ((await this.redis!.get(redisKey)) === owner) {
+        logger.debug(`Releasing redis lock for key: ${key}`);
+        await this.redis!.del(redisKey);
+      }
+    };
+
     if (await acquireLock()) {
       logger.debug(`Redis lock acquired for key: ${key}`);
       let result: T;
       try {
         result = await fn();
-        const storedResult: StoredResult<T> = { value: result };
-        await this.redis!.publish(
-          doneChannel,
-          stringifyLockResult(storedResult)
-        );
       } catch (e: any) {
+        await release();
         const errorResult: StoredResult<T> = { error: e };
         await this.redis!.publish(
           doneChannel,
           stringifyLockResult(errorResult)
         );
         throw e;
-      } finally {
-        if ((await this.redis!.get(redisKey)) === owner) {
-          logger.debug(`Releasing redis lock for key: ${key}`);
-          await this.redis!.del(redisKey);
-        }
+      }
+      await release();
+      // Serialising the result is the expensive part, and with nothing waiting it is thrown away.
+      if (await this.hasWaiters(doneChannel)) {
+        const storedResult: StoredResult<T> = { value: result };
+        await this.redis!.publish(
+          doneChannel,
+          stringifyLockResult(storedResult)
+        );
       }
       return { result, cached: false };
     }
@@ -237,7 +266,8 @@ export class DistributedLock {
 
       const cleanup = () => {
         clearTimeout(timeoutId);
-        this.subRedis!.unsubscribe(doneChannel).catch((e) =>
+        // Only this waiter's listener: others in this process may share the channel.
+        this.subRedis!.unsubscribe(doneChannel, subscriber).catch((e) =>
           logger.error(`Error during unsubscribe: ${e.message}`)
         );
       };
@@ -270,10 +300,19 @@ export class DistributedLock {
           this.redis!.get(redisKey)
             .then((lockValue) => {
               if (lockValue === null) {
-                logger.warn(
-                  `Lock for key ${key} was released before subscription completed. Timing out.`
+                /*
+                 * The holder finished between the failed acquire and the
+                 * subscription, so nothing was published to wait for. Running
+                 * it here duplicates one request; failing loses the addon.
+                 */
+                logger.debug(
+                  `Lock for key ${key} was released before subscription completed; running it here.`
                 );
-                onTimeout();
+                cleanup();
+                fn().then(
+                  (result) => resolve({ result, cached: false }),
+                  reject
+                );
               }
             })
             .catch((err) => {
